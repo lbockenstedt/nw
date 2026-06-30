@@ -45,6 +45,12 @@ from nw_engine import (build_driver, NwEngine, SshCliDriver,  # noqa: E402
 
 logging.disable(logging.CRITICAL)  # silence stub INFO logs during tests
 
+# Read the repo-root VERSION dynamically so the autobump bot's last-segment bump
+# (.00 → .01 → …) doesn't break these assertions (never hardcode the version).
+_VERSION_FILE = os.path.join(os.path.dirname(__file__), "..", "VERSION")
+with open(_VERSION_FILE) as _f:
+    _NW_VERSION = _f.read().strip()
+
 
 def _run(coro):
     return asyncio.get_event_loop().run_until_complete(coro)
@@ -58,7 +64,7 @@ def _spoke_with(devices):
 def test_get_version_reads_repo_root_version():
     spoke = _spoke_with([])
     # NwSpoke.get_version reads <src parent>/VERSION = the repo root VERSION.
-    assert spoke.get_version() == ".00"
+    assert spoke.get_version() == _NW_VERSION
 
 
 # ── UPDATE_CONFIG stores the fleet + reports count (creds masked in logs) ───
@@ -133,7 +139,7 @@ def test_run_config_returns_applied():
 def test_get_version_command():
     spoke = _spoke_with([])
     res = _run(spoke.handle_command("get_version", {}))
-    assert res == {"status": "SUCCESS", "version": ".00"}
+    assert res == {"status": "SUCCESS", "version": _NW_VERSION}
 
 
 # ── Unknown command ──────────────────────────────────────────────────────────
