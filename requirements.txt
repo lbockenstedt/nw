@@ -1,0 +1,7 @@
+requests
+fastapi
+uvicorn[standard]
+websockets
+httpx
+asyncssh
+pysnmp-lextudio
