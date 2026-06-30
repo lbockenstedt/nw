@@ -49,7 +49,7 @@ bound to this spoke via `UPDATE_CONFIG`. Each device dict:
   address,transport,reachable}]}`.
 
 ### Per-device (data carries `{"device_id": "<id>"}`)
-- `NW_PROBE` → `{"status":"SUCCESS","reachable": bool, "latency_ms": int}`.
+- `NW_PROBE` → `{"status":"SUCCESS","data":{reachable: bool, latency_ms: int}}`.
 - `NW_GET_DEVICE_INFO` → `{"status":"SUCCESS","data":{model,serial,firmware,
   interfaces_count}}`.
 - `NW_GET_MAC_TABLE` → `{"status":"SUCCESS","data":[{mac, vlan, interface}]}`.
@@ -58,10 +58,22 @@ bound to this spoke via `UPDATE_CONFIG`. Each device dict:
   tenants by IP-prefix containment and pushes to NetBox.)
 - `NW_GET_INTERFACES` → `{"status":"SUCCESS","data":[{name, ip, mac, vlan,
   status, speed}]}`.
+- `NW_POLL` → one-shot full poll (probe + device_info + interfaces + arp +
+  mac_table), each datum independent so a single failure doesn't sink the rest:
+  `{"status":"SUCCESS"|"PARTIAL","data":{reachable, latency_ms, device_info,
+  interfaces, arp, mac_table}, "errors":[...], "message":"..."}`. MACs are
+  canonicalized on the way out. The hub's POLL NOW button sends this and pushes
+  the device + interfaces to NetBox via `NETBOX_SYNC_NW_DEVICE`.
+
+> Every datum method returns an `ERROR` envelope (`{"status":"ERROR","data":[],
+> "message":...}`) on transport failure (timeout, no community, auth refused,
+> bad JSON) — never raises — so one device's failure doesn't sink a batch. This
+> is the fix for the "SNMP scan returned nothing" symptom: the old stubs
+> returned `SUCCESS` with empty data; real drivers now surface the error.
 
 ### Configure (admin-only at the hub route)
-- `NW_RUN_CONFIG` `{"device_id","commands":[...]}` →
-  `{"status":"SUCCESS","applied":[...],"errors":[...]}`.
+- `NW_RUN_CONFIG` `{"device_id","commands":[...]}` → not implemented this pass
+  (`{"status":"ERROR","applied":[],"errors":["run_config not implemented ..."]}`).
 
 ## Driver / transport matrix
 
@@ -72,10 +84,19 @@ bound to this spoke via `UPDATE_CONFIG`. Each device dict:
 | `ex_switch`  | ssh               | Junos (`show ethernet-switching table`, `show arp`, `show version`) |
 | `gateway`    | rest              | Aruba/HPE gateway REST                       |
 
-All four object types also support SNMP (v2c/v3) as an alternate/fallback
-transport. `transport=auto` selects the per-type default.
+All four object types also support SNMP (v2c) as an alternate/fallback
+transport (`transport=snmp`). `transport=auto` selects the per-type default.
 
-> **Phase 1 (this drop):** device IO is **stubbed** — each driver method logs
-> the intent and returns a structured `SUCCESS` placeholder so the full
-> hub→spoke→UI→NetBox pipeline is exercisable without real devices. Real
-> driver implementations land in phase 2.
+Drivers are real (not stubbed):
+- **SnmpDriver** — SNMPv2c via pysnmp-lextudio, standard MIBs only (IF-MIB,
+  IP-MIB, BRIDGE-MIB) so the same OIDs work across all four families. Requires
+  `snmp_community` on the device. Blocking pysnmp calls run via
+  `asyncio.to_thread`.
+- **SshCliDriver** — asyncssh interactive PTY, per-vendor text parsers
+  (`transports/cli_io.py`); `enable_secret` enters enable mode on AOS-S.
+- **RestDriver** — httpx async, AOS-CX RESTv1 (basic auth) + gateway REST
+  (bearer `api_token`); `LM_NW_VERIFY_TLS` env knob (default off for lab
+  self-signed).
+
+IO lives in `src/transports/` (lazy-imported heavy libs) so `nw_engine.py`
+imports cleanly without them.

@@ -4,25 +4,31 @@ The engine holds the fleet of managed devices (pushed by the hub via
 UPDATE_CONFIG) and, for each command, resolves the target device and delegates
 to a **driver** chosen by the device's ``object_type`` and ``transport``.
 
-PHASE 1: device IO is **stubbed**. Every driver method logs its intent and
-returns a structured ``SUCCESS`` placeholder so the full hub → spoke → UI →
-NetBox pipeline is exercisable end-to-end without real devices. Real
-SSH/REST/SNMP implementations land in phase 2 — see the ``# TODO(phase2)``
-markers. Credentials are NEVER logged (the spoke masks them in handle_command
-before logging; the engine itself only logs address + object_type + transport).
+Drivers implement real device IO across three transports:
+  * ``SnmpDriver``    — SNMPv2c via pysnmp (standard MIBs; all four families).
+  * ``SshCliDriver``  — SSH/CLI via asyncssh + per-vendor text parsers.
+  * ``RestDriver``    — REST via httpx (AOS-CX RESTv1 + Aruba/HPE gateway REST).
 
-Conforms to the standard result envelope used across LM spokes:
-``{"status": "SUCCESS"|"ERROR", "data": [...], "message": "..."}``.
+The blocking/vendored libs live in ``transports/`` and are lazy-imported there
+so this module imports cleanly without them installed. Every driver method
+returns the standard result envelope ``{"status":"SUCCESS"|"ERROR",
+"data":..., "message":...}``; a transport failure returns an ``ERROR`` envelope
+(never raises) so one device's failure doesn't sink a batch. Credentials are
+NEVER logged (the spoke masks them in handle_command before logging; the engine
+only logs address + object_type + transport).
+
+``poll(device_id)`` runs probe + device_info + interfaces + arp + mac_table in
+one call (each independent — partial results on partial failure) for the
+hub's POLL NOW path.
 """
+import asyncio
 import logging
 import re
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("NwEngine")
 
-# ── Vendor command reference (logged by the stubs; used by phase-2 drivers) ──
-# Per object_type: the canonical CLI/REST queries for each datum. Keeping these
-# in one table makes the phase-2 implementation a lookup, not a rewrite.
+# ── Vendor command reference (used by the CLI driver + logged for diagnostics)─
 _VENDOR_COMMANDS: Dict[str, Dict[str, str]] = {
     "aos_switch": {  # Aruba AOS-Switch (ProCurve/Aruba)
         "mac":  "show mac-address",
@@ -51,7 +57,7 @@ _VENDOR_COMMANDS: Dict[str, Dict[str, str]] = {
 }
 
 # Per object_type default transport when the device says ``transport=auto`` or
-# omits it.
+# omits it. SNMP is a valid explicit transport for any family.
 _DEFAULT_TRANSPORT: Dict[str, str] = {
     "aos_switch": "ssh",
     "cx_switch":  "rest",
@@ -62,8 +68,7 @@ _DEFAULT_TRANSPORT: Dict[str, str] = {
 _VALID_TRANSPORTS = ("ssh", "rest", "snmp", "auto")
 _VALID_OBJECT_TYPES = tuple(_VENDOR_COMMANDS.keys())
 
-# Credential field names — never logged. (handle_command masks these too; this
-# is the engine-side guarantee for any future direct logging.)
+# Credential field names — never logged.
 _SENSITIVE = ("password", "enable_secret", "api_token", "snmp_community")
 
 
@@ -84,14 +89,14 @@ def _norm_mac(m: str) -> str:
     return s
 
 
-class NwDriver:
-    """Abstract base for a per-device driver.
+def _err(message: str, data: Any = None) -> Dict[str, Any]:
+    return {"status": "ERROR", "data": data if data is not None else [],
+            "message": message}
 
-    Phase-1 default implementations are stubs that log + return ``SUCCESS``
-    placeholders. Transport subclasses (SSH/CLI, REST, SNMP) override the
-    transport-specific mechanics in phase 2; until then they inherit the stubs
-    and only customize the logged transport label.
-    """
+
+class NwDriver:
+    """Abstract base for a per-device driver. Transport subclasses implement the
+    IO; the base provides transport resolution + envelope helpers."""
 
     transport = "base"
 
@@ -100,7 +105,6 @@ class NwDriver:
         self.device_id = device.get("id", "")
         self.object_type = device.get("object_type", "")
         self.address = device.get("address", "")
-        # Resolved transport (auto → per-type default).
         self.transport = self._resolve_transport(device)
 
     @staticmethod
@@ -115,81 +119,204 @@ class NwDriver:
     def _log(self, method: str, extra: str = "") -> None:
         tag = f"[{self.object_type}/{self.transport}] {method} on {self.address}"
         logger.info(f"{tag} {extra}".rstrip())
-        cmds = _VENDOR_COMMANDS.get(self.object_type, {}).get(method, "")
-        if cmds:
-            logger.info(f"  phase2 query: {cmds}")
 
     def _ok(self, data: Any, message: str = "") -> Dict[str, Any]:
         return {"status": "SUCCESS", "data": data, "message": message}
 
-    # ── Datum methods (stubbed) ─────────────────────────────────────────────
+    # ── Datum methods (transport subclasses override) ────────────────────────
     async def probe(self) -> Dict[str, Any]:
-        # TODO(phase2): open the transport and verify reachability.
-        self._log("probe")
-        return self._ok({"reachable": True, "latency_ms": 0})
+        return _err("probe not implemented for this transport",
+                    {"reachable": False, "latency_ms": 0})
 
     async def get_device_info(self) -> Dict[str, Any]:
-        # TODO(phase2): fetch model/serial/firmware via the vendor query.
-        self._log("info")
-        return self._ok({
-            "model": f"{self.object_type}-stub",
-            "serial": "stub-serial",
-            "firmware": "stub-fw",
-            "interfaces_count": 0,
-        })
+        return _err("device info not implemented for this transport")
 
     async def get_mac_table(self) -> Dict[str, Any]:
-        # TODO(phase2): run the vendor mac-table query + parse.
-        self._log("mac")
-        return self._ok([], "mac table: stub (phase 2 will populate)")
+        return _err("mac table not implemented for this transport")
 
     async def get_arp(self) -> Dict[str, Any]:
-        # TODO(phase2): run the vendor arp query + parse into {ip, mac, interface}.
-        self._log("arp")
-        return self._ok([], "arp: stub (phase 2 will populate)")
+        return _err("arp not implemented for this transport")
 
     async def get_interfaces(self) -> Dict[str, Any]:
-        # TODO(phase2): enumerate interfaces + IPs + VLANs.
-        self._log("if")
-        return self._ok([], "interfaces: stub (phase 2 will populate)")
+        return _err("interfaces not implemented for this transport")
 
     async def run_config(self, commands: List[str]) -> Dict[str, Any]:
-        # TODO(phase2): push the CLI/REST config changes.
+        # TODO(phase3): push CLI/REST config changes. Out of scope for the
+        # polling work — returns a clear not-implemented envelope so a caller
+        # doesn't mistake silence for success.
         self._log("config", f"commands={len(commands or [])}")
-        return {"status": "SUCCESS",
-                "applied": list(commands or []),
-                "errors": [],
-                "message": "config apply: stub (phase 2 will push)"}
-
-
-class SshCliDriver(NwDriver):
-    """SSH / CLI driver (asyncssh). Phase-1: stubbed.
-
-    Phase-2 will use asyncssh to open an interactive shell, page-through paging
-    ('no page' on AOS-S / 'set screen-length 0' on Junos), run the vendor
-    commands, and parse the text output. enable_secret is used for privileged
-    mode where the vendor requires it.
-    """
-    transport = "ssh"
-
-
-class RestDriver(NwDriver):
-    """REST API driver (httpx). Phase-1: stubbed.
-
-    Phase-2 will use httpx against the vendor REST endpoints (AOS-CX RESTv1,
-    Aruba/HPE gateway REST) with api_token bearer auth, TLS verify controlled
-    by an LM_NW_VERIFY_TLS env knob (lab devices often self-signed).
-    """
-    transport = "rest"
+        return {"status": "ERROR",
+                "applied": [],
+                "errors": ["run_config not implemented for this transport"],
+                "message": "config apply: not implemented"}
 
 
 class SnmpDriver(NwDriver):
-    """SNMP driver (pysnmp). Phase-1: stubbed.
-
-    Phase-2 will walk BRIDGE-MIB (dot1dTpFdbPort → MAC table) + IP-MIB
-    (ipNetToPhysicalPhysAddress → ARP) using snmp_community / v3 creds.
-    """
+    """SNMPv2c driver (pysnmp). Standard MIBs work across all four families."""
     transport = "snmp"
+
+    def _session(self):
+        from transports import snmp_io
+        return snmp_io.SnmpSession(self.device)
+
+    async def probe(self) -> Dict[str, Any]:
+        from transports import snmp_io
+        try:
+            s = self._session()
+            res = await snmp_io.snmp_probe(s)
+            return self._ok(res)
+        except Exception as e:
+            return _err(f"snmp probe {self.address}: {e}",
+                        {"reachable": False, "latency_ms": 0})
+
+    async def get_device_info(self) -> Dict[str, Any]:
+        from transports import snmp_io
+        try:
+            return self._ok(await snmp_io.snmp_get_device_info(self._session()))
+        except Exception as e:
+            return _err(f"snmp device info {self.address}: {e}")
+
+    async def get_interfaces(self) -> Dict[str, Any]:
+        from transports import snmp_io
+        try:
+            rows = await snmp_io.snmp_get_interfaces(self._session())
+            return self._ok(rows)
+        except Exception as e:
+            return _err(f"snmp interfaces {self.address}: {e}")
+
+    async def get_arp(self) -> Dict[str, Any]:
+        from transports import snmp_io
+        try:
+            s = self._session()
+            # Map ifIndex → name so the ARP rows carry a friendly interface.
+            iftable = snmp_io.parse_iftable(
+                await snmp_io._to_thread(s.walk, snmp_io.IF_PREFIX))
+            rows = await snmp_io.snmp_get_arp(s, ifaces=iftable)
+            return self._ok(rows)
+        except Exception as e:
+            return _err(f"snmp arp {self.address}: {e}")
+
+    async def get_mac_table(self) -> Dict[str, Any]:
+        from transports import snmp_io
+        try:
+            s = self._session()
+            iftable = snmp_io.parse_iftable(
+                await snmp_io._to_thread(s.walk, snmp_io.IF_PREFIX))
+            rows = await snmp_io.snmp_get_mac_table(s, ifaces=iftable)
+            return self._ok(rows)
+        except Exception as e:
+            return _err(f"snmp mac table {self.address}: {e}")
+
+
+class SshCliDriver(NwDriver):
+    """SSH / CLI driver (asyncssh + per-vendor text parsers). One interactive
+    PTY session per call: connect, disable paging, run the vendor show commands,
+    parse the text. ``enable_secret`` enters enable mode on AOS-S."""
+    transport = "ssh"
+
+    def _session(self):
+        from transports import cli_io
+        return cli_io.CliSession(self.device)
+
+    async def _with_session(self, fn) -> Dict[str, Any]:
+        from transports import cli_io
+        try:
+            async with self._session() as s:
+                rows = await fn(s, self.object_type)
+                return self._ok(rows)
+        except cli_io.CliError as e:
+            return _err(f"cli {self.address}: {e}")
+        except Exception as e:
+            return _err(f"cli {self.address}: {e}")
+
+    async def probe(self) -> Dict[str, Any]:
+        from transports import cli_io
+        import time
+        t0 = time.monotonic()
+        try:
+            async with self._session() as s:
+                # A successful connection + one command == reachable.
+                await s.run("show version")
+            return self._ok({"reachable": True,
+                             "latency_ms": int((time.monotonic() - t0) * 1000)})
+        except cli_io.CliError as e:
+            return _err(f"cli probe {self.address}: {e}",
+                        {"reachable": False, "latency_ms": 0})
+        except Exception as e:
+            return _err(f"cli probe {self.address}: {e}",
+                        {"reachable": False, "latency_ms": 0})
+
+    async def get_device_info(self) -> Dict[str, Any]:
+        from transports import cli_io
+        return await self._with_session(cli_io.cli_get_device_info)
+
+    async def get_arp(self) -> Dict[str, Any]:
+        from transports import cli_io
+        return await self._with_session(cli_io.cli_get_arp)
+
+    async def get_mac_table(self) -> Dict[str, Any]:
+        from transports import cli_io
+        return await self._with_session(cli_io.cli_get_mac_table)
+
+    async def get_interfaces(self) -> Dict[str, Any]:
+        from transports import cli_io
+        return await self._with_session(cli_io.cli_get_interfaces)
+
+
+class RestDriver(NwDriver):
+    """REST driver (httpx). AOS-CX RESTv1 (basic auth) + Aruba/HPE gateway REST
+    (bearer token). TLS verify controlled by ``LM_NW_VERIFY_TLS`` (default off)."""
+    transport = "rest"
+
+    def _session(self):
+        from transports import rest_io
+        return rest_io.RestSession(self.device)
+
+    async def _with_session(self, fn) -> Dict[str, Any]:
+        from transports import rest_io
+        try:
+            async with self._session() as s:
+                rows = await fn(s, self.object_type)
+                return self._ok(rows)
+        except rest_io.RestError as e:
+            return _err(f"rest {self.address}: {e}")
+        except Exception as e:
+            return _err(f"rest {self.address}: {e}")
+
+    async def probe(self) -> Dict[str, Any]:
+        import time
+        t0 = time.monotonic()
+        try:
+            async with self._session() as s:
+                await rest_get_device_info(s, self.object_type)
+            return self._ok({"reachable": True,
+                             "latency_ms": int((time.monotonic() - t0) * 1000)})
+        except Exception as e:
+            return _err(f"rest probe {self.address}: {e}",
+                        {"reachable": False, "latency_ms": 0})
+
+    async def get_device_info(self) -> Dict[str, Any]:
+        from transports import rest_io
+        return await self._with_session(rest_io.rest_get_device_info)
+
+    async def get_arp(self) -> Dict[str, Any]:
+        from transports import rest_io
+        return await self._with_session(rest_io.rest_get_arp)
+
+    async def get_mac_table(self) -> Dict[str, Any]:
+        from transports import rest_io
+        return await self._with_session(rest_io.rest_get_mac_table)
+
+    async def get_interfaces(self) -> Dict[str, Any]:
+        from transports import rest_io
+        return await self._with_session(rest_io.rest_get_interfaces)
+
+
+# Forward ref for RestDriver.probe (defined above in the class body via the
+# rest_io helper; keep a module-level alias for clarity).
+async def rest_get_device_info(session, object_type):
+    from transports import rest_io
+    return await rest_io.rest_get_device_info(session, object_type)
 
 
 _TRANSPORT_CLASSES = {
@@ -217,7 +344,7 @@ class NwEngine:
     Holds the device list pushed by the hub (``set_devices``) and dispatches
     per-device commands to the appropriate driver. Stateless across commands
     apart from the cached fleet — each command resolves the device + builds a
-    fresh driver (drivers are cheap; real connections are per-call in phase 2).
+    fresh driver (drivers are cheap; real connections are per-call).
     """
 
     def __init__(self, devices: Optional[List[Dict[str, Any]]] = None):
@@ -225,7 +352,6 @@ class NwEngine:
 
     def set_devices(self, devices: List[Dict[str, Any]]) -> None:
         self.devices = list(devices or [])
-        # Log device count + types WITHOUT credentials.
         types = {}
         for d in self.devices:
             ot = (d.get("object_type") or "unknown")
@@ -247,53 +373,117 @@ class NwEngine:
 
     # ── Fleet ───────────────────────────────────────────────────────────────
     async def list_devices(self) -> Dict[str, Any]:
-        """Fleet summary (no credentials). Reachability is best-effort probed
-        per device in phase 2; phase 1 reports the configured fleet as-is."""
+        """Fleet summary (no credentials) with live reachability via a
+        concurrent lightweight probe per device (2s timeout each). Falls back
+        to ``unknown`` on probe error so the UI never shows a stale 'up'."""
         rows = []
-        for d in self.devices:
-            rows.append({
+        async def _probe_row(d):
+            drv = build_driver(d)
+            rcell = {"reachable": None, "latency_ms": None}
+            if drv:
+                try:
+                    pr = await asyncio.wait_for(drv.probe(), timeout=3.0)
+                    if pr.get("status") == "SUCCESS":
+                        rcell.update(pr.get("data") or {})
+                except (asyncio.TimeoutError, Exception):
+                    rcell = {"reachable": False, "latency_ms": None}
+            return {
                 "id": d.get("id", ""),
                 "name": d.get("name", ""),
                 "object_type": d.get("object_type", ""),
                 "address": d.get("address", ""),
                 "transport": NwDriver._resolve_transport(d),
-                "reachable": True,  # phase 2: probe each device
-            })
-        return {"status": "SUCCESS", "data": rows}
+                "reachable": rcell.get("reachable"),
+                "latency_ms": rcell.get("latency_ms"),
+            }
+        rows = await asyncio.gather(*(_probe_row(d) for d in self.devices))
+        return {"status": "SUCCESS", "data": list(rows)}
 
     # ── Per-device passthroughs ─────────────────────────────────────────────
     async def probe(self, device_id: str) -> Dict[str, Any]:
         drv = self._driver_for(device_id)
         if not drv:
-            return {"status": "ERROR", "message": f"Device {device_id} not found"}
+            return _err(f"Device {device_id} not found")
         return await drv.probe()
 
     async def get_device_info(self, device_id: str) -> Dict[str, Any]:
         drv = self._driver_for(device_id)
         if not drv:
-            return {"status": "ERROR", "message": f"Device {device_id} not found"}
+            return _err(f"Device {device_id} not found")
         return await drv.get_device_info()
 
     async def get_mac_table(self, device_id: str) -> Dict[str, Any]:
         drv = self._driver_for(device_id)
         if not drv:
-            return {"status": "ERROR", "message": f"Device {device_id} not found"}
+            return _err(f"Device {device_id} not found")
         return await drv.get_mac_table()
 
     async def get_arp(self, device_id: str) -> Dict[str, Any]:
         drv = self._driver_for(device_id)
         if not drv:
-            return {"status": "ERROR", "message": f"Device {device_id} not found"}
+            return _err(f"Device {device_id} not found")
         return await drv.get_arp()
 
     async def get_interfaces(self, device_id: str) -> Dict[str, Any]:
         drv = self._driver_for(device_id)
         if not drv:
-            return {"status": "ERROR", "message": f"Device {device_id} not found"}
+            return _err(f"Device {device_id} not found")
         return await drv.get_interfaces()
 
     async def run_config(self, device_id: str, commands: List[str]) -> Dict[str, Any]:
         drv = self._driver_for(device_id)
         if not drv:
-            return {"status": "ERROR", "message": f"Device {device_id} not found"}
+            return _err(f"Device {device_id} not found")
         return await drv.run_config(commands or [])
+
+    async def poll(self, device_id: str) -> Dict[str, Any]:
+        """Run a full poll (probe + device_info + interfaces + arp + mac_table)
+        for one device. Each sub-call is independent — a failure on one datum
+        doesn't sink the rest; failed datums come back as empty lists + an
+        entry in ``errors``. Used by the hub's POLL NOW path."""
+        drv = self._driver_for(device_id)
+        if not drv:
+            return _err(f"Device {device_id} not found")
+        errors: List[str] = []
+        reachable = False
+        latency_ms = None
+
+        pr = await drv.probe()
+        if pr.get("status") == "SUCCESS":
+            pd = pr.get("data") or {}
+            reachable = bool(pd.get("reachable"))
+            latency_ms = pd.get("latency_ms")
+        else:
+            errors.append(f"probe: {pr.get('message', 'failed')}")
+
+        async def _safe(coro, label):
+            r = await coro
+            if r.get("status") == "SUCCESS":
+                return r.get("data")
+            errors.append(f"{label}: {r.get('message', 'failed')}")
+            return [] if label != "device_info" else {}
+
+        device_info = await _safe(drv.get_device_info(), "device_info")
+        interfaces = await _safe(drv.get_interfaces(), "interfaces")
+        arp = await _safe(drv.get_arp(), "arp")
+        mac_table = await _safe(drv.get_mac_table(), "mac_table")
+
+        status = "SUCCESS" if reachable else ("PARTIAL" if any(errors) else "SUCCESS")
+        return {
+            "status": status,
+            "data": {
+                "reachable": reachable,
+                "latency_ms": latency_ms,
+                "device_info": device_info,
+                "interfaces": interfaces,
+                "arp": arp,
+                "mac_table": mac_table,
+            },
+            "errors": errors,
+            "message": (f"reachable={reachable}, "
+                        f"{len(interfaces) if isinstance(interfaces, list) else 0} "
+                        f"interface(s), "
+                        f"{len(arp) if isinstance(arp, list) else 0} arp, "
+                        f"{len(mac_table) if isinstance(mac_table, list) else 0} mac"
+                        + (f", errors={len(errors)}" if errors else "")),
+        }

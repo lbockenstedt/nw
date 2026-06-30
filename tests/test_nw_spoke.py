@@ -105,17 +105,25 @@ def test_list_devices_envelope_and_no_creds():
     assert res["data"][0]["transport"] == "ssh"  # aos_switch default
 
 
-# ── Per-device commands return SUCCESS envelopes (stubbed) ──────────────────
-def test_per_device_commands_success_envelopes():
+# ── Per-device commands return ERROR against an unreachable/fake host ────────
+# Real drivers actually attempt IO now; with no real device at 10.0.0.3 (and no
+# credentials), every datum returns an ERROR envelope — the opposite of the old
+# stubbed SUCCESS. This is the whole point of the rework: silence is no longer
+# mistaken for "reachable, zero rows".
+def test_per_device_commands_error_against_fake_host():
+    # transport=snmp with no community → SnmpSession raises in the session ctor
+    # (no IO attempted), so every datum returns ERROR fast. This is the real
+    # behavior change vs the old stubs: a misconfigured device is no longer
+    # reported as "SUCCESS, zero rows".
     spoke = _spoke_with([
-        {"id": "d1", "name": "sw1", "object_type": "cx_switch", "address": "10.0.0.3"},
+        {"id": "d1", "name": "sw1", "object_type": "cx_switch",
+         "address": "10.0.0.3", "transport": "snmp"},
     ])
-    for cmd, key in [("NW_GET_MAC_TABLE", "data"), ("NW_GET_ARP", "data"),
-                     ("NW_GET_INTERFACES", "data"), ("NW_GET_DEVICE_INFO", "data"),
-                     ("NW_PROBE", "data")]:
+    for cmd in ("NW_GET_MAC_TABLE", "NW_GET_ARP", "NW_GET_INTERFACES",
+                "NW_GET_DEVICE_INFO", "NW_PROBE"):
         res = _run(spoke.handle_command(cmd, {"device_id": "d1"}))
-        assert res["status"] == "SUCCESS", f"{cmd} -> {res}"
-        assert key in res, f"{cmd} missing {key}"
+        assert res["status"] == "ERROR", f"{cmd} -> {res}"
+        assert "message" in res
 
 
 def test_per_device_unknown_device_errors():
@@ -126,13 +134,13 @@ def test_per_device_unknown_device_errors():
 
 
 # ── NW_RUN_CONFIG returns applied/errors lists ──────────────────────────────
-def test_run_config_returns_applied():
+def test_run_config_not_implemented():
     spoke = _spoke_with([{"id": "d1", "object_type": "ex_switch", "address": "10.0.0.4"}])
     res = _run(spoke.handle_command("NW_RUN_CONFIG",
                {"device_id": "d1", "commands": ["set system name foo", "commit"]}))
-    assert res["status"] == "SUCCESS"
-    assert res["applied"] == ["set system name foo", "commit"]
-    assert res["errors"] == []
+    assert res["status"] == "ERROR"
+    assert res["applied"] == []
+    assert res["errors"] and "not implemented" in res["errors"][0]
 
 
 # ── get_version / GET_VERSION ────────────────────────────────────────────────

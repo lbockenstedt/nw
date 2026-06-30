@@ -98,6 +98,19 @@ class NwSpoke(BaseSpoke):
                                for r in res["data"] if isinstance(r, dict)]
             return res
 
+        if normalized_cmd == "NW_POLL":
+            # Full poll: probe + device_info + interfaces + arp + mac_table in
+            # one call. Canonicalize every MAC-bearing sub-list on the way out.
+            res = await self.engine.poll(device_id)
+            d = res.get("data") if isinstance(res.get("data"), dict) else None
+            if d is not None:
+                for key in ("arp", "mac_table", "interfaces"):
+                    lst = d.get(key)
+                    if isinstance(lst, list):
+                        d[key] = [{**r, "mac": _norm_mac(r.get("mac", ""))}
+                                  for r in lst if isinstance(r, dict)]
+            return res
+
         if normalized_cmd == "NW_RUN_CONFIG":
             commands = (data or {}).get("commands", []) if isinstance(data, dict) else []
             return await self.engine.run_config(device_id, commands)
