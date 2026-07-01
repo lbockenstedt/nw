@@ -92,6 +92,17 @@ EOF
 
 # --- Systemd Service (For Remote/Independent Deployment) ---
 echo "⚙️ Creating systemd service for auto-start..."
+# ExecStart uses the equals-attached arg form (--id=VALUE, not --id VALUE) for
+# every flag. control_plane.py declares --secret/--hub-secret with argparse
+# nargs='?', which REFUSES to consume a following token that starts with '-'
+# (treats it as an option flag). A generated hub-secret like "-3s6bmMPW4..."
+# therefore made argparse abort with "unrecognized arguments: -3s6bm..." and
+# the spoke crash-looped (nw-spoke-1 never registered). The equals form takes
+# everything after '=' verbatim, so any value (empty, leading-dash, or
+# otherwise) is accepted. Empty SPOKE_SECRET then resolves to "" (matches the
+# unauthenticated + await-admin-approval intent above). NOTE: keep this
+# rationale HERE, above the unquoted heredoc — backticks in a comment would
+# be run as command substitution inside <<EOF.
 cat <<EOF > /etc/systemd/system/lm-nw.service
 [Unit]
 Description=Lab Manager Spoke - Network Devices Manager
@@ -103,13 +114,7 @@ User=svc_lm
 WorkingDirectory=$INSTALL_DIR/nw
 EnvironmentFile=$INSTALL_DIR/nw/.env
 Environment="PYTHONPATH=$INSTALL_DIR:$INSTALL_DIR/core/src:$INSTALL_DIR/nw/src"
-# Use the `=`-attached form for every arg (not the space form). control_plane.py
-# declares --secret/--hub-secret with argparse `nargs='?'`, which REFUSES to
-# consume a following token that starts with `-` (treats it as an option flag).
-# A generated hub-secret like "-3s6bmMPW4..." therefore made argparse abort with
-# "unrecognized arguments: -3s6bm..." and the spoke crash-looped (nw-spoke-1
-# never registered). `--hub-secret=VALUE` takes everything after `=` verbatim,
-# so any value — empty, leading-dash, or otherwise — is accepted.
+# equals-attached args: accepts values that start with '-' (see installer note above)
 ExecStart=$INSTALL_DIR/nw/venv/bin/python3 -m src.control_plane --id=\${SPOKE_ID} --secret=\${SPOKE_SECRET} --hub=\${HUB_URL} --hub-secret=\${HUB_SECRET}
 StandardOutput=append:/var/log/lm/lm-nw.log
 StandardError=append:/var/log/lm/lm-nw.log
