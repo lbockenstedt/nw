@@ -371,6 +371,33 @@ class NwEngine:
             return None
         return build_driver(d)
 
+    # ── Logging: standard per-datum outcome trail ───────────────────────────
+    @staticmethod
+    def _log_datum(method: str, drv: "NwDriver", res: Dict[str, Any],
+                    detail: Optional[str] = None) -> None:
+        """Log a per-datum outcome in the standard module form: INFO on success
+        (with a row count), ERROR on failure. The ERROR line carries the word
+        "error" so it surfaces in the hub's GET_ERROR_LOGS / Error Log tab —
+        same precedent as the opnsense engine's ``logger.error`` on API failure
+        and the hub sync loops' ``[sync-error]`` marker (one place to go, no
+        spoke-log dig). Best-effort: logging never raises — a transport failure
+        is still returned in the envelope regardless."""
+        try:
+            status = str((res or {}).get("status", "")).upper()
+            msg = (res or {}).get("message", "") or "transport failure"
+            if detail is None:
+                data = (res or {}).get("data")
+                detail = f"{len(data)} rows" if isinstance(data, list) else "ok"
+            tag = (f"[{getattr(drv, 'object_type', '')}/"
+                   f"{getattr(drv, 'transport', '')}] "
+                   f"{method} {getattr(drv, 'address', '')}")
+            if status == "SUCCESS":
+                logger.info("nw %s -> %s", tag, detail)
+            else:
+                logger.error("nw %s -> error: %s", tag, msg)
+        except Exception:
+            logger.debug("nw log_datum %s failed", method, exc_info=True)
+
     # ── Fleet ───────────────────────────────────────────────────────────────
     async def list_devices(self) -> Dict[str, Any]:
         """Fleet summary (no credentials) with live reachability via a
@@ -385,8 +412,18 @@ class NwEngine:
                     pr = await asyncio.wait_for(drv.probe(), timeout=3.0)
                     if pr.get("status") == "SUCCESS":
                         rcell.update(pr.get("data") or {})
-                except (asyncio.TimeoutError, Exception):
+                    else:
+                        # Per-device probe failure — log once at WARNING (not
+                        # ERROR: a fleet list isn't a sync push, and one down
+                        # device among many is normal). The probe's own datum
+                        # log already fired inside drv.probe().
+                        logger.warning("nw probe %s during fleet list: %s",
+                                       getattr(drv, "address", ""),
+                                       pr.get("message", "probe failed"))
+                except (asyncio.TimeoutError, Exception) as e:
                     rcell = {"reachable": False, "latency_ms": None}
+                    logger.warning("nw probe %s during fleet list: %s",
+                                   getattr(drv, "address", ""), e)
             return {
                 "id": d.get("id", ""),
                 "name": d.get("name", ""),
@@ -397,42 +434,65 @@ class NwEngine:
                 "latency_ms": rcell.get("latency_ms"),
             }
         rows = await asyncio.gather(*(_probe_row(d) for d in self.devices))
+        up = sum(1 for r in rows if r.get("reachable") is True)
+        down = sum(1 for r in rows if r.get("reachable") is False)
+        logger.info("nw list_devices -> %d device(s): %d reachable, %d unreachable, "
+                    "%d unknown", len(rows), up, down, len(rows) - up - down)
         return {"status": "SUCCESS", "data": list(rows)}
 
     # ── Per-device passthroughs ─────────────────────────────────────────────
     async def probe(self, device_id: str) -> Dict[str, Any]:
         drv = self._driver_for(device_id)
         if not drv:
+            logger.warning("nw probe: device %s not in fleet", device_id)
             return _err(f"Device {device_id} not found")
-        return await drv.probe()
+        res = await drv.probe()
+        pd = res.get("data") if isinstance(res.get("data"), dict) else {}
+        self._log_datum("probe", drv, res,
+                        detail=f"reachable={pd.get('reachable')} "
+                               f"latency={pd.get('latency_ms')}ms")
+        return res
 
     async def get_device_info(self, device_id: str) -> Dict[str, Any]:
         drv = self._driver_for(device_id)
         if not drv:
+            logger.warning("nw get_device_info: device %s not in fleet", device_id)
             return _err(f"Device {device_id} not found")
-        return await drv.get_device_info()
+        res = await drv.get_device_info()
+        self._log_datum("device_info", drv, res)
+        return res
 
     async def get_mac_table(self, device_id: str) -> Dict[str, Any]:
         drv = self._driver_for(device_id)
         if not drv:
+            logger.warning("nw get_mac_table: device %s not in fleet", device_id)
             return _err(f"Device {device_id} not found")
-        return await drv.get_mac_table()
+        res = await drv.get_mac_table()
+        self._log_datum("mac_table", drv, res)
+        return res
 
     async def get_arp(self, device_id: str) -> Dict[str, Any]:
         drv = self._driver_for(device_id)
         if not drv:
+            logger.warning("nw get_arp: device %s not in fleet", device_id)
             return _err(f"Device {device_id} not found")
-        return await drv.get_arp()
+        res = await drv.get_arp()
+        self._log_datum("arp", drv, res)
+        return res
 
     async def get_interfaces(self, device_id: str) -> Dict[str, Any]:
         drv = self._driver_for(device_id)
         if not drv:
+            logger.warning("nw get_interfaces: device %s not in fleet", device_id)
             return _err(f"Device {device_id} not found")
-        return await drv.get_interfaces()
+        res = await drv.get_interfaces()
+        self._log_datum("interfaces", drv, res)
+        return res
 
     async def run_config(self, device_id: str, commands: List[str]) -> Dict[str, Any]:
         drv = self._driver_for(device_id)
         if not drv:
+            logger.warning("nw run_config: device %s not in fleet", device_id)
             return _err(f"Device {device_id} not found")
         return await drv.run_config(commands or [])
 
@@ -443,6 +503,7 @@ class NwEngine:
         entry in ``errors``. Used by the hub's POLL NOW path."""
         drv = self._driver_for(device_id)
         if not drv:
+            logger.warning("nw poll: device %s not in fleet", device_id)
             return _err(f"Device {device_id} not found")
         errors: List[str] = []
         reachable = False
@@ -453,11 +514,15 @@ class NwEngine:
             pd = pr.get("data") or {}
             reachable = bool(pd.get("reachable"))
             latency_ms = pd.get("latency_ms")
+            self._log_datum("probe", drv, pr,
+                            detail=f"reachable={reachable} latency={latency_ms}ms")
         else:
+            self._log_datum("probe", drv, pr)
             errors.append(f"probe: {pr.get('message', 'failed')}")
 
         async def _safe(coro, label):
             r = await coro
+            self._log_datum(label, drv, r)
             if r.get("status") == "SUCCESS":
                 return r.get("data")
             errors.append(f"{label}: {r.get('message', 'failed')}")
@@ -469,6 +534,12 @@ class NwEngine:
         mac_table = await _safe(drv.get_mac_table(), "mac_table")
 
         status = "SUCCESS" if reachable else ("PARTIAL" if any(errors) else "SUCCESS")
+        n_if = len(interfaces) if isinstance(interfaces, list) else 0
+        n_arp = len(arp) if isinstance(arp, list) else 0
+        n_mac = len(mac_table) if isinstance(mac_table, list) else 0
+        logger.info("nw poll %s -> status=%s reachable=%s interfaces=%d arp=%d "
+                    "mac=%d errors=%d", getattr(drv, "address", ""), status,
+                    reachable, n_if, n_arp, n_mac, len(errors))
         return {
             "status": status,
             "data": {
@@ -481,9 +552,8 @@ class NwEngine:
             },
             "errors": errors,
             "message": (f"reachable={reachable}, "
-                        f"{len(interfaces) if isinstance(interfaces, list) else 0} "
-                        f"interface(s), "
-                        f"{len(arp) if isinstance(arp, list) else 0} arp, "
-                        f"{len(mac_table) if isinstance(mac_table, list) else 0} mac"
+                        f"{n_if} interface(s), "
+                        f"{n_arp} arp, "
+                        f"{n_mac} mac"
                         + (f", errors={len(errors)}" if errors else "")),
         }

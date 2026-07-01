@@ -45,7 +45,34 @@ class NwSpoke(BaseSpoke):
         normalized_cmd = (command_type or "").upper()
         log_data = self._mask(data)
         logger.info(f"Handling Nw Command: {command_type} with data {log_data}")
+        res = await self._dispatch_command(normalized_cmd, command_type, data)
+        self._log_result(command_type, res)
+        return res
 
+    @staticmethod
+    def _log_result(command_type: str, res: Dict[str, Any]) -> None:
+        """Log every command's outcome in the standard module form: INFO on
+        success, ERROR on failure. The ERROR line carries the word "error" so
+        it surfaces in the hub's GET_ERROR_LOGS / Error Log tab (same precedent
+        as the opnsense spoke's per-command result logging + the hub sync
+        loops' ``[sync-error]`` marker). ``errors`` (from NW_POLL / NW_RUN_CONFIG)
+        is surfaced as a sub-error count. Best-effort: never raises."""
+        try:
+            status = str((res or {}).get("status", "")).upper()
+            msg = (res or {}).get("message", "")
+            errors = (res or {}).get("errors") or []
+            if status == "ERROR" or errors:
+                logger.error("nw command %s result: error — %s%s", command_type,
+                             msg or "failed",
+                             f" ({len(errors)} sub-error(s))" if errors else "")
+            else:
+                logger.info("nw command %s result: %s", command_type,
+                            status.lower() or "ok")
+        except Exception:
+            logger.debug("nw log_result failed", exc_info=True)
+
+    async def _dispatch_command(self, normalized_cmd: str, command_type: str,
+                                data: Dict[str, Any]) -> Dict[str, Any]:
         # ── Lifecycle / config ──────────────────────────────────────────────
         if normalized_cmd == "UPDATE_CONFIG":
             devices = (data or {}).get("devices", []) if isinstance(data, dict) else []
