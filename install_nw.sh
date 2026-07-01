@@ -103,7 +103,14 @@ User=svc_lm
 WorkingDirectory=$INSTALL_DIR/nw
 EnvironmentFile=$INSTALL_DIR/nw/.env
 Environment="PYTHONPATH=$INSTALL_DIR:$INSTALL_DIR/core/src:$INSTALL_DIR/nw/src"
-ExecStart=$INSTALL_DIR/nw/venv/bin/python3 -m src.control_plane --id \$SPOKE_ID --secret \$SPOKE_SECRET --hub \$HUB_URL --hub-secret \$HUB_SECRET
+# Use the `=`-attached form for every arg (not the space form). control_plane.py
+# declares --secret/--hub-secret with argparse `nargs='?'`, which REFUSES to
+# consume a following token that starts with `-` (treats it as an option flag).
+# A generated hub-secret like "-3s6bmMPW4..." therefore made argparse abort with
+# "unrecognized arguments: -3s6bm..." and the spoke crash-looped (nw-spoke-1
+# never registered). `--hub-secret=VALUE` takes everything after `=` verbatim,
+# so any value — empty, leading-dash, or otherwise — is accepted.
+ExecStart=$INSTALL_DIR/nw/venv/bin/python3 -m src.control_plane --id=\${SPOKE_ID} --secret=\${SPOKE_SECRET} --hub=\${HUB_URL} --hub-secret=\${HUB_SECRET}
 StandardOutput=append:/var/log/lm/lm-nw.log
 StandardError=append:/var/log/lm/lm-nw.log
 Restart=always
