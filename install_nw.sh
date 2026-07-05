@@ -51,11 +51,11 @@ if [ -d "nw" ]; then
     echo "📂 Network Devices directory exists. Preparing for update..."
     SPOKE_PATH="$INSTALL_DIR/nw"
     cd "$SPOKE_PATH"
-    git pull
+    git fetch origin -q && git reset --hard origin/main   # hard-sync (soft `git pull` no-ops on a diverged/detached clone)
     cd "$INSTALL_DIR"
 elif [ -d ".git" ]; then
     # This case is for when we are already inside the nw dir
-    git pull
+    git fetch origin -q && git reset --hard origin/main   # hard-sync
     SPOKE_PATH="$(pwd)"
 else
     echo "🌐 Cloning Network Devices Manager repository..."
