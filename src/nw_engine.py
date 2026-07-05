@@ -533,7 +533,10 @@ class NwEngine:
         arp = await _safe(drv.get_arp(), "arp")
         mac_table = await _safe(drv.get_mac_table(), "mac_table")
 
-        status = "SUCCESS" if reachable else ("PARTIAL" if any(errors) else "SUCCESS")
+        # SUCCESS only when reachable AND no sub-datum errored; else PARTIAL — a
+        # reachable device whose info/interfaces/arp/mac probes all failed must not
+        # report SUCCESS (the errors[] carry the detail).
+        status = "SUCCESS" if (reachable and not any(errors)) else "PARTIAL"
         n_if = len(interfaces) if isinstance(interfaces, list) else 0
         n_arp = len(arp) if isinstance(arp, list) else 0
         n_mac = len(mac_table) if isinstance(mac_table, list) else 0
