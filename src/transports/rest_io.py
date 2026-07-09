@@ -184,24 +184,31 @@ def map_system_gateway(payload: Any) -> dict:
 
 # ── High-level async gathers (the RestDriver calls these) ────────────────────
 async def rest_get_device_info(session: RestSession, object_type: str) -> dict:
+    """GET the vendor system endpoint and map to
+    ``{model, serial, firmware, interfaces_count}``."""
     path = "/rest/v1/system" if object_type == "cx_switch" else "/api/system/info"
     mapper = map_system_cx if object_type == "cx_switch" else map_system_gateway
     return mapper(await session.get(path))
 
 
 async def rest_get_arp(session: RestSession, object_type: str) -> List[dict]:
+    """GET the vendor ARP endpoint and map to ``[{ip, mac, interface}]``."""
     path = "/rest/v1/system/arp" if object_type == "cx_switch" else "/api/arp"
     mapper = map_arp_cx if object_type == "cx_switch" else map_arp_gateway
     return mapper(await session.get(path))
 
 
 async def rest_get_mac_table(session: RestSession, object_type: str) -> List[dict]:
+    """GET the vendor MAC-table endpoint and map to
+    ``[{mac, vlan, interface}]``."""
     path = "/rest/v1/system/mac-table" if object_type == "cx_switch" else "/api/mac-table"
     # AOS-CX mac-table mapper ~ gateway mac mapper.
     return map_mac_gateway(await session.get(path))
 
 
 async def rest_get_interfaces(session: RestSession, object_type: str) -> List[dict]:
+    """GET the vendor interfaces endpoint and map to
+    ``[{name, ip, mac, vlan, status, speed}]``."""
     path = "/rest/v1/interfaces" if object_type == "cx_switch" else "/api/interfaces"
     mapper = map_interfaces_cx if object_type == "cx_switch" else map_interfaces_gateway
     return mapper(await session.get(path))

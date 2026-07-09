@@ -41,6 +41,18 @@ class NwSpoke(BaseSpoke):
         return {k: ("********" if k in _SENSITIVE else v) for k, v in data.items()}
 
     async def handle_command(self, command_type: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Dispatch a hub NW_* command to the engine.
+
+        Command types (case-insensitive): ``UPDATE_CONFIG`` (store the fleet,
+        credentials masked in logs), ``GET_VERSION``, ``NW_LIST_DEVICES`` (fleet
+        summary + concurrent 3s reachability probe), ``NW_PROBE``,
+        ``NW_GET_DEVICE_INFO``, ``NW_GET_MAC_TABLE``, ``NW_GET_ARP``,
+        ``NW_GET_INTERFACES`` (each per-device via ``data["device_id"]``),
+        ``NW_POLL`` (probe + all four datums in one call, partial results on
+        partial failure), and ``NW_RUN_CONFIG`` (not-implemented envelope). MACs
+        are canonicalized to lower-colon form on the way out. Unknown commands
+        return an ERROR envelope. Every outcome is logged via ``_log_result``.
+        """
         # Normalize command type to uppercase for case-insensitive matching.
         normalized_cmd = (command_type or "").upper()
         log_data = self._mask(data)

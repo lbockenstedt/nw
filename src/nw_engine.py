@@ -401,7 +401,7 @@ class NwEngine:
     # ── Fleet ───────────────────────────────────────────────────────────────
     async def list_devices(self) -> Dict[str, Any]:
         """Fleet summary (no credentials) with live reachability via a
-        concurrent lightweight probe per device (2s timeout each). Falls back
+        concurrent lightweight probe per device (3s timeout each). Falls back
         to ``unknown`` on probe error so the UI never shows a stale 'up'."""
         rows = []
         async def _probe_row(d):

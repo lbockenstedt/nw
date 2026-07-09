@@ -332,6 +332,8 @@ async def _to_thread(fn, *args):
 
 
 async def snmp_probe(session: SnmpSession) -> dict:
+    """Reachability probe: GET sysUpTime and report ``{reachable, latency_ms}``.
+    Raises :class:`SnmpError` on timeout/no response."""
     import time
     t0 = time.monotonic()
     try:
@@ -342,6 +344,9 @@ async def snmp_probe(session: SnmpSession) -> dict:
 
 
 async def snmp_get_device_info(session: SnmpSession) -> dict:
+    """GET sysDescr/sysName/ifNumber and return
+    ``{model, serial, firmware, interfaces_count}`` (serial empty — ENTITY-MIB
+    not walked)."""
     sysdescr = await _to_thread(session.get, SYS_DESCR)
     sysname = await _to_thread(session.get, SYS_NAME)
     ifnum = await _to_thread(session.get, IF_NUMBER)
@@ -360,6 +365,9 @@ async def snmp_get_device_info(session: SnmpSession) -> dict:
 
 
 async def snmp_get_interfaces(session: SnmpSession) -> List[dict]:
+    """Walk ifTable + ipAdEntTable and return
+    ``[{name, ip, mac, vlan, status, speed}]`` (vlan empty — Q-BRIDGE-MIB not
+    walked this pass)."""
     iftable = parse_iftable(await _to_thread(session.walk, IF_PREFIX))
     ips = parse_ip_table(await _to_thread(session.walk, IP_PREFIX))
     rows = []
@@ -377,6 +385,8 @@ async def snmp_get_interfaces(session: SnmpSession) -> List[dict]:
 
 async def snmp_get_arp(session: SnmpSession,
                        ifaces: Optional[Dict[int, dict]] = None) -> List[dict]:
+    """Walk ipNetToMediaTable and return ``[{ip, mac, interface}]``. ``ifaces``
+    (from :func:`snmp_get_interfaces`) maps ifIndex → friendly interface name."""
     pairs = parse_arp(await _to_thread(session.walk, ARP_PREFIX))
     names = ifaces or {}
     return [{"ip": ip, "mac": mac,
@@ -387,6 +397,8 @@ async def snmp_get_arp(session: SnmpSession,
 async def snmp_get_mac_table(session: SnmpSession,
                              ifaces: Optional[Dict[int, dict]] = None
                              ) -> List[dict]:
+    """Walk BRIDGE-MIB FDB + base-port-ifIndex and return
+    ``[{mac, vlan, interface}]`` (vlan empty — Q-BRIDGE-MIB not walked)."""
     fdb = parse_fdb(await _to_thread(session.walk, FDB_ADDR_PREFIX))
     # also walk FDB_PORT to get ports; combine
     port_pairs = parse_fdb(await _to_thread(session.walk, FDB_PORT_PREFIX))

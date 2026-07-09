@@ -294,6 +294,8 @@ PARSERS: Dict[str, Any] = {
 
 # ── High-level async gathers (the SshCliDriver calls these) ──────────────────
 async def cli_get_device_info(session: CliSession, object_type: str) -> dict:
+    """Run the vendor ``info`` show command and parse model/serial/firmware from
+    its text (best-effort). Raises :class:`CliError` on command failure."""
     # Reuse the vendor "info" command via run(); model/firmware parsed from the
     # raw text best-effort.
     info_cmd = {"aos_switch": "show system-information",
@@ -309,6 +311,7 @@ async def cli_get_device_info(session: CliSession, object_type: str) -> dict:
 
 
 async def cli_get_arp(session: CliSession, object_type: str) -> List[dict]:
+    """Run the vendor ARP show command and return ``[{ip, mac, interface}]``."""
     arp_cmd = {"aos_switch": "show arp", "ex_switch": "show arp",
                "cx_switch": "show arp", "gateway": "show arp"}.get(object_type, "show arp")
     text = await session.run(arp_cmd)
@@ -316,6 +319,7 @@ async def cli_get_arp(session: CliSession, object_type: str) -> List[dict]:
 
 
 async def cli_get_mac_table(session: CliSession, object_type: str) -> List[dict]:
+    """Run the vendor MAC-table show command and return ``[{mac, vlan, interface}]``."""
     mac_cmd = {"aos_switch": "show mac-address", "ex_switch": "show ethernet-switching table",
                "cx_switch": "show mac-address", "gateway": "show mac-address"}.get(
                object_type, "show mac-address")
@@ -324,6 +328,8 @@ async def cli_get_mac_table(session: CliSession, object_type: str) -> List[dict]
 
 
 async def cli_get_interfaces(session: CliSession, object_type: str) -> List[dict]:
+    """Run the vendor interface show command and return
+    ``[{name, ip, mac, vlan, status, speed}]`` (IP/MAC/VLAN best-effort)."""
     if_cmd = {"aos_switch": "show interfaces brief", "ex_switch": "show interfaces descriptions",
               "cx_switch": "show interfaces brief", "gateway": "show interfaces"}.get(
               object_type, "show interfaces")

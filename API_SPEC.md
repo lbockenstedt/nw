@@ -79,7 +79,7 @@ bound to this spoke via `UPDATE_CONFIG`. Each device dict:
 
 | object_type  | default transport | vendor CLI / API                             |
 |--------------|-------------------|----------------------------------------------|
-| `aos_switch` | ssh               | Aruba AOS-S (`show mac-address-table`, `show arp`, `show system`) |
+| `aos_switch` | ssh               | Aruba AOS-S (`show mac-address`, `show arp`, `show system-information`) |
 | `cx_switch`  | rest              | Aruba AOS-CX RESTv1 (`/rest/v1/...`)         |
 | `ex_switch`  | ssh               | Junos (`show ethernet-switching table`, `show arp`, `show version`) |
 | `gateway`    | rest              | Aruba/HPE gateway REST                       |
