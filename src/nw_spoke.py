@@ -1,6 +1,6 @@
 import logging
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any
 
 try:
     from core.src.base_spoke import BaseSpoke

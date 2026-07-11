@@ -182,22 +182,6 @@ def _mac_from_octets(value: Any) -> str:
     return ""
 
 
-def _suffix_int(oid: str, prefix: str) -> Optional[int]:
-    """Return the integer suffix of ``oid`` after ``prefix`` (e.g. the ifIndex
-    for an ifTable column), or None if it doesn't match."""
-    if not oid.startswith(prefix):
-        return None
-    rest = oid[len(prefix):]
-    rest = rest.lstrip(".")
-    if not rest:
-        return None
-    head = rest.split(".")[0]
-    try:
-        return int(head)
-    except ValueError:
-        return None
-
-
 def parse_iftable(walk_pairs: List[Tuple[str, Any]]) -> Dict[int, dict]:
     """Walk pairs across the ifTable columns → {ifIndex: {name,mac,status,speed}}."""
     out: Dict[int, dict] = {}

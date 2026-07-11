@@ -8,11 +8,9 @@ overridable via the ``LM_NW_VERIFY_TLS`` env knob.
 JSON→row mappers are pure functions (testable without HTTP); the RestSession
 does the GETs and the driver calls the high-level gather functions.
 """
-import asyncio
 import logging
 import os
-import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 logger = logging.getLogger("NwRest")
 
