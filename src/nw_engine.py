@@ -311,6 +311,28 @@ class RestDriver(NwDriver):
         from transports import rest_io
         return await self._with_session(rest_io.rest_get_interfaces)
 
+    async def install_cert(self, fullchain: str, privkey: str, chain: str,
+                           domain: str) -> Dict[str, Any]:
+        """Install a CA-signed cert on this REST device (AOS-CX today) and bind
+        it to the HTTPS server. Own try/except (not ``_with_session``) so the
+        envelope carries a clear install message rather than a datum row
+        count. The cert material + key are pushed inline (no SCP); see
+        :func:`transports.rest_io.rest_install_cert` for the sequence."""
+        from transports import rest_io
+        try:
+            async with self._session() as s:
+                data = await rest_io.rest_install_cert(
+                    s, self.object_type, fullchain, privkey, chain, domain)
+            msg = (f"cert '{data.get('cert_name')}' installed on "
+                   f"{self.address} ({data.get('service')})")
+            self._log("install_cert",
+                      f"cert={data.get('cert_name')} prefix={data.get('rest_prefix')}")
+            return self._ok(data, message=msg)
+        except rest_io.RestError as e:
+            return _err(f"rest install_cert {self.address}: {e}")
+        except Exception as e:
+            return _err(f"rest install_cert {self.address}: {e}")
+
 
 # Forward ref for RestDriver.probe (defined above in the class body via the
 # rest_io helper; keep a module-level alias for clarity).
@@ -495,6 +517,51 @@ class NwEngine:
             logger.warning("nw run_config: device %s not in fleet", device_id)
             return _err(f"Device {device_id} not found")
         return await drv.run_config(commands or [])
+
+    async def install_cert(self, device_id: str, fullchain: str, privkey: str,
+                           chain: str, domain: str) -> Dict[str, Any]:
+        """Install a hub-delivered LE cert on a fleet device. Dispatches by
+        ``object_type``:
+
+        * ``cx_switch`` (AOS-CX, REST) → ``RestDriver.install_cert`` (inline
+          cert+key PUT + https-server binding via REST v10).
+        * ``aos_switch`` (AOS-S) → ERROR: the switch generates its keypair
+          on-device during CSR creation and has no command to import an
+          external private key — fundamentally incompatible with the
+          ACME/certbot external-key model.
+        * ``ex_switch`` / ``gateway`` → ERROR: not yet implemented (Juniper EX
+          needs SFTP upload + config-mode; the gateway path is platform-
+          dependent SSH/SFTP). The ERROR message names the gap so the hub's
+          cert-distribution ledger surfaces it instead of a silent skip.
+
+        The hub addresses a device by ``identifier`` (its fleet ``id``); the
+        spoke maps that to ``device_id`` here. Returns the standard envelope."""
+        drv = self._driver_for(device_id)
+        if not drv:
+            logger.warning("nw install_cert: device %s not in fleet", device_id)
+            return _err(f"Device {device_id} not found")
+        ot = (drv.object_type or "").strip().lower()
+        if ot == "cx_switch":
+            if drv.transport != "rest":
+                return _err(f"cx_switch cert install requires the REST transport "
+                            f"(device '{device_id}' is '{drv.transport}'; "
+                            f"CLI PEM-paste not yet wired)")
+            res = await drv.install_cert(fullchain, privkey, chain, domain)
+            self._log_datum(
+                "install_cert", drv, res,
+                detail=res.get("message") if res.get("status") == "SUCCESS" else None)
+            return res
+        if ot == "aos_switch":
+            return _err("AOS-Switch cannot import an external private key "
+                        "(on-switch CSR model) — ACME/certbot external key "
+                        "is incompatible; generate the CSR on the switch instead")
+        if ot == "ex_switch":
+            return _err("Juniper EX cert install not yet implemented "
+                        "(needs SFTP upload + config-mode plumbing)")
+        if ot == "gateway":
+            return _err("gateway cert install not yet implemented "
+                        "(platform-dependent SSH/SFTP plumbing)")
+        return _err(f"cert install not supported for object_type '{ot}'")
 
     async def poll(self, device_id: str) -> Dict[str, Any]:
         """Run a full poll (probe + device_info + interfaces + arp + mac_table)

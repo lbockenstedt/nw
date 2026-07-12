@@ -52,6 +52,9 @@ class NwSpoke(BaseSpoke):
         partial failure), and ``NW_RUN_CONFIG`` (not-implemented envelope). MACs
         are canonicalized to lower-colon form on the way out. Unknown commands
         return an ERROR envelope. Every outcome is logged via ``_log_result``.
+        ``INSTALL_CERT`` (hub-brokered cert distribution) installs a delivered
+        LE cert on the device named by ``identifier`` (cx_switch via AOS-CX REST
+        v10; other families return a clear ERROR naming the gap).
         """
         # Normalize command type to uppercase for case-insensitive matching.
         normalized_cmd = (command_type or "").upper()
@@ -153,6 +156,29 @@ class NwSpoke(BaseSpoke):
         if normalized_cmd == "NW_RUN_CONFIG":
             commands = (data or {}).get("commands", []) if isinstance(data, dict) else []
             return await self.engine.run_config(device_id, commands)
+
+        if normalized_cmd == "INSTALL_CERT":
+            # Hub-brokered cert distribution: install the delivered LE cert on
+            # the target fleet device. The hub addresses a device by
+            # ``identifier`` (its fleet id); accept ``device_id`` as a fallback
+            # (parity with the other per-device commands). The engine
+            # dispatches by object_type — cx_switch via AOS-CX REST v10 today;
+            # aos_switch / ex_switch / gateway return a clear ERROR naming the
+            # gap so the hub ledger surfaces it.
+            d = data or {}
+            identifier = (d.get("identifier") or d.get("device_id") or "").strip()
+            fullchain = d.get("fullchain", "")
+            privkey = d.get("privkey", "")
+            chain = d.get("chain", "")
+            domain = d.get("domain", "")
+            if not identifier:
+                return {"status": "ERROR",
+                        "message": "INSTALL_CERT requires identifier (device id)"}
+            if not fullchain or not privkey:
+                return {"status": "ERROR",
+                        "message": "INSTALL_CERT requires fullchain + privkey"}
+            return await self.engine.install_cert(
+                identifier, fullchain, privkey, chain, domain)
 
         # ── Unknown ─────────────────────────────────────────────────────────
         logger.warning(f"Unknown Nw command type: {command_type}")

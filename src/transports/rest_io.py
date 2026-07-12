@@ -81,6 +81,28 @@ class RestSession:
         except Exception as e:
             raise RestError(f"GET {path} on {self.host}: {e}")
 
+    async def post(self, path: str, json: Any = None) -> Any:
+        if not self._client:
+            await self.connect()
+        try:
+            r = await self._client.post(path, json=json)
+            r.raise_for_status()
+            # Tolerate empty success bodies (204 No Content) — r.json() on an
+            # empty body raises, so return None for a contentless 2xx.
+            return r.json() if r.content else None
+        except Exception as e:
+            raise RestError(f"POST {path} on {self.host}: {e}")
+
+    async def put(self, path: str, json: Any = None) -> Any:
+        if not self._client:
+            await self.connect()
+        try:
+            r = await self._client.put(path, json=json)
+            r.raise_for_status()
+            return r.json() if r.content else None
+        except Exception as e:
+            raise RestError(f"PUT {path} on {self.host}: {e}")
+
 
 # ── Pure JSON mappers (testable) ──────────────────────────────────────────────
 def _elements(payload: Any) -> List[dict]:
@@ -210,3 +232,104 @@ async def rest_get_interfaces(session: RestSession, object_type: str) -> List[di
     path = "/rest/v1/interfaces" if object_type == "cx_switch" else "/api/interfaces"
     mapper = map_interfaces_cx if object_type == "cx_switch" else map_interfaces_gateway
     return mapper(await session.get(path))
+
+
+# ── Cert install (AOS-CX REST v10) ───────────────────────────────────────────
+# AOS-CX manages server certs under REST v10 (NOT v1): install the cert+key
+# inline via PUT /rest/v10_xx/certificates/{name}, then bind it to the
+# https-server via the system configuration's certificate_association. The v10
+# minor-version path is device-specific, so it's resolved from the firmware
+# version (or an explicit LM_NW_CX_REST_VER override). Only cx_switch is wired
+# here — the gateway REST cert endpoint is platform-dependent (ArubaOS
+# controller vs AOS-CX gateway) and not implemented; aos_switch / ex_switch
+# need SSH/SFTP plumbing that the CLI driver doesn't have yet.
+
+def _cx_cert_name(domain: str) -> str:
+    """Sanitize a cert domain into an AOS-CX certificate name
+    (``lm-le-<sanitized-domain>``). AOS-CX cert names are conservative on
+    allowed characters, so everything outside ``[a-z0-9-]`` becomes ``-``;
+    a wildcard leading label (``*.``) becomes ``wild``; an empty domain falls
+    back to ``cert``. Capped at 63 chars (a typical name ceiling)."""
+    import re
+    base = (domain or "cert").strip().lower().replace("*", "wild")
+    base = re.sub(r"[^a-z0-9-]", "-", base)
+    base = re.sub(r"-+", "-", base).strip("-")
+    if not base:
+        base = "cert"
+    return f"lm-le-{base}"[:63]
+
+
+async def _cx_v10_prefix(session: "RestSession") -> str:
+    """Resolve the AOS-CX REST v10 minor-version path prefix (e.g. ``v10_13``).
+
+    Override via ``LM_NW_CX_REST_VER`` (e.g. ``v10_13``) when the firmware
+    parse is unavailable or the deployment pins a specific REST version. Else
+    parse ``10.XX`` out of ``GET /rest/v1/system``'s ``firmware_version``
+    (``RL.10.13.0001`` → ``v10_13``). Falls back to ``v10_09`` (broadly
+    supported across current AOS-CX) when neither yields a version."""
+    import os
+    import re
+    override = os.getenv("LM_NW_CX_REST_VER", "").strip().lstrip("/")
+    if override:
+        return override
+    try:
+        sysinfo = await session.get("/rest/v1/system")
+        fw = str((sysinfo or {}).get("firmware_version")
+                 or (sysinfo or {}).get("os_version") or "")
+        m = re.search(r"10\.(\d{1,2})", fw)
+        if m:
+            return f"v10_{int(m.group(1)):02d}"
+    except Exception:
+        pass
+    return "v10_09"
+
+
+async def rest_install_cert(session: "RestSession", object_type: str,
+                            fullchain: str, privkey: str, chain: str,
+                            domain: str) -> dict:
+    """Install a CA-signed cert (LE fullchain + key) on a REST-managed device
+    and bind it to the HTTPS server. AOS-CX (``cx_switch``) only — raises
+    ``RestError`` for any other object_type (the caller surfaces the ERROR).
+
+    Sequence (AOS-CX REST v10):
+      1. ``PUT /rest/{prefix}/certificates/{cert_name}`` with the fullchain +
+         private key concatenated in one ``certificate`` PEM blob (password
+         ``""`` — certbot produces an unencrypted key). AOS-CX stores the
+         cert+key; it does NOT need a TA profile for the HTTPS *server* role
+         (the client validates the leaf; the switch presents it as-is).
+      2. ``GET /rest/{prefix}/system?selector=configuration`` → set
+         ``certificate_association["https-server"] = cert_name`` →
+         ``PUT /rest/{prefix}/system`` with the modified body so the switch
+         presents the new cert on its HTTPS endpoint.
+
+    Returns ``{cert_name, service, rest_prefix}``. Raises ``RestError`` with
+    the step + host on any failure (the driver wraps it in an ERROR envelope)."""
+    if object_type != "cx_switch":
+        raise RestError(f"REST cert install not implemented for {object_type}")
+    if not fullchain or "BEGIN CERTIFICATE" not in fullchain:
+        raise RestError("invalid or empty fullchain PEM")
+    if not privkey or "PRIVATE KEY" not in privkey:
+        raise RestError("invalid or empty privkey PEM")
+
+    prefix = await _cx_v10_prefix(session)
+    cert_name = _cx_cert_name(domain)
+
+    # 1. Install cert + key (inline PEM: fullchain, blank line, privkey).
+    cert_blob = fullchain.rstrip() + "\n\n" + privkey.rstrip() + "\n"
+    await session.put(f"/rest/{prefix}/certificates/{cert_name}",
+                      json={"certificate": cert_blob, "password": ""})
+
+    # 2. Bind it to the https-server via the system configuration.
+    syscfg = await session.get(f"/rest/{prefix}/system?selector=configuration")
+    if not isinstance(syscfg, dict):
+        raise RestError("system configuration GET did not return a JSON object")
+    assoc = syscfg.get("certificate_association")
+    if not isinstance(assoc, dict):
+        raise RestError(
+            "system configuration has no certificate_association object "
+            "(cannot bind https-server)")
+    assoc["https-server"] = cert_name
+    await session.put(f"/rest/{prefix}/system", json=syscfg)
+
+    return {"cert_name": cert_name, "service": "https-server",
+            "rest_prefix": prefix}
