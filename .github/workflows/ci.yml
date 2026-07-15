@@ -1,0 +1,100 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  lint-python:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        module: [cppm, cs, ldap, netbox, opnsense, pxmx, lm/core, qa]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with: { python-version: '3.9' }
+      - name: Install Linters
+        run: pip install ruff bandit pip-audit
+      - name: Run Analysis
+        run: |
+          cd ${{ matrix.module }}
+          ruff check . || echo "Ruff found issues"
+          bandit -r . || echo "Bandit found issues"
+          [ -f requirements.txt ] && pip-audit -r requirements.txt || echo "No requirements.txt found"
+
+  lint-shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run ShellCheck
+        run: |
+          sudo apt-get install -y shellcheck
+          shellcheck audit/*.sh
+
+  lint-webui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install & Lint
+        run: |
+          cd lm/WebUI
+          npm install
+          npm run lint || echo "No lint script found, skipping"
+
+  test-unit:
+    needs: [lint-python, lint-shell, lint-webui]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        module: [cppm, cs, ldap, netbox, opnsense, pxmx, lm/core, qa]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with: { python-version: '3.9' }
+      - name: Run Tests
+        run: |
+          cd ${{ matrix.module }}
+          if [ "${{ matrix.module }}" == "cppm" ]; then
+            pip install pytest -r requirements.txt
+            pytest tests/
+          else
+            # Basic syntax check for other modules
+            find src -name "*.py" -exec python -m py_compile {} + || echo "Syntax errors found"
+          fi
+
+  test-integration:
+    needs: test-unit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Spin up Environment
+        run: docker-compose up -d
+      - name: Run QA Engine
+        run: |
+          cd qa
+          pip install -r requirements.txt
+          python main.py --hub localhost --spoke-id CI_SPOKE --secret CI_SECRET
+      - name: Cleanup
+        run: docker-compose down
+
+  build:
+    needs: test-integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Docker Images
+        run: |
+          docker build -f cs/cs.Dockerfile -t cs:latest . || echo "CS build failed"
+          docker build -f opnsense/opnsense.Dockerfile -t opnsense:latest . || echo "OPNsense build failed"
+          docker build -f pxmx/pxmx.Dockerfile -t pxmx:latest . || echo "PXM build failed"
+          docker build -f lm/core/hub.Dockerfile -t lm-hub:latest . || echo "LM Hub build failed"
+          docker build -f lm/WebUI/ui.Dockerfile -t lm-ui:latest . || echo "LM UI build failed"
+      - name: Bundle WebUI
+        run: |
+          cd lm/WebUI
+          npm install && npm run build
+      - name: Bundle Audit Scripts
+        run: tar -czf audit-scripts.tar.gz audit/

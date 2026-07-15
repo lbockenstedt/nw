@@ -1,0 +1,40 @@
+name: Issue Automation
+
+on:
+  issues:
+    types: [opened, labeled]
+  issue_comment:
+    types: [created]
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    if: github.event.issue.labels.contains('ai-fix') || contains(github.event.comment.body, '/fix-this')
+    steps:
+      - uses: actions/checkout@v4
+      - name: GitHub CLI Setup
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Ensure the issue is labeled for tracking
+          gh issue edit ${{ github.event.issue.number }} --add-label "automated-fix"
+
+          # Create a branch for the fix
+          BRANCH_NAME="fix/issue-${{ github.event.issue.number }}"
+          git checkout -b $BRANCH_NAME
+          git push origin $BRANCH_NAME
+
+          # Post a comment indicating the AI agent has picked it up
+          gh issue comment ${{ github.event.issue.number }} --body "🤖 AI Agent has picked up this issue. Branch \`$BRANCH_NAME\` created. Implementation in progress..."
+
+  # In a real-world production setup, the 'execute' job would be a webhook
+  # calling an external AI Agent Runner (like Claude Code on a server).
+  # For this demonstration, we'll simulate the hand-off.
+  execute:
+    needs: triage
+    runs-on: ubuntu-latest
+    steps:
+      - name: Signal Agent Runner
+        run: |
+          echo "Signaling AI Agent to work on issue ${{ github.event.issue.number }} on branch fix/issue-${{ github.event.issue.number }}"
+          # This is where you would call your agent's API (e.g., curl -X POST https://agent-runner.internal/work)
