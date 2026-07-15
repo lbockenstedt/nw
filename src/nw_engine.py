@@ -262,6 +262,24 @@ class SshCliDriver(NwDriver):
         from transports import cli_io
         return await self._with_session(cli_io.cli_get_interfaces)
 
+    async def install_cert(self, fullchain: str, privkey: str, chain: str,
+                           domain: str) -> Dict[str, Any]:
+        """Install an LE server cert over SSH. Implemented for the ArubaOS
+        gateway/controller (PKCS#12 + SCP + crypto pki-import + web-server bind);
+        other CLI object_types have no external-key import path."""
+        from transports import cli_io
+        if self.object_type != "gateway":
+            return _err(f"CLI cert install not implemented for object_type "
+                        f"'{self.object_type}'")
+        try:
+            async with self._session() as s:
+                return await cli_io.cli_install_cert_gateway(
+                    s, fullchain, privkey, chain, domain)
+        except cli_io.CliError as e:
+            return _err(f"cli {self.address}: {e}")
+        except Exception as e:  # noqa: BLE001
+            return _err(f"cli {self.address}: {e}")
+
 
 class RestDriver(NwDriver):
     """REST driver (httpx). AOS-CX RESTv1 (basic auth) + Aruba/HPE gateway REST
@@ -559,17 +577,25 @@ class NwEngine:
             return _err("Juniper EX cert install not yet implemented "
                         "(needs SFTP upload + config-mode plumbing)")
         if ot == "gateway":
-            return _err("gateway cert install not yet implemented "
-                        "(platform-dependent SSH/SFTP plumbing)")
+            # ArubaOS mobility gateway/controller: PKCS#12 + SCP upload +
+            # crypto pki-import + web-server bind (SshCliDriver.install_cert).
+            if not hasattr(drv, "install_cert"):
+                return _err(f"gateway '{device_id}' driver has no cert-install path "
+                            f"(transport '{drv.transport}')")
+            res = await drv.install_cert(fullchain, privkey, chain, domain)
+            self._log_datum(
+                "install_cert", drv, res,
+                detail=res.get("message") if res.get("status") == "SUCCESS" else None)
+            return res
         return _err(f"cert install not supported for object_type '{ot}'")
 
     async def install_cert_fleet(self, fullchain: str, privkey: str, chain: str,
                                  domain: str) -> Dict[str, Any]:
         """Install a hub-delivered LE cert on the WHOLE fleet (spoke-level cert
-        target). Installs on every ``cx_switch`` (the only object_type that can
-        import an external key today); other types are reported SKIPPED, not
-        failed. Returns an aggregate envelope PLUS a per-device ``devices`` list
-        so the hub/WebUI can show which switches got the cert."""
+        target). Installs on every cert-capable device (``cx_switch`` via AOS-CX
+        REST, ``gateway`` via ArubaOS PKCS#12/SCP); other types are reported
+        SKIPPED, not failed. Returns an aggregate envelope PLUS a per-device
+        ``devices`` list so the hub/WebUI can show which devices got the cert."""
         results: List[Dict[str, Any]] = []
         ok = fail = 0
         for d in self.devices:
@@ -577,7 +603,7 @@ class NwEngine:
             ot = (d.get("object_type") or "").strip().lower()
             name = d.get("name") or d.get("hostname") or did
             ip = d.get("address") or d.get("ip") or d.get("mgmt_ip") or ""
-            if ot != "cx_switch":
+            if ot not in ("cx_switch", "gateway"):
                 results.append({"device_id": did, "name": name, "ip": ip,
                                 "object_type": ot, "status": "SKIPPED",
                                 "message": f"cert install not supported for '{ot or 'unknown'}'"})

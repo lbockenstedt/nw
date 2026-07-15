@@ -143,6 +143,41 @@ class CliSession:
             text = text.lstrip("\n")
         return text
 
+    async def config(self, commands: List[str], timeout: float = 20.0) -> str:
+        """Enter config mode, run each command, exit (``end``). Returns the
+        concatenated output. Used for the ArubaOS cert bind (crypto-local pki +
+        web-server profile). ``web-server profile`` etc. enter sub-contexts;
+        ``end`` at the finish pops all the way out regardless of nesting."""
+        out = []
+        await self._send("configure terminal")
+        out.append(await self._read_until_prompt(timeout=timeout))
+        for c in commands:
+            await self._send(c)
+            out.append(await self._read_until_prompt(timeout=timeout))
+        await self._send("end")
+        out.append(await self._read_until_prompt(timeout=timeout))
+        return "".join(out)
+
+    async def scp_put_bytes(self, data: bytes, remote_path: str) -> None:
+        """SCP-upload ``data`` to ``remote_path`` on the device over the SAME SSH
+        connection (ArubaOS accepts a file into flash: via SCP). Writes a 0600
+        temp file locally and streams it with asyncssh.scp."""
+        import asyncssh, os, tempfile
+        if self._conn is None:
+            raise CliError("not connected")
+        fd, tmp = tempfile.mkstemp(suffix=".pfx")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            os.chmod(tmp, 0o600)
+            await asyncio.wait_for(asyncssh.scp(tmp, (self._conn, remote_path)),
+                                   timeout=60.0)
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
 
 # ── Pure parsers (testable) ──────────────────────────────────────────────────
 _MAC_TOKEN = re.compile(r"[0-9a-fA-F]{4}[-:][0-9a-fA-F]{4}[-:][0-9a-fA-F]{4}|"
@@ -392,6 +427,88 @@ async def cli_get_mac_table(session: CliSession, object_type: str) -> List[dict]
                object_type, "show mac-address")
     text = await session.run(mac_cmd)
     return PARSERS.get(object_type, PARSERS["aos_switch"])[1](text)
+
+
+def _err(message: str, data: Any = None) -> dict:
+    """Standard ERROR envelope (mirrors nw_engine._err) for the cert-install
+    helpers, which return an envelope rather than a parsed list."""
+    out = {"status": "ERROR", "message": message}
+    if data is not None:
+        out["data"] = data
+    return out
+
+
+def _build_pkcs12(fullchain: str, privkey: str, name: str, password: str) -> bytes:
+    """Bundle the LE fullchain + private key into a PKCS#12 (.pfx) — the format
+    ArubaOS imports for a server cert (cert + key in one file). Uses the
+    ``cryptography`` lib (an asyncssh dependency, so always present)."""
+    import re as _re
+    from cryptography.hazmat.primitives.serialization import pkcs12, BestAvailableEncryption
+    from cryptography.hazmat.primitives.serialization import load_pem_private_key
+    from cryptography.x509 import load_pem_x509_certificate
+    key = load_pem_private_key(privkey.encode(), password=None)
+    blocks = _re.findall(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
+                         fullchain, _re.DOTALL)
+    certs = [load_pem_x509_certificate(b.encode()) for b in blocks]
+    if not certs:
+        raise CliError("no certificate found in fullchain")
+    leaf, cas = certs[0], (certs[1:] or None)
+    return pkcs12.serialize_key_and_certificates(
+        name=name.encode(), key=key, cert=leaf, cas=cas,
+        encryption_algorithm=BestAvailableEncryption(password.encode()))
+
+
+async def cli_install_cert_gateway(session: CliSession, fullchain: str, privkey: str,
+                                   chain: str, domain: str) -> dict:
+    """Install an LE server cert on an ArubaOS mobility gateway/controller over
+    SSH. Workflow (ArubaOS 8): build a PKCS#12, SCP it into flash:, import it
+    (``crypto pki-import pfx serverCert``), then bind it to the web server
+    (``crypto-local pki SERVERCERT`` + ``web-server profile / switch-cert``) and
+    save. Captures every command's output so a failure is diagnosable. Returns
+    the standard ``{status, message}`` envelope."""
+    import re as _re
+    import secrets as _secrets
+    name = _re.sub(r"[^A-Za-z0-9._-]", "_", domain) or "lm-cert"
+    fname = f"{name}.pfx"
+    # ArubaOS pfx passphrase must avoid ' $ & ( ) | \ " ; < > ? — hex is safe.
+    passphrase = _secrets.token_hex(12)
+    try:
+        pfx = _build_pkcs12(fullchain, privkey, name, passphrase)
+    except Exception as e:  # noqa: BLE001
+        return _err(f"gateway: PKCS#12 build failed: {e}")
+
+    log = []
+    try:
+        # 1. Upload the .pfx into flash: over SCP (same SSH connection).
+        await session.scp_put_bytes(pfx, f"flash/{fname}")
+        log.append(f"uploaded flash/{fname} ({len(pfx)} bytes)")
+        # 2. Import the server cert (exec/privileged mode).
+        imp = await session.run(
+            f"crypto pki-import pfx serverCert {name} {fname} {passphrase}")
+        log.append("import: " + " ".join(imp.split())[:300])
+        # 3. Bind: register the server cert + point the web server at it, save.
+        cfg = await session.config([
+            f"crypto-local pki SERVERCERT {name} {fname}",
+            "web-server profile",
+            f"switch-cert {name}",
+        ])
+        log.append("bind: " + " ".join(cfg.split())[:300])
+        save = await session.run("write memory")
+        log.append("save: " + " ".join(save.split())[:120])
+    except CliError as e:
+        return _err(f"gateway cert install: {e}", {"log": log})
+    except Exception as e:  # noqa: BLE001
+        return _err(f"gateway cert install: {e}", {"log": log})
+
+    # Best-effort error detection in the captured output.
+    joined = " ".join(log).lower()
+    for marker in ("error", "invalid", "% ", "failed", "cannot"):
+        if marker in joined:
+            return _err(f"gateway cert install may have failed (device said: "
+                        f"{'; '.join(log)})", {"log": log})
+    return {"status": "SUCCESS",
+            "message": f"imported {name} + bound to web-server on {session.host}",
+            "log": log}
 
 
 async def cli_get_interfaces(session: CliSession, object_type: str) -> List[dict]:
