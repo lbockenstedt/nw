@@ -615,9 +615,7 @@ class NwEngine:
         if not drv:
             logger.warning("nw get_endpoints: device %s not in fleet", device_id)
             return _err(f"Device {device_id} not found")
-        arp = await drv.get_arp()
-        mac = await drv.get_mac_table()
-        ifs = await drv.get_interfaces()
+        arp, mac, ifs = await self._gather_endpoint_datums(drv)
         self._log_datum("endpoints", drv, arp)
         eps = merge_endpoints(
             arp.get("data") if arp.get("status") == "SUCCESS" else [],
@@ -632,9 +630,7 @@ class NwEngine:
         if not drv:
             logger.warning("nw get_vlans: device %s not in fleet", device_id)
             return _err(f"Device {device_id} not found")
-        arp = await drv.get_arp()
-        mac = await drv.get_mac_table()
-        ifs = await drv.get_interfaces()
+        arp, mac, ifs = await self._gather_endpoint_datums(drv)
         self._log_datum("vlans", drv, mac)
         ifdata = ifs.get("data") if ifs.get("status") == "SUCCESS" else []
         eps = merge_endpoints(
@@ -642,6 +638,21 @@ class NwEngine:
             mac.get("data") if mac.get("status") == "SUCCESS" else [], ifdata)
         return self._ok_or_partial(summarize_vlans(eps, ifdata), [arp, mac, ifs],
                                    "vlan(s)")
+
+    @staticmethod
+    async def _gather_endpoint_datums(drv):
+        """Fetch ARP + MAC + interfaces concurrently (each on its own session) so
+        the fused endpoint/VLAN views cost one round-trip, not three. A gather
+        member that raises is coerced to an ERROR envelope so the merge still
+        runs on whatever succeeded."""
+        async def _safe(coro):
+            try:
+                return await coro
+            except Exception as e:  # noqa: BLE001 - degrade to ERROR envelope
+                return _err(str(e))
+        return await asyncio.gather(_safe(drv.get_arp()),
+                                    _safe(drv.get_mac_table()),
+                                    _safe(drv.get_interfaces()))
 
     @staticmethod
     def _ok_or_partial(data, sources, noun):

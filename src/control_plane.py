@@ -17,12 +17,14 @@ except Exception:
 import logging
 import argparse
 import asyncio
+import time
 from typing import Dict, Any
 try:
     from core.src.messaging.control_plane import BaseControlPlane
 except ImportError:
     from messaging.control_plane import BaseControlPlane
 from nw_spoke import NwSpoke
+from nw_engine import _norm_mac
 
 try:
     from logging_setup import configure_logging
@@ -64,6 +66,12 @@ class NwControlPlane(BaseControlPlane):
         super().__init__(spoke_id, secret, hub_secret, hub_url)
         self.module_type = "nw"
 
+    # Poll-loop tick granularity + per-device interval floor (seconds). The
+    # cadence itself is per-device (``poll_interval`` on each nw_devices entry);
+    # these bound the scheduler, not the user's choice.
+    _NW_POLL_TICK = 10
+    _NW_POLL_FLOOR = 30
+
     async def run_hub_mode(self):
         """Native LM Spoke behavior."""
         logger.info(f"Starting Network Devices Module in HUB MODE -> {self.hub_url}")
@@ -71,8 +79,89 @@ class NwControlPlane(BaseControlPlane):
         nw_spoke = NwSpoke(self.spoke_id, self.config)
         self.register_module("nw", nw_spoke)
 
+        # Autonomous per-device polling (spoke-driven). Started before the main
+        # loop; it idles until connected + a device sets poll_interval.
+        asyncio.create_task(self._nw_poll_loop())
+
         # Delegate to BaseControlPlane's main loop
         await self.run()
+
+    async def _nw_poll_loop(self):
+        """Per-device autonomous polling done **by the spoke**.
+
+        Each nw device may set ``poll_interval`` (seconds) in its config; this
+        ticks every ``_NW_POLL_TICK`` and polls any device whose interval has
+        elapsed, pushing the result to the hub (``NW_POLL_RESULT``) so the hub
+        warms its per-device cache — every sub-view (info/arp/macs/interfaces/
+        endpoints/vlans) then loads instantly instead of blocking on a live
+        SSH round-trip. ``poll_interval`` ≤ 0 / absent = disabled. Intervals are
+        floored to ``_NW_POLL_FLOOR`` to avoid hammering a device. A newly-seen
+        device is scheduled (not polled immediately) so a fleet reload staggers
+        rather than stampedes."""
+        next_due: Dict[str, float] = {}
+        while True:
+            await asyncio.sleep(self._NW_POLL_TICK)
+            try:
+                module = self.modules.get("nw")
+                engine = getattr(module, "engine", None)
+                if engine is None or getattr(self, "_hub_ws", None) is None:
+                    continue
+                now = time.monotonic()
+                due, seen = [], set()
+                for d in list(engine.devices):
+                    did = d.get("id")
+                    if not did:
+                        continue
+                    seen.add(did)
+                    try:
+                        interval = int(d.get("poll_interval") or 0)
+                    except (TypeError, ValueError):
+                        interval = 0
+                    if interval <= 0:
+                        next_due.pop(did, None)
+                        continue
+                    interval = max(interval, self._NW_POLL_FLOOR)
+                    deadline = next_due.get(did)
+                    if deadline is None:          # first sight → stagger
+                        next_due[did] = now + interval
+                    elif now >= deadline:
+                        next_due[did] = now + interval
+                        due.append(did)
+                for gone in set(next_due) - seen:  # prune removed devices
+                    next_due.pop(gone, None)
+                if due:
+                    sem = asyncio.Semaphore(3)
+
+                    async def _one(device_id):
+                        async with sem:
+                            await self._nw_poll_and_push(device_id)
+                    await asyncio.gather(*(_one(x) for x in due))
+            except Exception as e:  # noqa: BLE001 - loop must never die
+                logger.debug("nw poll loop tick error: %s", e)
+
+    async def _nw_poll_and_push(self, device_id: str):
+        """Run one full engine poll + push it to the hub as NW_POLL_RESULT."""
+        module = self.modules.get("nw")
+        engine = getattr(module, "engine", None)
+        if engine is None:
+            return
+        try:
+            res = await engine.poll(device_id)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("nw auto-poll %s failed: %s", device_id, e)
+            return
+        data = res.get("data") if isinstance(res, dict) else None
+        if not isinstance(data, dict):
+            return
+        for key in ("arp", "mac_table", "interfaces", "endpoints"):
+            lst = data.get(key)
+            if isinstance(lst, list):
+                data[key] = [{**r, "mac": _norm_mac(r.get("mac", ""))}
+                             for r in lst if isinstance(r, dict)]
+        await self.send_to_hub("NW_POLL_RESULT",
+                               {"device_id": device_id, "data": data})
+        logger.info("nw auto-poll %s -> pushed (status=%s)",
+                    device_id, res.get("status"))
 
 
 if __name__ == "__main__":
