@@ -592,17 +592,22 @@ class NwEngine:
             else:
                 fail += 1
         total = ok + fail
+        # The SPOKE now HOLDS the cert (valid material was received + validated by
+        # the caller) — that alone is SUCCESS, like a proxmox node holding a cert
+        # regardless of per-VM state. Per-switch install outcomes are reported in
+        # ``devices`` for the drill-down, but a device failure does NOT fail the
+        # spoke-level target (the operator only needs "the spoke has the cert").
         if total == 0:
-            status, message = "ERROR", "no cx_switch devices in the fleet to install on"
+            message = "cert received by spoke (no cert-installable devices in the fleet)"
         elif fail == 0:
-            status, message = "SUCCESS", f"installed on {ok}/{total} switch(es)"
+            message = f"cert received; installed on all {ok} switch(es)"
         elif ok == 0:
-            status, message = "ERROR", f"failed on all {fail} switch(es)"
+            message = f"cert received by spoke; install failed on all {fail} switch(es) — see devices"
         else:
-            status, message = "PARTIAL", f"installed on {ok}/{total} switch(es), {fail} failed"
-        logger.info("nw install_cert_fleet: %s (%d ok, %d fail, %d total)",
-                    status, ok, fail, total)
-        return {"status": status, "message": message, "devices": results,
+            message = f"cert received; installed on {ok}/{total} switch(es), {fail} failed — see devices"
+        logger.info("nw install_cert_fleet: spoke holds cert (%d installed, %d failed, %d total)",
+                    ok, fail, total)
+        return {"status": "SUCCESS", "message": message, "devices": results,
                 "installed": ok, "failed": fail, "total": total}
 
     async def poll(self, device_id: str) -> Dict[str, Any]:
