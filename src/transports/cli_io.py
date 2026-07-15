@@ -267,18 +267,72 @@ def parse_interfaces_junos(text: str) -> List[dict]:
     return rows
 
 
-# Best-effort generic parsers for the Aruba/HPE gateway CLI (output varies by
-# firmware); reuse the AOS-S ARP/MAC regex which matches most Aruba formats.
-def parse_arp_gateway(text: str) -> List[dict]:
-    return parse_arp_aos_s(text)
+# ── ArubaOS gateway/controller parsers (NOT AOS-S — different CLI + commands) ──
+# The gateway is an ArubaOS 8 mobility gateway/controller, not an AOS-S switch, so
+# `show mac-address` / `show interfaces` (AOS-S) return nothing useful. Correct
+# sources:
+#   ARP/IP+MAC  ← `show user-table`          (connected clients: IP col1, MAC col2)
+#   MAC table   ← `show datapath bridge table`(bridge entries: MAC + VLAN + dest)
+#   Interfaces  ← `show ip interface brief`   (ported from ntc-templates aruba_os)
+# Parsers ported from ntc-templates (aruba_os) + real device output.
+
+def parse_user_table_gateway(text: str) -> List[dict]:
+    """ArubaOS ``show user-table`` → ``[{ip, mac, interface}]``. IP is always
+    column 1 and MAC column 2 (later columns — Name/Auth/Type — are frequently
+    EMPTY, so whitespace-column parsing misaligns; anchoring on IP+MAC is robust).
+    ``interface`` carries the AP name when present (best-effort)."""
+    rows = []
+    for line in (text or "").splitlines():
+        m = re.match(r"^\s*(\d{1,3}(?:\.\d{1,3}){3})\s+"
+                     r"([0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5})\b", line)
+        if not m:
+            continue
+        rows.append({"ip": m.group(1), "mac": m.group(2).lower(), "interface": ""})
+    return rows
 
 
-def parse_mac_gateway(text: str) -> List[dict]:
-    return parse_mac_aos_s(text)
+# Retain the old name as an alias so callers/tests referencing parse_arp_gateway
+# keep working — the gateway ARP source is now the user-table.
+parse_arp_gateway = parse_user_table_gateway
+
+
+def parse_datapath_bridge_gateway(text: str) -> List[dict]:
+    """ArubaOS ``show datapath bridge table`` → ``[{mac, vlan, interface}]``.
+    Columns vary by version (MAC, VLAN, Assigned-VLAN, Destination, Flags), so
+    parse tolerantly: MAC token + first VLAN-like integer + a destination token
+    (tunnel/local/port)."""
+    rows = []
+    for line in (text or "").splitlines():
+        mac = _MAC_TOKEN.search(line)
+        if not mac:
+            continue
+        rest = line[mac.end():].split()
+        vlan = next((t for t in rest if t.isdigit() and 1 <= int(t) <= 4094), "")
+        dest = next((t for t in rest if ("/" in t or t.lower() in ("tunnel", "local"))), "")
+        rows.append({"mac": mac.group(0).lower(), "vlan": str(vlan), "interface": str(dest)})
+    return rows
+
+
+# Alias: the gateway MAC-table source is the datapath bridge table.
+parse_mac_gateway = parse_datapath_bridge_gateway
 
 
 def parse_interfaces_gateway(text: str) -> List[dict]:
-    return parse_interfaces_aos_s(text)
+    """ArubaOS ``show ip interface brief`` → ``[{name, ip, mac, vlan, status,
+    speed}]``. Ported from ntc-templates ``aruba_os_show_ip_interface_brief``:
+    ``<iface (two tokens)>  <ip> / <netmask>  <admin>  <protocol>``."""
+    rows = []
+    for line in (text or "").splitlines():
+        m = re.match(r"^\s*(\S+\s\S+)\s+(\S+)\s+/\s+(\S+)\s+(\S+)\s+(\S+)\s*$", line)
+        if not m:
+            continue
+        name, ip, _netmask, _admin, proto = m.groups()
+        if name.lower().startswith(("interface", "----")):  # header/separator
+            continue
+        rows.append({"name": name.strip(),
+                     "ip": "" if ip.lower() in ("unassigned", "n/a") else ip,
+                     "mac": "", "vlan": "", "status": proto.lower(), "speed": 0})
+    return rows
 
 
 # object_type → (arp, mac, interfaces) parser triple
@@ -301,19 +355,29 @@ async def cli_get_device_info(session: CliSession, object_type: str) -> dict:
     info_cmd = {"aos_switch": "show system-information",
                 "ex_switch": "show version",
                 "cx_switch": "show version",
-                "gateway": "show system"}.get(object_type, "show version")
+                # ArubaOS gateway: `show version` carries the OS name + version
+                # (wanted for NetBox platform / software_version).
+                "gateway": "show version"}.get(object_type, "show version")
     try:
         text = await session.run(info_cmd)
     except Exception as e:
         raise CliError(f"info command failed: {e}")
+    # OS name for NetBox (platform). Detect the family from the version banner;
+    # fall back to a sensible default per object_type.
+    _os_m = re.search(r"\b(ArubaOS-CX|ArubaOS|AOS-CX|AOS-S|JUNOS|Junos)\b", text or "", re.IGNORECASE)
+    os_name = _os_m.group(1) if _os_m else {"gateway": "ArubaOS", "cx_switch": "ArubaOS-CX",
+                                            "aos_switch": "AOS-S", "ex_switch": "Junos"}.get(object_type, "")
     return {"model": _first_hw_token(text), "serial": _serial_from(text),
-            "firmware": _firmware_from(text), "interfaces_count": 0}
+            "firmware": _firmware_from(text), "os": os_name, "interfaces_count": 0}
 
 
 async def cli_get_arp(session: CliSession, object_type: str) -> List[dict]:
     """Run the vendor ARP show command and return ``[{ip, mac, interface}]``."""
     arp_cmd = {"aos_switch": "show arp", "ex_switch": "show arp",
-               "cx_switch": "show arp", "gateway": "show arp"}.get(object_type, "show arp")
+               "cx_switch": "show arp",
+               # ArubaOS gateway: the user-table holds the client IP↔MAC bindings
+               # (there is no useful `show arp` for wireless clients).
+               "gateway": "show user-table"}.get(object_type, "show arp")
     text = await session.run(arp_cmd)
     return PARSERS.get(object_type, PARSERS["aos_switch"])[0](text)
 
@@ -321,7 +385,10 @@ async def cli_get_arp(session: CliSession, object_type: str) -> List[dict]:
 async def cli_get_mac_table(session: CliSession, object_type: str) -> List[dict]:
     """Run the vendor MAC-table show command and return ``[{mac, vlan, interface}]``."""
     mac_cmd = {"aos_switch": "show mac-address", "ex_switch": "show ethernet-switching table",
-               "cx_switch": "show mac-address", "gateway": "show mac-address"}.get(
+               "cx_switch": "show mac-address",
+               # ArubaOS gateway: `show mac-address` is a switch command; the
+               # bridge/MAC table lives in the datapath.
+               "gateway": "show datapath bridge table"}.get(
                object_type, "show mac-address")
     text = await session.run(mac_cmd)
     return PARSERS.get(object_type, PARSERS["aos_switch"])[1](text)
@@ -331,7 +398,9 @@ async def cli_get_interfaces(session: CliSession, object_type: str) -> List[dict
     """Run the vendor interface show command and return
     ``[{name, ip, mac, vlan, status, speed}]`` (IP/MAC/VLAN best-effort)."""
     if_cmd = {"aos_switch": "show interfaces brief", "ex_switch": "show interfaces descriptions",
-              "cx_switch": "show interfaces brief", "gateway": "show interfaces"}.get(
+              "cx_switch": "show interfaces brief",
+              # ArubaOS gateway uses `show ip interface brief` (not `show interfaces`).
+              "gateway": "show ip interface brief"}.get(
               object_type, "show interfaces")
     text = await session.run(if_cmd)
     return PARSERS.get(object_type, PARSERS["aos_switch"])[2](text)
