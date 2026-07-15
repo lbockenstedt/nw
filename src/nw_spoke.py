@@ -171,12 +171,16 @@ class NwSpoke(BaseSpoke):
             privkey = d.get("privkey", "")
             chain = d.get("chain", "")
             domain = d.get("domain", "")
-            if not identifier:
-                return {"status": "ERROR",
-                        "message": "INSTALL_CERT requires identifier (device id)"}
             if not fullchain or not privkey:
                 return {"status": "ERROR",
                         "message": "INSTALL_CERT requires fullchain + privkey"}
+            # Spoke-level cert target: an empty/"*"/"all" identifier means "the nw
+            # spoke" — fan the cert out to every cert-capable switch in the fleet
+            # and return a per-device report. A specific identifier still installs
+            # on that ONE device (backward compat / targeted re-push).
+            if not identifier or identifier.lower() in ("*", "all", "fleet", self.spoke_id.lower()):
+                return await self.engine.install_cert_fleet(
+                    fullchain, privkey, chain, domain)
             return await self.engine.install_cert(
                 identifier, fullchain, privkey, chain, domain)
 

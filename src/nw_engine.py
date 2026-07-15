@@ -563,6 +563,48 @@ class NwEngine:
                         "(platform-dependent SSH/SFTP plumbing)")
         return _err(f"cert install not supported for object_type '{ot}'")
 
+    async def install_cert_fleet(self, fullchain: str, privkey: str, chain: str,
+                                 domain: str) -> Dict[str, Any]:
+        """Install a hub-delivered LE cert on the WHOLE fleet (spoke-level cert
+        target). Installs on every ``cx_switch`` (the only object_type that can
+        import an external key today); other types are reported SKIPPED, not
+        failed. Returns an aggregate envelope PLUS a per-device ``devices`` list
+        so the hub/WebUI can show which switches got the cert."""
+        results: List[Dict[str, Any]] = []
+        ok = fail = 0
+        for d in self.devices:
+            did = d.get("id", "")
+            ot = (d.get("object_type") or "").strip().lower()
+            name = d.get("name") or d.get("hostname") or did
+            ip = d.get("address") or d.get("ip") or d.get("mgmt_ip") or ""
+            if ot != "cx_switch":
+                results.append({"device_id": did, "name": name, "ip": ip,
+                                "object_type": ot, "status": "SKIPPED",
+                                "message": f"cert install not supported for '{ot or 'unknown'}'"})
+                continue
+            res = await self.install_cert(did, fullchain, privkey, chain, domain)
+            st = res.get("status", "ERROR")
+            results.append({"device_id": did, "name": name, "ip": ip,
+                            "object_type": ot, "status": st,
+                            "message": res.get("message", "")})
+            if st == "SUCCESS":
+                ok += 1
+            else:
+                fail += 1
+        total = ok + fail
+        if total == 0:
+            status, message = "ERROR", "no cx_switch devices in the fleet to install on"
+        elif fail == 0:
+            status, message = "SUCCESS", f"installed on {ok}/{total} switch(es)"
+        elif ok == 0:
+            status, message = "ERROR", f"failed on all {fail} switch(es)"
+        else:
+            status, message = "PARTIAL", f"installed on {ok}/{total} switch(es), {fail} failed"
+        logger.info("nw install_cert_fleet: %s (%d ok, %d fail, %d total)",
+                    status, ok, fail, total)
+        return {"status": status, "message": message, "devices": results,
+                "installed": ok, "failed": fail, "total": total}
+
     async def poll(self, device_id: str) -> Dict[str, Any]:
         """Run a full poll (probe + device_info + interfaces + arp + mac_table)
         for one device. Each sub-call is independent — a failure on one datum
