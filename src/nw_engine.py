@@ -89,6 +89,84 @@ def _norm_mac(m: str) -> str:
     return s
 
 
+def merge_endpoints(arp: Any, mac_table: Any,
+                    interfaces: Any = None) -> List[Dict[str, Any]]:
+    """Join the ARP/user-table (IP↔MAC) with the MAC/bridge table (MAC↔VLAN) on
+    MAC → a de-duplicated endpoint list ``[{mac, ip, vlan, interface}]``.
+
+    On an ArubaOS gateway this fuses ``show user-table`` (IP + MAC) with
+    ``show datapath bridge table`` (MAC + VLAN + dest) so every connected client
+    shows up once with its IP, MAC and VLAN — the "unique MAC/IP" view. Works for
+    any device type: a MAC seen only in ARP (no bridge entry) or only in the MAC
+    table (no IP yet) is still emitted, just with the missing field blank. VLAN
+    from the MAC table wins; a MAC's interface is taken from whichever table has
+    a non-empty value (MAC/bridge dest preferred).
+    """
+    by_mac: Dict[str, Dict[str, Any]] = {}
+
+    def _slot(mac: str) -> Dict[str, Any]:
+        return by_mac.setdefault(mac, {"mac": mac, "ip": "", "vlan": "",
+                                       "interface": ""})
+
+    for r in (mac_table or []):
+        mac = _norm_mac(r.get("mac"))
+        if not mac:
+            continue
+        s = _slot(mac)
+        if r.get("vlan"):
+            s["vlan"] = str(r["vlan"])
+        if r.get("interface") and not s["interface"]:
+            s["interface"] = str(r["interface"])
+
+    for r in (arp or []):
+        mac = _norm_mac(r.get("mac"))
+        if not mac:
+            continue
+        s = _slot(mac)
+        if r.get("ip") and not s["ip"]:
+            s["ip"] = str(r["ip"])
+        if r.get("vlan") and not s["vlan"]:
+            s["vlan"] = str(r["vlan"])
+        if r.get("interface") and not s["interface"]:
+            s["interface"] = str(r["interface"])
+
+    return sorted(by_mac.values(),
+                  key=lambda e: (e["vlan"] or "~", e["ip"] or "~", e["mac"]))
+
+
+def summarize_vlans(endpoints: Any, interfaces: Any = None) -> List[Dict[str, Any]]:
+    """Roll the merged endpoints (+ any L3 interfaces) into a per-VLAN summary
+    ``[{vlan, endpoints, macs, ips, gateway_ip}]`` for the VLANs tab."""
+    vlans: Dict[str, Dict[str, Any]] = {}
+
+    def _slot(vlan: str) -> Dict[str, Any]:
+        return vlans.setdefault(vlan, {"vlan": vlan, "endpoints": 0,
+                                       "macs": 0, "ips": 0, "gateway_ip": ""})
+
+    for e in (endpoints or []):
+        vlan = str(e.get("vlan") or "").strip()
+        if not vlan:
+            continue
+        s = _slot(vlan)
+        s["endpoints"] += 1
+        if e.get("mac"):
+            s["macs"] += 1
+        if e.get("ip"):
+            s["ips"] += 1
+
+    # An SVI/L3 interface named like "vlan42" contributes the gateway IP.
+    for i in (interfaces or []):
+        name = str(i.get("name") or i.get("vlan") or "")
+        m = re.search(r"(\d{1,4})", name)
+        if m and i.get("ip"):
+            s = _slot(m.group(1))
+            if not s["gateway_ip"]:
+                s["gateway_ip"] = str(i["ip"])
+
+    return sorted(vlans.values(), key=lambda v: (int(v["vlan"])
+                  if v["vlan"].isdigit() else 9999, v["vlan"]))
+
+
 def _err(message: str, data: Any = None) -> Dict[str, Any]:
     return {"status": "ERROR", "data": data if data is not None else [],
             "message": message}
@@ -529,6 +607,53 @@ class NwEngine:
         self._log_datum("interfaces", drv, res)
         return res
 
+    async def get_endpoints(self, device_id: str) -> Dict[str, Any]:
+        """Unified endpoint list: gather ARP + MAC table (+ interfaces) and fuse
+        on MAC → ``[{mac, ip, vlan, interface}]`` (the "IP Addresses" view). On a
+        gateway this joins ``show user-table`` with ``show datapath bridge table``."""
+        drv = self._driver_for(device_id)
+        if not drv:
+            logger.warning("nw get_endpoints: device %s not in fleet", device_id)
+            return _err(f"Device {device_id} not found")
+        arp = await drv.get_arp()
+        mac = await drv.get_mac_table()
+        ifs = await drv.get_interfaces()
+        self._log_datum("endpoints", drv, arp)
+        eps = merge_endpoints(
+            arp.get("data") if arp.get("status") == "SUCCESS" else [],
+            mac.get("data") if mac.get("status") == "SUCCESS" else [],
+            ifs.get("data") if ifs.get("status") == "SUCCESS" else [])
+        return self._ok_or_partial(eps, [arp, mac], "endpoint(s)")
+
+    async def get_vlans(self, device_id: str) -> Dict[str, Any]:
+        """Per-VLAN summary rolled up from the merged endpoints + L3 interfaces →
+        ``[{vlan, endpoints, macs, ips, gateway_ip}]`` (the "VLANs" view)."""
+        drv = self._driver_for(device_id)
+        if not drv:
+            logger.warning("nw get_vlans: device %s not in fleet", device_id)
+            return _err(f"Device {device_id} not found")
+        arp = await drv.get_arp()
+        mac = await drv.get_mac_table()
+        ifs = await drv.get_interfaces()
+        self._log_datum("vlans", drv, mac)
+        ifdata = ifs.get("data") if ifs.get("status") == "SUCCESS" else []
+        eps = merge_endpoints(
+            arp.get("data") if arp.get("status") == "SUCCESS" else [],
+            mac.get("data") if mac.get("status") == "SUCCESS" else [], ifdata)
+        return self._ok_or_partial(summarize_vlans(eps, ifdata), [arp, mac, ifs],
+                                   "vlan(s)")
+
+    @staticmethod
+    def _ok_or_partial(data, sources, noun):
+        """SUCCESS envelope; downgrade to PARTIAL (still returning ``data``) when
+        any source datum errored, carrying the first error message."""
+        errs = [s.get("message", "failed") for s in sources
+                if s.get("status") != "SUCCESS"]
+        if errs and not data:
+            return _err("; ".join(errs))
+        return {"status": "PARTIAL" if errs else "SUCCESS", "data": data,
+                "message": f"{len(data)} {noun}" + (f" ({errs[0]})" if errs else "")}
+
     async def run_config(self, device_id: str, commands: List[str]) -> Dict[str, Any]:
         drv = self._driver_for(device_id)
         if not drv:
@@ -676,6 +801,11 @@ class NwEngine:
         # SUCCESS only when reachable AND no sub-datum errored; else PARTIAL — a
         # reachable device whose info/interfaces/arp/mac probes all failed must not
         # report SUCCESS (the errors[] carry the detail).
+        # Fuse ARP (IP↔MAC) + MAC table (MAC↔VLAN) into a unique endpoint list,
+        # then roll that up per-VLAN. Surfaces the "IP Addresses" + "VLANs" tabs.
+        endpoints = merge_endpoints(arp, mac_table, interfaces)
+        vlans = summarize_vlans(endpoints, interfaces)
+
         status = "SUCCESS" if (reachable and not any(errors)) else "PARTIAL"
         n_if = len(interfaces) if isinstance(interfaces, list) else 0
         n_arp = len(arp) if isinstance(arp, list) else 0
@@ -692,6 +822,8 @@ class NwEngine:
                 "interfaces": interfaces,
                 "arp": arp,
                 "mac_table": mac_table,
+                "endpoints": endpoints,
+                "vlans": vlans,
             },
             "errors": errors,
             "message": (f"reachable={reachable}, "

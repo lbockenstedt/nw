@@ -47,8 +47,9 @@ class NwSpoke(BaseSpoke):
         credentials masked in logs), ``GET_VERSION``, ``NW_LIST_DEVICES`` (fleet
         summary + concurrent 3s reachability probe), ``NW_PROBE``,
         ``NW_GET_DEVICE_INFO``, ``NW_GET_MAC_TABLE``, ``NW_GET_ARP``,
-        ``NW_GET_INTERFACES`` (each per-device via ``data["device_id"]``),
-        ``NW_POLL`` (probe + all four datums in one call, partial results on
+        ``NW_GET_INTERFACES``, ``NW_GET_ENDPOINTS`` (fused ARP+MAC unique IP/MAC
+        list), ``NW_GET_VLANS`` (each per-device via ``data["device_id"]``),
+        ``NW_POLL`` (probe + all datums in one call, partial results on
         partial failure), and ``NW_RUN_CONFIG`` (not-implemented envelope). MACs
         are canonicalized to lower-colon form on the way out. Unknown commands
         return an ERROR envelope. Every outcome is logged via ``_log_result``.
@@ -140,13 +141,25 @@ class NwSpoke(BaseSpoke):
                                for r in res["data"] if isinstance(r, dict)]
             return res
 
+        if normalized_cmd == "NW_GET_ENDPOINTS":
+            # Fused ARP+MAC "unique IP/MAC" list. MACs already canonical (merge
+            # normalizes), but re-apply for safety/parity with the other datums.
+            res = await self.engine.get_endpoints(device_id)
+            if isinstance(res.get("data"), list):
+                res["data"] = [{**r, "mac": _norm_mac(r.get("mac", ""))}
+                               for r in res["data"] if isinstance(r, dict)]
+            return res
+
+        if normalized_cmd == "NW_GET_VLANS":
+            return await self.engine.get_vlans(device_id)
+
         if normalized_cmd == "NW_POLL":
             # Full poll: probe + device_info + interfaces + arp + mac_table in
             # one call. Canonicalize every MAC-bearing sub-list on the way out.
             res = await self.engine.poll(device_id)
             d = res.get("data") if isinstance(res.get("data"), dict) else None
             if d is not None:
-                for key in ("arp", "mac_table", "interfaces"):
+                for key in ("arp", "mac_table", "interfaces", "endpoints"):
                     lst = d.get(key)
                     if isinstance(lst, list):
                         d[key] = [{**r, "mac": _norm_mac(r.get("mac", ""))}
