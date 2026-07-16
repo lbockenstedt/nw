@@ -27,8 +27,13 @@ _PAGING_CMD = {
     "aos_switch": "no page",
     "ex_switch":  "set cli screen-length 0",
     "cx_switch":  "no page",
+    # ArubaOS gateway/controller: `no page` disables the pager (confirmed on the
+    # live device). If paging is ever still on, the `--More--` fallback in
+    # _read_until_prompt advances + strips it so output isn't truncated.
     "gateway":    "no page",
 }
+# Pager continuation marker (belt-and-suspenders if paging is still on).
+_PAGER_RE = re.compile(r"--\s*More\s*--", re.IGNORECASE)
 # Prompt ends in '#' (enabled) or '>' (user) for AOS-S/gateway; Junos ends in
 # '>' or '#'. Match a line ending in a prompt char after optional whitespace.
 _PROMPT_RE = re.compile(r"[>#]\s*$")
@@ -119,6 +124,15 @@ class CliSession:
                 if not chunk:
                     break
                 buf += chunk
+                # If paging is still on despite `no page`, advance the pager (send
+                # a space) and strip the marker so output isn't truncated/polluted.
+                if _PAGER_RE.search(buf):
+                    try:
+                        self._proc.stdin.write(" ")
+                    except Exception:
+                        pass
+                    buf = _PAGER_RE.sub("", buf)
+                    deadline = loop.time() + timeout  # keep reading further pages
                 lines = buf.splitlines(keepends=True)
                 if lines and _PROMPT_RE.search(lines[-1].rstrip()):
                     out.append(buf)
@@ -313,18 +327,43 @@ def parse_interfaces_junos(text: str) -> List[dict]:
 #   Interfaces  ← `show interface brief`      (physical-port status)
 # Parsers ported from ntc-templates (aruba_os) + real device output.
 
+# ArubaOS device-fingerprint "Type" column vocabulary → client OS. Longest-first
+# so "Windows Mobile" wins over "Windows". Matched only in the row tail (after the
+# forward-mode token) to avoid a false hit in an SSID/name.
+_OS_TYPES = ["Windows Mobile", "Windows Phone", "Windows", "macOS", "OS X",
+             "iPhone", "iPad", "iPod", "iOS", "Android", "Chrome OS",
+             "Chromebook", "Apple TV", "AppleTV", "tvOS", "watchOS", "Ubuntu",
+             "Debian", "Fedora", "Linux", "Roku", "PlayStation", "Xbox",
+             "Nintendo", "Kindle", "BlackBerry", "Symbian"]
+_OS_RE = re.compile(r"(?<![\w-])(" + "|".join(re.escape(t) for t in _OS_TYPES)
+                    + r")(?![\w-])", re.IGNORECASE)
+_FWD_MODE_RE = re.compile(r"\b(?:tunnel|bridge|decrypt-tunnel|split-tunnel)\b")
+
+
 def parse_user_table_gateway(text: str) -> List[dict]:
-    """ArubaOS ``show user-table`` → ``[{ip, mac, interface}]``. IP is always
-    column 1 and MAC column 2 (later columns — Name/Auth/Type — are frequently
-    EMPTY, so whitespace-column parsing misaligns; anchoring on IP+MAC is robust).
-    ``interface`` carries the AP name when present (best-effort)."""
+    """ArubaOS ``show user-table`` → ``[{ip, mac, os, interface}]``. IP is always
+    column 1 and MAC column 2 (later columns — Name/Auth/Host Name — are
+    frequently EMPTY, so whitespace-column parsing misaligns; anchoring on IP+MAC
+    is robust). ``os`` is the device-fingerprint "Type" column (macOS/iPhone/…),
+    read from the row tail after the forward-mode token so an SSID/name can't
+    false-match. ``interface`` carries the AP name / wired port when present."""
     rows = []
     for line in (text or "").splitlines():
         m = re.match(r"^\s*(\d{1,3}(?:\.\d{1,3}){3})\s+"
                      r"([0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5})\b", line)
         if not m:
             continue
-        rows.append({"ip": m.group(1), "mac": m.group(2).lower(), "interface": ""})
+        # OS from the "Type" column: search only the tail after forward-mode
+        # (tunnel/bridge) where Type|Host Name|User Type live.
+        fwd = _FWD_MODE_RE.search(line, m.end())
+        tail = line[fwd.end():] if fwd else line[m.end():]
+        om = _OS_RE.search(tail)
+        os_val = ""
+        if om:
+            hit = om.group(1)
+            os_val = next((t for t in _OS_TYPES if t.lower() == hit.lower()), hit)
+        rows.append({"ip": m.group(1), "mac": m.group(2).lower(),
+                     "os": os_val, "interface": ""})
     return rows
 
 

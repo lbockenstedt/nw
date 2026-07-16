@@ -106,7 +106,7 @@ def merge_endpoints(arp: Any, mac_table: Any,
 
     def _slot(mac: str) -> Dict[str, Any]:
         return by_mac.setdefault(mac, {"mac": mac, "ip": "", "vlan": "",
-                                       "interface": ""})
+                                       "os": "", "interface": ""})
 
     for r in (mac_table or []):
         mac = _norm_mac(r.get("mac"))
@@ -127,6 +127,8 @@ def merge_endpoints(arp: Any, mac_table: Any,
             s["ip"] = str(r["ip"])
         if r.get("vlan") and not s["vlan"]:
             s["vlan"] = str(r["vlan"])
+        if r.get("os") and not s["os"]:
+            s["os"] = str(r["os"])
         if r.get("interface") and not s["interface"]:
             s["interface"] = str(r["interface"])
 
