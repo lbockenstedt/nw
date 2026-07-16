@@ -71,6 +71,9 @@ class NwControlPlane(BaseControlPlane):
     # these bound the scheduler, not the user's choice.
     _NW_POLL_TICK = 10
     _NW_POLL_FLOOR = 30
+    # Default cadence when a device has no poll_interval set at all. An explicit
+    # 0 (the UI "Off" choice) disables; only an absent/blank value defaults.
+    _NW_POLL_DEFAULT = 900  # 15 minutes
 
     async def run_hub_mode(self):
         """Native LM Spoke behavior."""
@@ -113,11 +116,15 @@ class NwControlPlane(BaseControlPlane):
                     if not did:
                         continue
                     seen.add(did)
-                    try:
-                        interval = int(d.get("poll_interval") or 0)
-                    except (TypeError, ValueError):
-                        interval = 0
-                    if interval <= 0:
+                    raw = d.get("poll_interval")
+                    if raw is None or raw == "":
+                        interval = self._NW_POLL_DEFAULT   # unset → 15m default
+                    else:
+                        try:
+                            interval = int(raw)
+                        except (TypeError, ValueError):
+                            interval = self._NW_POLL_DEFAULT
+                    if interval <= 0:                       # explicit Off
                         next_due.pop(did, None)
                         continue
                     interval = max(interval, self._NW_POLL_FLOOR)
