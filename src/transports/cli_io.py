@@ -194,40 +194,80 @@ class CliSession:
 
 
 # ── Pure parsers (testable) ──────────────────────────────────────────────────
-_MAC_TOKEN = re.compile(r"[0-9a-fA-F]{4}[-:][0-9a-fA-F]{4}[-:][0-9a-fA-F]{4}|"
-                        r"[0-9a-fA-F]{2}(?:[-:][0-9a-fA-F]{2}){5}|"
-                        r"[0-9a-fA-F]{12}")
+_MAC_TOKEN = re.compile(
+    r"[0-9a-fA-F]{6}-[0-9a-fA-F]{6}|"                          # Aruba aabbcc-ddeeff
+    r"[0-9a-fA-F]{4}[-.:][0-9a-fA-F]{4}[-.:][0-9a-fA-F]{4}|"   # Cisco aabb.ccdd.eeff
+    r"[0-9a-fA-F]{2}(?:[-:][0-9a-fA-F]{2}){5}|"                # aa:bb:cc:dd:ee:ff
+    r"[0-9a-fA-F]{12}")                                        # bare 12 hex
+
+
+def _is_null_mac(mac: str) -> bool:
+    """True for an all-zero / incomplete MAC (e.g. ``000000-000000`` in an ARP
+    table with no resolved hardware address)."""
+    return set(re.sub(r"[^0-9a-fA-F]", "", mac or "")) <= {"0"}
 _IP_TOKEN = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
 
 
 def parse_arp_aos_s(text: str) -> List[dict]:
-    """Aruba AOS-S `show arp` → [{ip, mac, interface}]."""
+    """Aruba AOS-S ``show arp`` → ``[{ip, mac, interface}]``. Columns:
+    ``IP | MAC(aabbcc-ddeeff) | Type(dynamic) | Port``. The Port is optional
+    (an unresolved ``000000-000000`` entry has none); such null-MAC rows are
+    dropped. Port is taken only when it's a real port token (not the Type word)."""
     rows = []
     for line in (text or "").splitlines():
         ip = _IP_TOKEN.search(line)
         mac = _MAC_TOKEN.search(line)
-        if not ip or not mac:
+        if not ip or not mac or _is_null_mac(mac.group(0)):
             continue
-        # tokens after the MAC: type, port — port is the last numeric-ish token.
-        tail = line[mac.end():]
-        port = tail.strip().split()[-1] if tail.strip().split() else ""
-        rows.append({"ip": ip.group(0), "mac": mac.group(0),
+        # tail = [Type, Port?]. Port present only when the last token is port-like
+        # (digit or a/b/c or slash form) — never the Type word ("dynamic").
+        tail = line[mac.end():].split()
+        port = ""
+        if len(tail) >= 2 and re.match(r"^[A-Za-z]?\d+(?:/\d+)*$", tail[-1]):
+            port = tail[-1]
+        rows.append({"ip": ip.group(0), "mac": mac.group(0).lower(),
                      "interface": str(port)})
     return rows
 
 
 def parse_mac_aos_s(text: str) -> List[dict]:
-    """Aruba AOS-S `show mac-address` → [{mac, vlan, interface}]."""
+    """Aruba AOS-S ``show mac-address`` → ``[{mac, vlan, interface}]``. Columns:
+    ``MAC(aabbcc-ddeeff) | Port | VLAN`` — note Port precedes VLAN."""
     rows = []
     for line in (text or "").splitlines():
         mac = _MAC_TOKEN.search(line)
-        if not mac:
+        if not mac or _is_null_mac(mac.group(0)):
             continue
         rest = line[mac.end():].split()
-        vlan = rest[0] if rest else ""
-        iface = rest[1] if len(rest) > 1 else ""
-        rows.append({"mac": mac.group(0), "vlan": str(vlan),
-                     "interface": str(iface)})
+        port = rest[0] if rest else ""
+        vlan = rest[1] if len(rest) > 1 else ""
+        # Guard against a reversed layout: if the first token is a VLAN-sized
+        # number and the second is a small port, they're already right; but if
+        # 'port' looks like a VLAN (>4 digits impossible; 1-4094) we still trust
+        # column order (Port|VLAN) per the real AOS-S output.
+        rows.append({"mac": mac.group(0).lower(), "vlan": str(vlan),
+                     "interface": str(port)})
+    return rows
+
+
+def parse_port_access_clients_aos_s(text: str) -> List[dict]:
+    """Aruba AOS-S ``show port-access clients`` → ``[{ip, mac, vlan, interface}]``.
+    Columns: ``Port | Client Name | MAC(aabbcc-ddeeff) | IP | User Role | Type |
+    VLAN(list)``. IP may be ``n/a``; VLAN may be a comma-separated list or empty.
+    Anchored on the hyphenated MAC (col 3); the port is column 1; the trailing
+    comma-separated integers are the VLAN list."""
+    rows = []
+    for line in (text or "").splitlines():
+        m = re.match(r"^\s*(\d+(?:/\d+)*)\s+\S+\s+"
+                     r"([0-9a-fA-F]{6}-[0-9a-fA-F]{6})\s+(\S+)", line)
+        if not m or _is_null_mac(m.group(2)):
+            continue
+        port, mac, ip = m.group(1), m.group(2), m.group(3)
+        ip = "" if ip.lower() in ("n/a", "na", "-", "") else ip
+        vm = re.search(r"((?:\d{1,4})(?:\s*,\s*\d{1,4})*)\s*$", line)
+        vlan = re.sub(r"\s+", "", vm.group(1)) if vm else ""
+        rows.append({"ip": ip, "mac": mac.lower(), "vlan": vlan,
+                     "interface": str(port)})
     return rows
 
 

@@ -617,11 +617,12 @@ class NwEngine:
         if not drv:
             logger.warning("nw get_mac_table: device %s not in fleet", device_id)
             return _err(f"Device {device_id} not found")
-        # Gateway MAC table = `show user-table` (client MAC+IP) augmented by
-        # `show datapath bridge table` (all bridged MACs + VLAN), fused on MAC.
-        if getattr(drv, "object_type", "") == "gateway":
-            arp = await drv.get_arp()          # show user-table
-            mac = await drv.get_mac_table()    # show datapath bridge table
+        # Augment the MAC table with the client/ARP table so each MAC carries its
+        # IP: gateway = `show user-table` ⋈ `show datapath bridge table`;
+        # AOS-S = `show arp` (IP+MAC) ⋈ `show mac-address` (MAC+VLAN+port).
+        if getattr(drv, "object_type", "") in ("gateway", "aos_switch"):
+            arp = await drv.get_arp()          # user-table / show arp
+            mac = await drv.get_mac_table()    # datapath bridge / show mac-address
             self._log_datum("mac_table", drv, mac)
             merged = merge_endpoints(
                 arp.get("data") if arp.get("status") == "SUCCESS" else [],
