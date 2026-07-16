@@ -307,8 +307,10 @@ def parse_interfaces_junos(text: str) -> List[dict]:
 # `show mac-address` / `show interfaces` (AOS-S) return nothing useful. Correct
 # sources:
 #   ARP/IP+MAC  ← `show user-table`          (connected clients: IP col1, MAC col2)
-#   MAC table   ← `show datapath bridge table`(bridge entries: MAC + VLAN + dest)
-#   Interfaces  ← `show ip interface brief`   (ported from ntc-templates aruba_os)
+#   MAC table   ← `show user-table` augmented by `show datapath bridge table`
+#                 (user-table = client MAC+IP; datapath adds bridged MACs + VLAN)
+#   VLANs       ← `show vlan`                 (authoritative list, incl. empty VLANs)
+#   Interfaces  ← `show interface brief`      (physical-port status)
 # Parsers ported from ntc-templates (aruba_os) + real device output.
 
 def parse_user_table_gateway(text: str) -> List[dict]:
@@ -370,14 +372,64 @@ def parse_interfaces_gateway(text: str) -> List[dict]:
     return rows
 
 
+def parse_interface_brief_gateway(text: str) -> List[dict]:
+    """ArubaOS ``show interface brief`` → ``[{name, ip, mac, vlan, status,
+    speed}]``. Physical-port view (Port | Admin | Link/Oper | Speed | Duplex |
+    …). Tolerant: anchor on a port-like first token, read up/down for status and
+    the first speed-like integer. Header/separator lines drop (no port token)."""
+    rows = []
+    for line in (text or "").splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        name = parts[0]
+        # Port token: GE0/0/0, XGE0/0/1, 1/1/1, gigabitethernet…, or mgmt/vlan.
+        if not re.match(r"^(?:\d+/\d+|[A-Za-z]{2,}\d|mgmt|vlan)", name, re.IGNORECASE):
+            continue
+        tail = [p.lower() for p in parts[1:]]
+        status = "up" if "up" in tail else ("down" if "down" in tail else "")
+        sm = re.search(r"\b(\d{2,6})\b", " ".join(parts[1:]))
+        rows.append({"name": name, "ip": "", "mac": "", "vlan": "",
+                     "status": status, "speed": int(sm.group(1)) if sm else 0})
+    return rows
+
+
+def parse_vlans_gateway(text: str) -> List[dict]:
+    """ArubaOS ``show vlan`` → ``[{vlan, name, ports}]`` — the authoritative VLAN
+    list (includes empty VLANs, unlike a MAC/user-table rollup). Tolerant of the
+    column layout (VLAN | Name | Ports | AAA Profile): anchor on a leading VLAN
+    id 1-4094, take the next token as the name, and keep the remainder as ports/
+    description. Header/separator lines have no leading integer so they drop."""
+    rows = []
+    for line in (text or "").splitlines():
+        m = re.match(r"^\s*(\d{1,4})\s+(\S.*?)\s*$", line)
+        if not m:
+            continue
+        vid = int(m.group(1))
+        if not (1 <= vid <= 4094):
+            continue
+        rest = m.group(2).split()
+        name = rest[0] if rest else ""
+        ports = " ".join(rest[1:]) if len(rest) > 1 else ""
+        rows.append({"vlan": str(vid), "name": name, "ports": ports})
+    return rows
+
+
 # object_type → (arp, mac, interfaces) parser triple
 PARSERS: Dict[str, Any] = {
     "aos_switch": (parse_arp_aos_s, parse_mac_aos_s, parse_interfaces_aos_s),
     "ex_switch":  (parse_arp_junos, parse_mac_junos, parse_interfaces_junos),
-    "gateway":    (parse_arp_gateway, parse_mac_gateway, parse_interfaces_gateway),
+    "gateway":    (parse_arp_gateway, parse_mac_gateway, parse_interface_brief_gateway),
     # AOS-CX is REST-first; if CLI is forced, the AOS-S parsers are a close
     # enough fallback for Aruba's CLI family.
     "cx_switch":  (parse_arp_aos_s, parse_mac_aos_s, parse_interfaces_aos_s),
+}
+
+# object_type → VLAN parser. The ``show vlan`` layout is close enough across the
+# Aruba/generic families that the tolerant gateway parser covers all of them.
+VLAN_PARSERS: Dict[str, Any] = {
+    "gateway": parse_vlans_gateway, "aos_switch": parse_vlans_gateway,
+    "cx_switch": parse_vlans_gateway, "ex_switch": parse_vlans_gateway,
 }
 
 
@@ -516,11 +568,21 @@ async def cli_get_interfaces(session: CliSession, object_type: str) -> List[dict
     ``[{name, ip, mac, vlan, status, speed}]`` (IP/MAC/VLAN best-effort)."""
     if_cmd = {"aos_switch": "show interfaces brief", "ex_switch": "show interfaces descriptions",
               "cx_switch": "show interfaces brief",
-              # ArubaOS gateway uses `show ip interface brief` (not `show interfaces`).
-              "gateway": "show ip interface brief"}.get(
+              # ArubaOS gateway: physical-port status via `show interface brief`.
+              "gateway": "show interface brief"}.get(
               object_type, "show interfaces")
     text = await session.run(if_cmd)
     return PARSERS.get(object_type, PARSERS["aos_switch"])[2](text)
+
+
+async def cli_get_vlans(session: CliSession, object_type: str) -> List[dict]:
+    """Run the vendor VLAN show command and return ``[{vlan, name, ports}]`` —
+    the authoritative VLAN list (``show vlan`` on the ArubaOS gateway)."""
+    vlan_cmd = {"aos_switch": "show vlans", "ex_switch": "show vlans",
+                "cx_switch": "show vlan",
+                "gateway": "show vlan"}.get(object_type, "show vlan")
+    text = await session.run(vlan_cmd)
+    return VLAN_PARSERS.get(object_type, parse_vlans_gateway)(text)
 
 
 def _first_hw_token(text: str) -> str:

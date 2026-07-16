@@ -167,6 +167,27 @@ def summarize_vlans(endpoints: Any, interfaces: Any = None) -> List[Dict[str, An
                   if v["vlan"].isdigit() else 9999, v["vlan"]))
 
 
+def enrich_vlans(native_rows: Any, endpoints: Any,
+                 interfaces: Any = None) -> List[Dict[str, Any]]:
+    """Enrich the authoritative ``show vlan`` list with live counts. Each native
+    VLAN ``{vlan, name, ports}`` is annotated with endpoint/mac/ip counts (from
+    the fused user-table+bridge endpoints) and a gateway IP (from an SVI-named
+    L3 interface). Keeps every VLAN from ``show vlan`` (incl. empty ones), which
+    a purely endpoint-derived rollup would miss."""
+    counts = {v["vlan"]: v for v in summarize_vlans(endpoints, interfaces)}
+    out = []
+    for r in (native_rows or []):
+        vid = str(r.get("vlan") or "").strip()
+        if not vid:
+            continue
+        c = counts.get(vid, {})
+        out.append({"vlan": vid, "name": r.get("name", ""),
+                    "ports": r.get("ports", ""),
+                    "endpoints": c.get("endpoints", 0), "macs": c.get("macs", 0),
+                    "ips": c.get("ips", 0), "gateway_ip": c.get("gateway_ip", "")})
+    return out
+
+
 def _err(message: str, data: Any = None) -> Dict[str, Any]:
     return {"status": "ERROR", "data": data if data is not None else [],
             "message": message}
@@ -217,6 +238,11 @@ class NwDriver:
 
     async def get_interfaces(self) -> Dict[str, Any]:
         return _err("interfaces not implemented for this transport")
+
+    async def get_vlans(self) -> Dict[str, Any]:
+        # Native VLAN list (`show vlan`). Only the CLI driver implements it; other
+        # transports degrade so the engine falls back to endpoint-derived VLANs.
+        return _err("vlans not implemented for this transport")
 
     async def run_config(self, commands: List[str]) -> Dict[str, Any]:
         # TODO(phase3): push CLI/REST config changes. Out of scope for the
@@ -339,6 +365,10 @@ class SshCliDriver(NwDriver):
     async def get_interfaces(self) -> Dict[str, Any]:
         from transports import cli_io
         return await self._with_session(cli_io.cli_get_interfaces)
+
+    async def get_vlans(self) -> Dict[str, Any]:
+        from transports import cli_io
+        return await self._with_session(cli_io.cli_get_vlans)
 
     async def install_cert(self, fullchain: str, privkey: str, chain: str,
                            domain: str) -> Dict[str, Any]:
@@ -585,6 +615,16 @@ class NwEngine:
         if not drv:
             logger.warning("nw get_mac_table: device %s not in fleet", device_id)
             return _err(f"Device {device_id} not found")
+        # Gateway MAC table = `show user-table` (client MAC+IP) augmented by
+        # `show datapath bridge table` (all bridged MACs + VLAN), fused on MAC.
+        if getattr(drv, "object_type", "") == "gateway":
+            arp = await drv.get_arp()          # show user-table
+            mac = await drv.get_mac_table()    # show datapath bridge table
+            self._log_datum("mac_table", drv, mac)
+            merged = merge_endpoints(
+                arp.get("data") if arp.get("status") == "SUCCESS" else [],
+                mac.get("data") if mac.get("status") == "SUCCESS" else [])
+            return self._ok_or_partial(merged, [arp, mac], "mac(s)")
         res = await drv.get_mac_table()
         self._log_datum("mac_table", drv, res)
         return res
@@ -624,18 +664,26 @@ class NwEngine:
         return self._ok_or_partial(eps, [arp, mac], "endpoint(s)")
 
     async def get_vlans(self, device_id: str) -> Dict[str, Any]:
-        """Per-VLAN summary rolled up from the merged endpoints + L3 interfaces →
-        ``[{vlan, endpoints, macs, ips, gateway_ip}]`` (the "VLANs" view)."""
+        """VLANs from the authoritative ``show vlan`` list, enriched with live
+        endpoint/mac/ip counts → ``[{vlan, name, ports, endpoints, macs, ips,
+        gateway_ip}]`` (the "VLANs" view). Falls back to an endpoint-derived
+        rollup when the device/transport has no native ``show vlan``."""
         drv = self._driver_for(device_id)
         if not drv:
             logger.warning("nw get_vlans: device %s not in fleet", device_id)
             return _err(f"Device {device_id} not found")
+        native = await drv.get_vlans()
         arp, mac, ifs = await self._gather_endpoint_datums(drv)
-        self._log_datum("vlans", drv, mac)
+        self._log_datum("vlans", drv, native)
         ifdata = ifs.get("data") if ifs.get("status") == "SUCCESS" else []
         eps = merge_endpoints(
             arp.get("data") if arp.get("status") == "SUCCESS" else [],
             mac.get("data") if mac.get("status") == "SUCCESS" else [], ifdata)
+        native_rows = native.get("data") if native.get("status") == "SUCCESS" else None
+        if native_rows:
+            return self._ok_or_partial(enrich_vlans(native_rows, eps, ifdata),
+                                       [native, arp, mac], "vlan(s)")
+        # No native `show vlan` (non-gateway / transport w/o CLI) → derive.
         return self._ok_or_partial(summarize_vlans(eps, ifdata), [arp, mac, ifs],
                                    "vlan(s)")
 
@@ -807,15 +855,22 @@ class NwEngine:
         device_info = await _safe(drv.get_device_info(), "device_info")
         interfaces = await _safe(drv.get_interfaces(), "interfaces")
         arp = await _safe(drv.get_arp(), "arp")
-        mac_table = await _safe(drv.get_mac_table(), "mac_table")
+        # ``bridge`` = the raw datapath/native MAC table; the fielded ``mac_table``
+        # for a gateway is user-table+bridge fused (matches the MAC Table tab).
+        bridge = await _safe(drv.get_mac_table(), "mac_table")
 
         # SUCCESS only when reachable AND no sub-datum errored; else PARTIAL — a
         # reachable device whose info/interfaces/arp/mac probes all failed must not
         # report SUCCESS (the errors[] carry the detail).
-        # Fuse ARP (IP↔MAC) + MAC table (MAC↔VLAN) into a unique endpoint list,
-        # then roll that up per-VLAN. Surfaces the "IP Addresses" + "VLANs" tabs.
-        endpoints = merge_endpoints(arp, mac_table, interfaces)
-        vlans = summarize_vlans(endpoints, interfaces)
+        # Fuse ARP/user-table (IP↔MAC) + bridge (MAC↔VLAN) into a unique endpoint
+        # list; VLANs come from the authoritative `show vlan`, enriched with the
+        # endpoint counts (endpoint-derived rollup is the no-`show vlan` fallback).
+        is_gw = getattr(drv, "object_type", "") == "gateway"
+        endpoints = merge_endpoints(arp, bridge, interfaces)
+        mac_table = endpoints if is_gw else bridge
+        native_vlans = await _safe(drv.get_vlans(), "vlans") if is_gw else []
+        vlans = (enrich_vlans(native_vlans, endpoints, interfaces)
+                 if native_vlans else summarize_vlans(endpoints, interfaces))
 
         status = "SUCCESS" if (reachable and not any(errors)) else "PARTIAL"
         n_if = len(interfaces) if isinstance(interfaces, list) else 0
