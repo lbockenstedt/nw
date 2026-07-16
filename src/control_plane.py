@@ -109,6 +109,14 @@ class NwControlPlane(BaseControlPlane):
                 engine = getattr(module, "engine", None)
                 if engine is None or getattr(self, "_hub_ws", None) is None:
                     continue
+                # Module-level default cadence (pushed via UPDATE_CONFIG); a
+                # device with no poll_interval inherits it, else the 15m built-in.
+                mod_raw = (getattr(module, "config", {}) or {}).get("default_poll_interval")
+                try:
+                    module_default = (self._NW_POLL_DEFAULT
+                                      if mod_raw in (None, "") else int(mod_raw))
+                except (TypeError, ValueError):
+                    module_default = self._NW_POLL_DEFAULT
                 now = time.monotonic()
                 due, seen = [], set()
                 for d in list(engine.devices):
@@ -118,12 +126,12 @@ class NwControlPlane(BaseControlPlane):
                     seen.add(did)
                     raw = d.get("poll_interval")
                     if raw is None or raw == "":
-                        interval = self._NW_POLL_DEFAULT   # unset → 15m default
+                        interval = module_default          # inherit module default
                     else:
                         try:
-                            interval = int(raw)
+                            interval = int(raw)            # device wins (incl 0=Off)
                         except (TypeError, ValueError):
-                            interval = self._NW_POLL_DEFAULT
+                            interval = module_default
                     if interval <= 0:                       # explicit Off
                         next_due.pop(did, None)
                         continue
