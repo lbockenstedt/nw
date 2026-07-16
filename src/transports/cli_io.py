@@ -364,7 +364,7 @@ def parse_interfaces_junos(text: str) -> List[dict]:
 #   MAC table   ← `show user-table` augmented by `show datapath bridge table`
 #                 (user-table = client MAC+IP; datapath adds bridged MACs + VLAN)
 #   VLANs       ← `show vlan`                 (authoritative list, incl. empty VLANs)
-#   Interfaces  ← `show interface brief`      (physical-port status)
+#   Interfaces  ← `show port status`          (physical-port status/speed/mode)
 # Parsers ported from ntc-templates (aruba_os) + real device output.
 
 # ArubaOS device-fingerprint "Type" column vocabulary → client OS. Longest-first
@@ -451,25 +451,28 @@ def parse_interfaces_gateway(text: str) -> List[dict]:
     return rows
 
 
-def parse_interface_brief_gateway(text: str) -> List[dict]:
-    """ArubaOS ``show interface brief`` → ``[{name, ip, mac, vlan, status,
-    speed}]``. Physical-port view (Port | Admin | Link/Oper | Speed | Duplex |
-    …). Tolerant: anchor on a port-like first token, read up/down for status and
-    the first speed-like integer. Header/separator lines drop (no port token)."""
+def parse_port_status_gateway(text: str) -> List[dict]:
+    """ArubaOS gateway ``show port status`` → ``[{name, ip, mac, vlan, status,
+    speed, mode}]``. Columns: ``Slot-Port | PortType | AdminState | OperState |
+    PoE | Trusted | SpanningTree | PortMode | Speed | Duplex | PortError``.
+
+    Anchor on a ``slot/port`` first token; status = OperState (col 4); speed is
+    parsed from the ``<n> Gbps|Mbps`` token → Mbps int (Auto → 0); mode = PortMode
+    (Access/Trunk). No IP/MAC/VLAN in this output (those come from the user-table
+    / bridge). Header/separator lines have no slot-port token so they drop."""
     rows = []
     for line in (text or "").splitlines():
-        parts = line.split()
-        if len(parts) < 2:
+        toks = line.split()
+        if len(toks) < 4 or not re.match(r"^\d+/\d+(?:/\d+)?$", toks[0]):
             continue
-        name = parts[0]
-        # Port token: GE0/0/0, XGE0/0/1, 1/1/1, gigabitethernet…, or mgmt/vlan.
-        if not re.match(r"^(?:\d+/\d+|[A-Za-z]{2,}\d|mgmt|vlan)", name, re.IGNORECASE):
-            continue
-        tail = [p.lower() for p in parts[1:]]
-        status = "up" if "up" in tail else ("down" if "down" in tail else "")
-        sm = re.search(r"\b(\d{2,6})\b", " ".join(parts[1:]))
-        rows.append({"name": name, "ip": "", "mac": "", "vlan": "",
-                     "status": status, "speed": int(sm.group(1)) if sm else 0})
+        oper = toks[3].lower()
+        status = "up" if oper == "up" else ("down" if oper == "down" else oper)
+        sm = re.search(r"\b(\d+)\s*(Gbps|Mbps)\b", line, re.IGNORECASE)
+        speed = (int(sm.group(1)) * (1000 if sm.group(2).lower().startswith("g")
+                 else 1)) if sm else 0
+        mode = toks[7] if len(toks) > 7 else ""
+        rows.append({"name": toks[0], "ip": "", "mac": "", "vlan": "",
+                     "status": status, "speed": speed, "mode": mode})
     return rows
 
 
@@ -498,7 +501,7 @@ def parse_vlans_gateway(text: str) -> List[dict]:
 PARSERS: Dict[str, Any] = {
     "aos_switch": (parse_arp_aos_s, parse_mac_aos_s, parse_interfaces_aos_s),
     "ex_switch":  (parse_arp_junos, parse_mac_junos, parse_interfaces_junos),
-    "gateway":    (parse_arp_gateway, parse_mac_gateway, parse_interface_brief_gateway),
+    "gateway":    (parse_arp_gateway, parse_mac_gateway, parse_port_status_gateway),
     # AOS-CX is REST-first; if CLI is forced, the AOS-S parsers are a close
     # enough fallback for Aruba's CLI family.
     "cx_switch":  (parse_arp_aos_s, parse_mac_aos_s, parse_interfaces_aos_s),
@@ -647,8 +650,8 @@ async def cli_get_interfaces(session: CliSession, object_type: str) -> List[dict
     ``[{name, ip, mac, vlan, status, speed}]`` (IP/MAC/VLAN best-effort)."""
     if_cmd = {"aos_switch": "show interfaces brief", "ex_switch": "show interfaces descriptions",
               "cx_switch": "show interfaces brief",
-              # ArubaOS gateway: physical-port status via `show interface brief`.
-              "gateway": "show interface brief"}.get(
+              # ArubaOS gateway: physical-port status via `show port status`.
+              "gateway": "show port status"}.get(
               object_type, "show interfaces")
     text = await session.run(if_cmd)
     return PARSERS.get(object_type, PARSERS["aos_switch"])[2](text)
