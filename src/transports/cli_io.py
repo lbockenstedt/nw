@@ -37,6 +37,13 @@ _PAGER_RE = re.compile(r"--\s*More\s*--", re.IGNORECASE)
 # Prompt ends in '#' (enabled) or '>' (user) for AOS-S/gateway; Junos ends in
 # '>' or '#'. Match a line ending in a prompt char after optional whitespace.
 _PROMPT_RE = re.compile(r"[>#]\s*$")
+# Tail windows so per-chunk detection cost is O(chunk), never O(total output):
+# pager markers are short ("--  More  --"-ish), so 64 chars of overlap catches
+# one split across a chunk boundary; prompt lines are short, so 512 chars is
+# ample to isolate the text after the last newline (the prompt regex is
+# end-anchored, so a bounded tail gives identical results).
+_PAGER_OVERLAP = 64
+_PROMPT_TAIL = 512
 
 
 class CliSession:
@@ -104,10 +111,20 @@ class CliSession:
         self._proc.stdin.write(line + "\n")
 
     async def _read_until_prompt(self, timeout: float = 12.0) -> str:
-        """Drain stdout until a prompt-looking line appears (or timeout)."""
+        """Drain stdout until a prompt-looking line appears (or timeout).
+
+        Linear cost: complete lines are drained into ``out`` every iteration,
+        so ``buf`` only ever holds the trailing partial line + the newest
+        chunk, and both detections examine bounded tails — the prompt check
+        looks only at the last line (``_PROMPT_TAIL`` window), the pager check
+        only at the newest chunk plus a ``_PAGER_OVERLAP`` overlap for a
+        marker split across the boundary. A multi-thousand-line MAC/user
+        table is never rescanned whole per 4KB read."""
         out: List[str] = []
+        # Invariant: between iterations buf holds only the trailing partial
+        # line (no newline) — complete lines are drained below.
+        buf = ""
         try:
-            buf = ""
             loop = asyncio.get_event_loop()
             deadline = loop.time() + timeout
             while loop.time() < deadline:
@@ -118,29 +135,46 @@ class CliSession:
                     chunk = await asyncio.wait_for(
                         self._proc.stdout.read(4096), timeout=min(remaining, 1.0))
                 except asyncio.TimeoutError:
-                    if buf and _PROMPT_RE.search(buf.splitlines()[-1] if buf else ""):
+                    # buf is the current (only) partial line; the end-anchored
+                    # prompt regex on its tail == the old whole-last-line check.
+                    if buf and _PROMPT_RE.search(buf[-_PROMPT_TAIL:]):
                         break
                     continue
                 if not chunk:
                     break
-                buf += chunk
                 # If paging is still on despite `no page`, advance the pager (send
                 # a space) and strip the marker so output isn't truncated/polluted.
-                if _PAGER_RE.search(buf):
+                # Scan only the newest chunk + a small overlap — older text was
+                # already scanned (and scrubbed) when its own chunk arrived.
+                keep = max(0, len(buf) - _PAGER_OVERLAP)
+                window = buf[keep:] + chunk
+                if _PAGER_RE.search(window):
                     try:
                         self._proc.stdin.write(" ")
                     except Exception:
                         pass
-                    buf = _PAGER_RE.sub("", buf)
+                    buf = buf[:keep] + _PAGER_RE.sub("", window)
                     deadline = loop.time() + timeout  # keep reading further pages
-                lines = buf.splitlines(keepends=True)
-                if lines and _PROMPT_RE.search(lines[-1].rstrip()):
+                else:
+                    buf += chunk
+                # Prompt check on the LAST line only (same semantics as the old
+                # splitlines()[-1].rstrip() over the whole buffer, but bounded).
+                tail = buf[-_PROMPT_TAIL:]
+                if tail.endswith("\n"):
+                    tail = tail[:-1]
+                    if tail.endswith("\r"):
+                        tail = tail[:-1]
+                last_line = tail[tail.rfind("\n") + 1:]
+                if last_line and _PROMPT_RE.search(last_line.rstrip()):
                     out.append(buf)
                     return "".join(out)
-                # keep the last partial line in buf
-                if "\n" in buf:
-                    complete, buf = buf.rsplit("\n", 1)
-                    out.append(complete + "\n")
+                # Drain complete lines; keep only the trailing partial line so
+                # the next iteration's scans stay O(chunk). Any newline is at
+                # index >= keep (the pre-chunk buf held none).
+                nl = buf.rfind("\n", keep)
+                if nl != -1:
+                    out.append(buf[:nl + 1])
+                    buf = buf[nl + 1:]
         except Exception as e:
             logger.debug("cli read %s: %s", self.host, e)
         return "".join(out)

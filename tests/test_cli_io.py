@@ -99,3 +99,100 @@ def test_serial_and_firmware_extractors():
     text = "Aruba JL658A Serial: SG123ABCD Firmware Version 16.02.0023"
     assert cli_io._serial_from(text) == "SG123ABCD"
     assert "16.02.0023" == cli_io._firmware_from(text)
+
+
+# ── _read_until_prompt: linear tail-window reader (FIX B) ─────────────────────
+import asyncio  # noqa: E402
+import time  # noqa: E402
+
+
+class _FakeStdout:
+    def __init__(self, chunks, eof=False):
+        self._chunks = list(chunks)
+        self._eof = eof
+
+    async def read(self, n):
+        if self._chunks:
+            return self._chunks.pop(0)
+        if self._eof:
+            return ""  # EOF
+        raise RuntimeError("read past end of scripted output")
+
+
+class _FakeStdin:
+    def __init__(self):
+        self.writes = []
+
+    def write(self, s):
+        self.writes.append(s)
+
+
+class _FakeProc:
+    def __init__(self, chunks, eof=False):
+        self.stdout = _FakeStdout(chunks, eof=eof)
+        self.stdin = _FakeStdin()
+
+
+def _reader_session(chunks, eof=False):
+    s = cli_io.CliSession({"address": "10.0.0.1", "username": "admin"})
+    s._proc = _FakeProc(chunks, eof=eof)
+    return s
+
+
+def _chunked(text, size=4096):
+    return [text[i:i + size] for i in range(0, len(text), size)]
+
+
+def _read(s, timeout=5.0):
+    return asyncio.get_event_loop().run_until_complete(
+        s._read_until_prompt(timeout=timeout))
+
+
+def test_read_large_output_intact_and_fast():
+    # A multi-thousand-line MAC-table-sized response fed in 4KB chunks must come
+    # back byte-identical (prompt detected on the last chunk) in linear time.
+    lines = [f"  10.0.0.{i % 250}    aabbcc-dd{i:04x}  dynamic  {i % 48}"
+             for i in range(5000)]
+    text = "\n".join(lines) + "\nswitch# "
+    s = _reader_session(_chunked(text))
+    t0 = time.monotonic()
+    res = _read(s)
+    assert time.monotonic() - t0 < 2.0
+    assert res == text
+
+
+def test_read_pager_marker_split_across_chunk_boundary():
+    # The overlap window must catch a "--  More  --" split across two chunks:
+    # the pager gets advanced (space written) and the marker is stripped.
+    part1 = "line one\nline two --  Mo"
+    part2 = "re  --\nline three\nswitch# "
+    s = _reader_session([part1, part2])
+    res = _read(s)
+    assert "More" not in res
+    assert "line one\n" in res and "line three\n" in res
+    assert res.endswith("switch# ")
+    assert " " in s._proc.stdin.writes
+
+
+def test_read_prompt_on_complete_final_line():
+    # A prompt followed by a newline (complete last line) must still terminate
+    # the read immediately — the old splitlines()[-1] semantics.
+    text = "some output\nswitch#\n"
+    s = _reader_session(_chunked(text))
+    res = _read(s)
+    assert res == text
+
+
+def test_read_crlf_output_intact():
+    text = "l1\r\nl2\r\nswitch# "
+    s = _reader_session(_chunked(text))
+    res = _read(s)
+    assert res == text
+
+
+def test_read_eof_drops_trailing_partial_line():
+    # EOF without a prompt: complete lines are returned, the dangling partial
+    # line is dropped (unchanged legacy behavior).
+    s = _reader_session(["a\nb\npartial"], eof=True)
+    res = _read(s)
+    assert res == "a\nb\n"
