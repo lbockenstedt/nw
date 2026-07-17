@@ -152,3 +152,140 @@ def test_nw_poll_command_normalizes_macs():
 
 async def _async(val):
     return val
+
+
+# ── FIX A: one transport session per device per poll ─────────────────────────
+class _CountingCliSession:
+    """Fake CliSession: counts connects/closes, records commands, and returns
+    canned text so the real cli_io datum functions parse something."""
+
+    def __init__(self, calls, fail_cmds=None):
+        self._calls = calls
+        self._fail_cmds = fail_cmds or set()
+
+    async def __aenter__(self):
+        await self.connect()
+        return self
+
+    async def __aexit__(self, *exc):
+        await self.close()
+
+    async def connect(self):
+        self._calls["connect"] += 1
+
+    async def close(self):
+        self._calls["close"] += 1
+
+    async def run(self, cmd):
+        self._calls["runs"].append(cmd)
+        if cmd in self._fail_cmds:
+            raise RuntimeError(f"session died on {cmd!r}")
+        return "Aruba JL658A Serial: SG1 Version 16.02.0003\nswitch# "
+
+
+def _ssh_engine(calls, fail_cmds=None):
+    eng = NwEngine([{"id": "d1", "object_type": "aos_switch",
+                     "address": "10.0.0.1", "username": "admin",
+                     "transport": "ssh"}])
+    real_driver_for = eng._driver_for
+
+    def _driver_for(device_id):
+        drv = real_driver_for(device_id)
+        if drv is not None:
+            drv._session = lambda: _CountingCliSession(calls, fail_cmds)
+        return drv
+    eng._driver_for = _driver_for  # type: ignore
+    return eng
+
+
+def test_poll_ssh_opens_single_session():
+    calls = {"connect": 0, "close": 0, "runs": []}
+    eng = _ssh_engine(calls)
+    res = _run(eng.poll("d1"))
+    # probe + device_info + interfaces + arp + mac all ran over ONE session.
+    assert calls["connect"] == 1
+    assert calls["close"] == 1
+    assert len(calls["runs"]) == 5
+    assert res["status"] == "SUCCESS"
+    assert res["data"]["reachable"] is True
+
+
+def test_poll_ssh_shared_session_datum_failure_isolated():
+    # A command that raises mid-poll costs one reconnect; the failed datum comes
+    # back as an ERROR (empty list + errors entry) and the REST of the poll
+    # still completes over the reconnected session.
+    calls = {"connect": 0, "close": 0, "runs": []}
+    eng = _ssh_engine(calls, fail_cmds={"show arp"})
+    res = _run(eng.poll("d1"))
+    assert calls["connect"] == 2          # initial + the one reconnect credit
+    assert res["data"]["arp"] == []
+    assert any("arp" in e for e in res["errors"])
+    assert res["data"]["interfaces"]      # earlier datum unaffected
+    assert isinstance(res["data"]["mac_table"], list)  # later datum still ran
+    assert all("arp" in e for e in res["errors"])      # only arp failed
+
+
+def test_get_vlans_composite_single_session():
+    # get_vlans = native `show vlans` + arp + mac + interfaces — all four over
+    # ONE session (previously up to 4 simultaneous sessions to one device).
+    calls = {"connect": 0, "close": 0, "runs": []}
+    eng = _ssh_engine(calls)
+    res = _run(eng.get_vlans("d1"))
+    assert calls["connect"] == 1
+    assert len(calls["runs"]) == 4
+    assert res["status"] in ("SUCCESS", "PARTIAL")
+
+
+def test_get_endpoints_composite_single_session():
+    calls = {"connect": 0, "close": 0, "runs": []}
+    eng = _ssh_engine(calls)
+    res = _run(eng.get_endpoints("d1"))
+    assert calls["connect"] == 1
+    assert len(calls["runs"]) == 3        # arp + mac + interfaces
+    assert res["status"] in ("SUCCESS", "PARTIAL")
+
+
+def test_single_datum_call_still_per_session():
+    # Outside a poll/composite fetch the legacy one-session-per-call shape is
+    # unchanged.
+    calls = {"connect": 0, "close": 0, "runs": []}
+    eng = _ssh_engine(calls)
+    res = _run(eng.get_arp("d1"))
+    assert calls["connect"] == 1
+    assert calls["close"] == 1
+    assert res["status"] == "SUCCESS"
+
+
+def test_poll_rest_reuses_single_client():
+    from nw_engine import RestDriver
+
+    calls = {"connect": 0, "close": 0, "gets": []}
+
+    class _CountingRestSession:
+        async def connect(self):
+            calls["connect"] += 1
+
+        async def close(self):
+            calls["close"] += 1
+
+        async def get(self, path):
+            calls["gets"].append(path)
+            return []
+
+    eng = NwEngine([{"id": "d1", "object_type": "cx_switch",
+                     "address": "10.0.0.2", "username": "admin",
+                     "transport": "rest"}])
+    real_driver_for = eng._driver_for
+
+    def _driver_for(device_id):
+        drv = real_driver_for(device_id)
+        if drv is not None:
+            assert isinstance(drv, RestDriver)
+            drv._session = lambda: _CountingRestSession()
+        return drv
+    eng._driver_for = _driver_for  # type: ignore
+    res = _run(eng.poll("d1"))
+    assert calls["connect"] == 1
+    assert calls["close"] == 1
+    assert len(calls["gets"]) == 5        # probe + info + interfaces + arp + mac
+    assert res["data"]["reachable"] is True

@@ -24,6 +24,7 @@ hub's POLL NOW path.
 import asyncio
 import logging
 import re
+from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("NwEngine")
@@ -195,11 +196,63 @@ def _err(message: str, data: Any = None) -> Dict[str, Any]:
             "message": message}
 
 
+class _SharedTransportSession:
+    """One live transport session (SSH PTY / httpx client) shared by all the
+    datum calls of a single poll or composite fetch, with a single reconnect
+    credit: if the session dies mid-poll the next datum call reconnects once;
+    after that, failures degrade to per-datum ERROR envelopes."""
+
+    def __init__(self, factory):
+        self._factory = factory
+        self.session = None
+        self._reconnect_used = False
+
+    async def open(self) -> None:
+        s = self._factory()
+        try:
+            await s.connect()
+        except Exception:
+            try:
+                await s.close()
+            except Exception:
+                pass
+            raise
+        self.session = s
+
+    async def reconnect_once(self) -> bool:
+        """One-shot reconnect after a mid-poll session death. True when a fresh
+        session is live; False when the credit is spent or the reconnect itself
+        failed (callers then fall back to per-datum handling)."""
+        if self._reconnect_used:
+            return False
+        self._reconnect_used = True
+        await self.close()
+        try:
+            await self.open()
+            return True
+        except Exception:
+            return False
+
+    async def close(self) -> None:
+        s, self.session = self.session, None
+        if s is not None:
+            try:
+                await s.close()
+            except Exception:
+                pass
+
+
 class NwDriver:
     """Abstract base for a per-device driver. Transport subclasses implement the
     IO; the base provides transport resolution + envelope helpers."""
 
     transport = "base"
+    # Transports with a costly per-connection handshake (SSH banner/no-page/
+    # enable, REST TLS+auth) set this True so poll/composite fetches open ONE
+    # session per device and run their commands over it sequentially (some
+    # devices also cap concurrent VTYs). SNMP stays False: sessions are cheap
+    # and its datums may still run concurrently.
+    shares_session = False
 
     def __init__(self, device: Dict[str, Any]):
         self.device = device
@@ -207,6 +260,44 @@ class NwDriver:
         self.object_type = device.get("object_type", "")
         self.address = device.get("address", "")
         self.transport = self._resolve_transport(device)
+        self._shared: Optional[_SharedTransportSession] = None
+
+    @asynccontextmanager
+    async def session_scope(self):
+        """Scope within which the datum methods reuse ONE transport session
+        instead of opening a fresh one per call. No-op for transports whose
+        sessions are cheap (``shares_session`` False); reentrant, so nested
+        composite fetches reuse the outer scope's session. A failed connect
+        degrades silently to the legacy per-call sessions so the per-datum
+        ERROR-envelope contract is unchanged."""
+        if not self.shares_session or self._shared is not None:
+            yield
+            return
+        shared = _SharedTransportSession(self._session)
+        try:
+            await shared.open()
+            self._shared = shared
+        except Exception as e:
+            logger.debug("shared %s session %s: %s (per-call fallback)",
+                         self.transport, self.address, e)
+        try:
+            yield
+        finally:
+            self._shared = None
+            await shared.close()
+
+    async def _run_on_shared(self, fn):
+        """Run one datum ``fn`` over the active shared session, reconnecting
+        once if the session died mid-poll. Caller checks ``self._shared`` (and
+        its ``.session``) first; raises on failure so the caller's existing
+        except clauses build the usual ERROR envelope."""
+        shared = self._shared
+        try:
+            return await fn(shared.session, self.object_type)
+        except Exception:
+            if not await shared.reconnect_once():
+                raise
+            return await fn(shared.session, self.object_type)
 
     @staticmethod
     def _resolve_transport(device: Dict[str, Any]) -> str:
@@ -316,9 +407,12 @@ class SnmpDriver(NwDriver):
 
 class SshCliDriver(NwDriver):
     """SSH / CLI driver (asyncssh + per-vendor text parsers). One interactive
-    PTY session per call: connect, disable paging, run the vendor show commands,
-    parse the text. ``enable_secret`` enters enable mode on AOS-S."""
+    PTY session per call — or ONE session for a whole poll/composite fetch when
+    called inside :meth:`session_scope` (connect, disable paging, then run all
+    the vendor show commands over it sequentially). ``enable_secret`` enters
+    enable mode on AOS-S."""
     transport = "ssh"
+    shares_session = True
 
     def _session(self):
         from transports import cli_io
@@ -327,6 +421,8 @@ class SshCliDriver(NwDriver):
     async def _with_session(self, fn) -> Dict[str, Any]:
         from transports import cli_io
         try:
+            if self._shared is not None and self._shared.session is not None:
+                return self._ok(await self._run_on_shared(fn))
             async with self._session() as s:
                 rows = await fn(s, self.object_type)
                 return self._ok(rows)
@@ -340,9 +436,15 @@ class SshCliDriver(NwDriver):
         import time
         t0 = time.monotonic()
         try:
-            async with self._session() as s:
-                # A successful connection + one command == reachable.
-                await s.run("show version")
+            if self._shared is not None and self._shared.session is not None:
+                # Shared-session poll: reachability == one command round-trip
+                # (the connect already happened when the scope opened).
+                await self._run_on_shared(
+                    lambda s, _ot: s.run("show version"))
+            else:
+                async with self._session() as s:
+                    # A successful connection + one command == reachable.
+                    await s.run("show version")
             return self._ok({"reachable": True,
                              "latency_ms": int((time.monotonic() - t0) * 1000)})
         except cli_io.CliError as e:
@@ -393,8 +495,11 @@ class SshCliDriver(NwDriver):
 
 class RestDriver(NwDriver):
     """REST driver (httpx). AOS-CX RESTv1 (basic auth) + Aruba/HPE gateway REST
-    (bearer token). TLS verify controlled by ``LM_NW_VERIFY_TLS`` (default off)."""
+    (bearer token). TLS verify controlled by ``LM_NW_VERIFY_TLS`` (default off).
+    Inside :meth:`session_scope` (poll/composite fetches) one httpx client is
+    reused for every GET instead of a fresh client (TLS handshake) per datum."""
     transport = "rest"
+    shares_session = True
 
     def _session(self):
         from transports import rest_io
@@ -403,6 +508,8 @@ class RestDriver(NwDriver):
     async def _with_session(self, fn) -> Dict[str, Any]:
         from transports import rest_io
         try:
+            if self._shared is not None and self._shared.session is not None:
+                return self._ok(await self._run_on_shared(fn))
             async with self._session() as s:
                 rows = await fn(s, self.object_type)
                 return self._ok(rows)
@@ -415,8 +522,11 @@ class RestDriver(NwDriver):
         import time
         t0 = time.monotonic()
         try:
-            async with self._session() as s:
-                await rest_get_device_info(s, self.object_type)
+            if self._shared is not None and self._shared.session is not None:
+                await self._run_on_shared(rest_get_device_info)
+            else:
+                async with self._session() as s:
+                    await rest_get_device_info(s, self.object_type)
             return self._ok({"reachable": True,
                              "latency_ms": int((time.monotonic() - t0) * 1000)})
         except Exception as e:
@@ -474,6 +584,12 @@ _TRANSPORT_CLASSES = {
     "rest": RestDriver,
     "snmp": SnmpDriver,
 }
+
+
+@asynccontextmanager
+async def _null_scope():
+    """No-op async scope for drivers without ``session_scope`` (test fakes)."""
+    yield
 
 
 def build_driver(device: Dict[str, Any]) -> Optional[NwDriver]:
@@ -621,8 +737,9 @@ class NwEngine:
         # IP: gateway = `show user-table` ⋈ `show datapath bridge table`;
         # AOS-S = `show arp` (IP+MAC) ⋈ `show mac-address` (MAC+VLAN+port).
         if getattr(drv, "object_type", "") in ("gateway", "aos_switch"):
-            arp = await drv.get_arp()          # user-table / show arp
-            mac = await drv.get_mac_table()    # datapath bridge / show mac-address
+            async with self._session_scope(drv):  # one session for both datums
+                arp = await drv.get_arp()        # user-table / show arp
+                mac = await drv.get_mac_table()  # datapath bridge / show mac-address
             self._log_datum("mac_table", drv, mac)
             merged = merge_endpoints(
                 arp.get("data") if arp.get("status") == "SUCCESS" else [],
@@ -675,8 +792,9 @@ class NwEngine:
         if not drv:
             logger.warning("nw get_vlans: device %s not in fleet", device_id)
             return _err(f"Device {device_id} not found")
-        native = await drv.get_vlans()
-        arp, mac, ifs = await self._gather_endpoint_datums(drv)
+        async with self._session_scope(drv):
+            native = await drv.get_vlans()
+            arp, mac, ifs = await self._gather_endpoint_datums(drv)
         self._log_datum("vlans", drv, native)
         ifdata = ifs.get("data") if ifs.get("status") == "SUCCESS" else []
         eps = merge_endpoints(
@@ -691,16 +809,33 @@ class NwEngine:
                                    "vlan(s)")
 
     @staticmethod
+    def _session_scope(drv):
+        """The driver's shared-session scope (ONE connection for all the datum
+        calls inside it); a no-op scope for drivers without one (test fakes) or
+        with cheap sessions (SNMP)."""
+        scope = getattr(drv, "session_scope", None)
+        if callable(scope):
+            return scope()
+        return _null_scope()
+
+    @staticmethod
     async def _gather_endpoint_datums(drv):
-        """Fetch ARP + MAC + interfaces concurrently (each on its own session) so
-        the fused endpoint/VLAN views cost one round-trip, not three. A gather
-        member that raises is coerced to an ERROR envelope so the merge still
-        runs on whatever succeeded."""
+        """Fetch ARP + MAC + interfaces for the fused endpoint/VLAN views. On a
+        session-sharing transport (SSH/REST) the three run SEQUENTIALLY over ONE
+        shared session — the handshake is the expensive part, and some devices
+        cap concurrent VTY sessions. On SNMP (sessions cheap) they still run
+        concurrently. A datum that raises is coerced to an ERROR envelope so
+        the merge still runs on whatever succeeded."""
         async def _safe(coro):
             try:
                 return await coro
             except Exception as e:  # noqa: BLE001 - degrade to ERROR envelope
                 return _err(str(e))
+        if getattr(drv, "shares_session", False):
+            async with NwEngine._session_scope(drv):
+                return (await _safe(drv.get_arp()),
+                        await _safe(drv.get_mac_table()),
+                        await _safe(drv.get_interfaces()))
         return await asyncio.gather(_safe(drv.get_arp()),
                                     _safe(drv.get_mac_table()),
                                     _safe(drv.get_interfaces()))
@@ -836,17 +971,6 @@ class NwEngine:
         reachable = False
         latency_ms = None
 
-        pr = await drv.probe()
-        if pr.get("status") == "SUCCESS":
-            pd = pr.get("data") or {}
-            reachable = bool(pd.get("reachable"))
-            latency_ms = pd.get("latency_ms")
-            self._log_datum("probe", drv, pr,
-                            detail=f"reachable={reachable} latency={latency_ms}ms")
-        else:
-            self._log_datum("probe", drv, pr)
-            errors.append(f"probe: {pr.get('message', 'failed')}")
-
         async def _safe(coro, label):
             r = await coro
             self._log_datum(label, drv, r)
@@ -855,12 +979,32 @@ class NwEngine:
             errors.append(f"{label}: {r.get('message', 'failed')}")
             return [] if label != "device_info" else {}
 
-        device_info = await _safe(drv.get_device_info(), "device_info")
-        interfaces = await _safe(drv.get_interfaces(), "interfaces")
-        arp = await _safe(drv.get_arp(), "arp")
-        # ``bridge`` = the raw datapath/native MAC table; the fielded ``mac_table``
-        # for a gateway is user-table+bridge fused (matches the MAC Table tab).
-        bridge = await _safe(drv.get_mac_table(), "mac_table")
+        # ONE shared transport session (SSH/REST) for the whole poll — probe +
+        # every datum runs over it sequentially instead of a full handshake per
+        # sub-call. Each call still fails independently (ERROR envelope), and a
+        # session that dies mid-poll gets one reconnect.
+        async with self._session_scope(drv):
+            pr = await drv.probe()
+            if pr.get("status") == "SUCCESS":
+                pd = pr.get("data") or {}
+                reachable = bool(pd.get("reachable"))
+                latency_ms = pd.get("latency_ms")
+                self._log_datum("probe", drv, pr,
+                                detail=f"reachable={reachable} latency={latency_ms}ms")
+            else:
+                self._log_datum("probe", drv, pr)
+                errors.append(f"probe: {pr.get('message', 'failed')}")
+
+            device_info = await _safe(drv.get_device_info(), "device_info")
+            interfaces = await _safe(drv.get_interfaces(), "interfaces")
+            arp = await _safe(drv.get_arp(), "arp")
+            # ``bridge`` = the raw datapath/native MAC table; the fielded
+            # ``mac_table`` for a gateway is user-table+bridge fused (matches
+            # the MAC Table tab).
+            bridge = await _safe(drv.get_mac_table(), "mac_table")
+
+            is_gw = getattr(drv, "object_type", "") == "gateway"
+            native_vlans = await _safe(drv.get_vlans(), "vlans") if is_gw else []
 
         # SUCCESS only when reachable AND no sub-datum errored; else PARTIAL — a
         # reachable device whose info/interfaces/arp/mac probes all failed must not
@@ -868,10 +1012,8 @@ class NwEngine:
         # Fuse ARP/user-table (IP↔MAC) + bridge (MAC↔VLAN) into a unique endpoint
         # list; VLANs come from the authoritative `show vlan`, enriched with the
         # endpoint counts (endpoint-derived rollup is the no-`show vlan` fallback).
-        is_gw = getattr(drv, "object_type", "") == "gateway"
         endpoints = merge_endpoints(arp, bridge, interfaces)
         mac_table = endpoints if is_gw else bridge
-        native_vlans = await _safe(drv.get_vlans(), "vlans") if is_gw else []
         vlans = (enrich_vlans(native_vlans, endpoints, interfaces)
                  if native_vlans else summarize_vlans(endpoints, interfaces))
 
