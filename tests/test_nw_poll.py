@@ -69,7 +69,7 @@ def _err(message): return {"status": "ERROR", "data": [], "message": message}
 
 def _engine_with_fake(driver):
     eng = NwEngine([{"id": "d1", "object_type": "gateway", "address": "10.0.0.1"}])
-    eng._driver_for = lambda device_id: driver  # type: ignore
+    eng._driver_for = lambda device_id, tenant=None: driver  # type: ignore
     return eng
 
 
@@ -142,7 +142,7 @@ def test_nw_poll_command_normalizes_macs():
         "errors": [],
         "message": "ok",
     }
-    spoke.engine.poll = lambda device_id: _async(canned)  # type: ignore
+    spoke.engine.poll = lambda device_id, tenant=None: _async(canned)  # type: ignore
     res = _run(spoke.handle_command("NW_POLL", {"device_id": "d1"}))
     d = res["data"]
     assert d["arp"][0]["mac"] == "aa:bb:cc:dd:ee:ff"
@@ -189,8 +189,8 @@ def _ssh_engine(calls, fail_cmds=None):
                      "transport": "ssh"}])
     real_driver_for = eng._driver_for
 
-    def _driver_for(device_id):
-        drv = real_driver_for(device_id)
+    def _driver_for(device_id, tenant=None):
+        drv = real_driver_for(device_id, tenant)
         if drv is not None:
             drv._session = lambda: _CountingCliSession(calls, fail_cmds)
         return drv
@@ -277,8 +277,8 @@ def test_poll_rest_reuses_single_client():
                      "transport": "rest"}])
     real_driver_for = eng._driver_for
 
-    def _driver_for(device_id):
-        drv = real_driver_for(device_id)
+    def _driver_for(device_id, tenant=None):
+        drv = real_driver_for(device_id, tenant)
         if drv is not None:
             assert isinstance(drv, RestDriver)
             drv._session = lambda: _CountingRestSession()

@@ -256,7 +256,7 @@ def test_spoke_install_cert_routes_by_identifier():
     spoke = _spoke_with([_CX])
     captured = {}
 
-    async def _engine_install(device_id, fullchain, privkey, chain, domain):
+    async def _engine_install(device_id, fullchain, privkey, chain, domain, tenant=None):
         captured.update(device_id=device_id, fullchain=fullchain,
                         privkey=privkey, chain=chain, domain=domain)
         return {"status": "SUCCESS", "message": f"installed on {device_id}"}

@@ -133,6 +133,115 @@ def test_per_device_unknown_device_errors():
     assert "not found" in res["message"]
 
 
+# ── Tenant scoping (Stage 1) ───────────────────────────────────────────────
+# The fleet list + per-device commands accept an optional ``tenant`` filter;
+# a device is visible to a tenant if its ``tenant_id`` matches OR equals the
+# shared tenant id (mirrors the hub's shared-tenant-flag invariant). Omitting
+# ``tenant`` returns the whole fleet (backward-compatible with a hub that
+# doesn't pass one). build_driver is stubbed to None so list_devices' 3s
+# reachability probe is skipped (no real IO; reachable stays None) — these
+# tests assert the tenant FILTER, not the probe.
+def _no_probe(monkeypatch):
+    import nw_engine as _ne
+    monkeypatch.setattr(_ne, "build_driver", lambda d: None)
+
+
+def _fleet():
+    # acme-owned, othercorp-owned, shared, and unassigned (admin-only) devices.
+    return [
+        {"id": "acme-sw", "name": "acme", "object_type": "aos_switch",
+         "address": "10.0.0.2", "tenant_id": "acme"},
+        {"id": "other-sw", "name": "other", "object_type": "aos_switch",
+         "address": "10.0.0.3", "tenant_id": "othercorp"},
+        {"id": "shared-sw", "name": "shared", "object_type": "aos_switch",
+         "address": "10.0.0.4", "tenant_id": "shared"},
+        {"id": "unassigned-sw", "name": "unassigned", "object_type": "aos_switch",
+         "address": "10.0.0.5", "tenant_id": ""},
+    ]
+
+
+def test_list_devices_no_tenant_returns_whole_fleet(monkeypatch):
+    _no_probe(monkeypatch)
+    spoke = _spoke_with(_fleet())
+    spoke.engine.shared_tenant_id = "shared"
+    res = _run(spoke.handle_command("NW_LIST_DEVICES", {}))
+    assert res["status"] == "SUCCESS"
+    ids = {r["id"] for r in res["data"]}
+    assert ids == {"acme-sw", "other-sw", "shared-sw", "unassigned-sw"}
+
+
+def test_list_devices_tenant_filter_returns_own_plus_shared(monkeypatch):
+    _no_probe(monkeypatch)
+    spoke = _spoke_with(_fleet())
+    spoke.engine.shared_tenant_id = "shared"
+    res = _run(spoke.handle_command("NW_LIST_DEVICES", {"tenant": "acme"}))
+    ids = {r["id"] for r in res["data"]}
+    assert ids == {"acme-sw", "shared-sw"}      # own + shared; not othercorp/unassigned
+
+
+def test_list_devices_rows_carry_tenant_id_and_shared(monkeypatch):
+    _no_probe(monkeypatch)
+    spoke = _spoke_with(_fleet())
+    spoke.engine.shared_tenant_id = "shared"
+    res = _run(spoke.handle_command("NW_LIST_DEVICES", {"tenant": "acme"}))
+    by_id = {r["id"]: r for r in res["data"]}
+    assert by_id["acme-sw"]["tenant_id"] == "acme"
+    assert by_id["acme-sw"]["shared"] is False
+    assert by_id["shared-sw"]["tenant_id"] == "shared"
+    assert by_id["shared-sw"]["shared"] is True
+
+
+def test_list_devices_no_shared_tenant_excludes_shared_flag(monkeypatch):
+    _no_probe(monkeypatch)
+    # Without shared_tenant_id pushed, a tenant filter matches only own-tenant
+    # (the shared device is NOT visible under any tenant filter) — defense
+    # degrades safely; the hub filter is authoritative anyway.
+    spoke = _spoke_with(_fleet())
+    # shared_tenant_id stays "" (never pushed)
+    res = _run(spoke.handle_command("NW_LIST_DEVICES", {"tenant": "acme"}))
+    ids = {r["id"] for r in res["data"]}
+    assert ids == {"acme-sw"}
+
+
+def test_per_device_command_rejects_other_tenant(monkeypatch):
+    _no_probe(monkeypatch)
+    spoke = _spoke_with(_fleet())
+    spoke.engine.shared_tenant_id = "shared"
+    # acme-sw is acme-owned; resolving it as othercorp → the gate denies it
+    # (no existence leak across tenants).
+    assert spoke.engine._get_device("acme-sw", "othercorp") is None
+    # own-tenant resolves:
+    assert spoke.engine._get_device("acme-sw", "acme") is not None
+
+
+def test_per_device_command_shared_visible_to_any_tenant(monkeypatch):
+    _no_probe(monkeypatch)
+    spoke = _spoke_with(_fleet())
+    spoke.engine.shared_tenant_id = "shared"
+    # shared-sw resolves under any tenant filter (shared device visible to all).
+    assert spoke.engine._get_device("shared-sw", "acme") is not None
+    assert spoke.engine._get_device("shared-sw", "othercorp") is not None
+    # unassigned resolves only when no tenant filter is applied (admin path):
+    assert spoke.engine._get_device("unassigned-sw", "acme") is None
+    assert spoke.engine._get_device("unassigned-sw", None) is not None
+
+
+def test_update_config_carries_shared_tenant_id():
+    spoke = _spoke_with([])
+    _run(spoke.handle_command("UPDATE_CONFIG", {
+        "devices": [{"id": "d1", "object_type": "aos_switch", "address": "10.0.0.2",
+                     "tenant_id": "acme"}],
+        "shared_tenant_id": "shared",
+    }))
+    assert spoke.engine.shared_tenant_id == "shared"
+    assert spoke.engine.devices[0]["tenant_id"] == "acme"
+
+
+def test_init_reads_shared_tenant_id_from_config():
+    spoke = NwSpoke("nw-1", {"devices": [], "shared_tenant_id": "shared"})
+    assert spoke.engine.shared_tenant_id == "shared"
+
+
 # ── NW_RUN_CONFIG returns applied/errors lists ──────────────────────────────
 def test_run_config_not_implemented():
     spoke = _spoke_with([{"id": "d1", "object_type": "ex_switch", "address": "10.0.0.4"}])

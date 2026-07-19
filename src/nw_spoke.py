@@ -31,6 +31,9 @@ class NwSpoke(BaseSpoke):
         # pre-provisioned config.
         devices = (config or {}).get("devices", []) if isinstance(config, dict) else []
         self.engine = NwEngine(devices)
+        shared_tid = (config or {}).get("shared_tenant_id", "") if isinstance(config, dict) else ""
+        if shared_tid:
+            self.engine.shared_tenant_id = shared_tid
         super().__init__(spoke_id, config)
 
     # ── Logging helper: mask sensitive fields in any command data ───────────
@@ -92,13 +95,15 @@ class NwSpoke(BaseSpoke):
         # ── Lifecycle / config ──────────────────────────────────────────────
         if normalized_cmd == "UPDATE_CONFIG":
             devices = (data or {}).get("devices", []) if isinstance(data, dict) else []
+            shared_tid = (data or {}).get("shared_tenant_id", "") if isinstance(data, dict) else ""
             # Mask credentials in the per-device log summary.
             summary = [{k: ("********" if k in _SENSITIVE else v)
                         for k, v in d.items()} for d in devices] if isinstance(devices, list) else []
             logger.info(f"Updating nw fleet configuration: {len(devices if isinstance(devices, list) else [])} "
                         f"device(s) -> {summary}")
             self.config = data or {}
-            self.engine.set_devices(devices if isinstance(devices, list) else [])
+            self.engine.set_devices(devices if isinstance(devices, list) else [],
+                                    shared_tenant_id=shared_tid)
             return {"status": "SUCCESS",
                     "message": "nw configuration updated from Hub",
                     "device_count": len(self.engine.devices)}
@@ -108,19 +113,21 @@ class NwSpoke(BaseSpoke):
 
         # ── Fleet ───────────────────────────────────────────────────────────
         if normalized_cmd == "NW_LIST_DEVICES":
-            return await self.engine.list_devices()
+            tenant = (data or {}).get("tenant") if isinstance(data, dict) else None
+            return await self.engine.list_devices(tenant)
 
         # ── Per-device (data carries device_id) ─────────────────────────────
         device_id = (data or {}).get("device_id", "") if isinstance(data, dict) else ""
+        tenant = (data or {}).get("tenant") if isinstance(data, dict) else None
 
         if normalized_cmd == "NW_PROBE":
-            return await self.engine.probe(device_id)
+            return await self.engine.probe(device_id, tenant)
 
         if normalized_cmd == "NW_GET_DEVICE_INFO":
-            return await self.engine.get_device_info(device_id)
+            return await self.engine.get_device_info(device_id, tenant)
 
         if normalized_cmd == "NW_GET_MAC_TABLE":
-            res = await self.engine.get_mac_table(device_id)
+            res = await self.engine.get_mac_table(device_id, tenant)
             # Canonicalize MACs on the way out so the hub/UI/NetBox see one form.
             if isinstance(res.get("data"), list):
                 res["data"] = [{**r, "mac": _norm_mac(r.get("mac", ""))}
@@ -128,14 +135,14 @@ class NwSpoke(BaseSpoke):
             return res
 
         if normalized_cmd == "NW_GET_ARP":
-            res = await self.engine.get_arp(device_id)
+            res = await self.engine.get_arp(device_id, tenant)
             if isinstance(res.get("data"), list):
                 res["data"] = [{**r, "mac": _norm_mac(r.get("mac", ""))}
                                for r in res["data"] if isinstance(r, dict)]
             return res
 
         if normalized_cmd == "NW_GET_INTERFACES":
-            res = await self.engine.get_interfaces(device_id)
+            res = await self.engine.get_interfaces(device_id, tenant)
             if isinstance(res.get("data"), list):
                 res["data"] = [{**r, "mac": _norm_mac(r.get("mac", ""))}
                                for r in res["data"] if isinstance(r, dict)]
@@ -144,19 +151,19 @@ class NwSpoke(BaseSpoke):
         if normalized_cmd == "NW_GET_ENDPOINTS":
             # Fused ARP+MAC "unique IP/MAC" list. MACs already canonical (merge
             # normalizes), but re-apply for safety/parity with the other datums.
-            res = await self.engine.get_endpoints(device_id)
+            res = await self.engine.get_endpoints(device_id, tenant)
             if isinstance(res.get("data"), list):
                 res["data"] = [{**r, "mac": _norm_mac(r.get("mac", ""))}
                                for r in res["data"] if isinstance(r, dict)]
             return res
 
         if normalized_cmd == "NW_GET_VLANS":
-            return await self.engine.get_vlans(device_id)
+            return await self.engine.get_vlans(device_id, tenant)
 
         if normalized_cmd == "NW_POLL":
             # Full poll: probe + device_info + interfaces + arp + mac_table in
             # one call. Canonicalize every MAC-bearing sub-list on the way out.
-            res = await self.engine.poll(device_id)
+            res = await self.engine.poll(device_id, tenant)
             d = res.get("data") if isinstance(res.get("data"), dict) else None
             if d is not None:
                 for key in ("arp", "mac_table", "interfaces", "endpoints"):
@@ -168,7 +175,7 @@ class NwSpoke(BaseSpoke):
 
         if normalized_cmd == "NW_RUN_CONFIG":
             commands = (data or {}).get("commands", []) if isinstance(data, dict) else []
-            return await self.engine.run_config(device_id, commands)
+            return await self.engine.run_config(device_id, commands, tenant)
 
         if normalized_cmd == "INSTALL_CERT":
             # Hub-brokered cert distribution: install the delivered LE cert on
@@ -193,9 +200,9 @@ class NwSpoke(BaseSpoke):
             # on that ONE device (backward compat / targeted re-push).
             if not identifier or identifier.lower() in ("*", "all", "fleet", self.spoke_id.lower()):
                 return await self.engine.install_cert_fleet(
-                    fullchain, privkey, chain, domain)
+                    fullchain, privkey, chain, domain, tenant)
             return await self.engine.install_cert(
-                identifier, fullchain, privkey, chain, domain)
+                identifier, fullchain, privkey, chain, domain, tenant)
 
         # ── Unknown ─────────────────────────────────────────────────────────
         logger.warning(f"Unknown Nw command type: {command_type}")

@@ -615,9 +615,16 @@ class NwEngine:
 
     def __init__(self, devices: Optional[List[Dict[str, Any]]] = None):
         self.devices: List[Dict[str, Any]] = list(devices or [])
+        # The shared tenant id (set via UPDATE_CONFIG from the hub) — a device
+        # whose ``tenant_id`` equals this is visible to ALL tenants (matches the
+        # hub's shared-tenant-flag invariant). Empty when the hub hasn't pushed
+        # it yet (legacy) → a ``tenant`` filter then matches only own-tenant.
+        self.shared_tenant_id: str = ""
 
-    def set_devices(self, devices: List[Dict[str, Any]]) -> None:
+    def set_devices(self, devices: List[Dict[str, Any]],
+                    shared_tenant_id: str = "") -> None:
         self.devices = list(devices or [])
+        self.shared_tenant_id = shared_tenant_id or ""
         types = {}
         for d in self.devices:
             ot = (d.get("object_type") or "unknown")
@@ -625,14 +632,27 @@ class NwEngine:
         logger.info(f"NwEngine fleet updated: {len(self.devices)} device(s) "
                     f"by type={types}")
 
-    def _get_device(self, device_id: str) -> Optional[Dict[str, Any]]:
+    def _tenant_matches(self, device: Dict[str, Any],
+                        tenant: Optional[str]) -> bool:
+        """True if ``device`` is visible to ``tenant``: own-tenant or the
+        shared tenant. ``tenant`` None/empty → no filter (whole fleet, today's
+        behavior — backward-compatible with a hub that doesn't pass a tenant)."""
+        if not tenant:
+            return True
+        dt = (device or {}).get("tenant_id", "")
+        return dt == tenant or (bool(self.shared_tenant_id)
+                                and dt == self.shared_tenant_id)
+
+    def _get_device(self, device_id: str,
+                    tenant: Optional[str] = None) -> Optional[Dict[str, Any]]:
         for d in self.devices:
-            if d.get("id") == device_id:
+            if d.get("id") == device_id and self._tenant_matches(d, tenant):
                 return d
         return None
 
-    def _driver_for(self, device_id: str) -> Optional[NwDriver]:
-        d = self._get_device(device_id)
+    def _driver_for(self, device_id: str,
+                    tenant: Optional[str] = None) -> Optional[NwDriver]:
+        d = self._get_device(device_id, tenant)
         if not d:
             return None
         return build_driver(d)
@@ -665,10 +685,17 @@ class NwEngine:
             logger.debug("nw log_datum %s failed", method, exc_info=True)
 
     # ── Fleet ───────────────────────────────────────────────────────────────
-    async def list_devices(self) -> Dict[str, Any]:
+    async def list_devices(self, tenant: Optional[str] = None) -> Dict[str, Any]:
         """Fleet summary (no credentials) with live reachability via a
         concurrent lightweight probe per device (3s timeout each). Falls back
-        to ``unknown`` on probe error so the UI never shows a stale 'up'."""
+        to ``unknown`` on probe error so the UI never shows a stale 'up'.
+
+        ``tenant`` (optional) scopes the returned rows to that tenant's own
+        devices + the shared tenant (defense-in-depth: the hub already gates
+        by the device record's ``tenant_id``). Omit → whole fleet (today's
+        behavior). Each row carries ``tenant_id`` + ``shared`` so the hub can
+        re-filter its cached envelope on serve."""
+        fleet = [d for d in self.devices if self._tenant_matches(d, tenant)]
         rows = []
         async def _probe_row(d):
             drv = build_driver(d)
@@ -698,8 +725,11 @@ class NwEngine:
                 "transport": NwDriver._resolve_transport(d),
                 "reachable": rcell.get("reachable"),
                 "latency_ms": rcell.get("latency_ms"),
+                "tenant_id": d.get("tenant_id", ""),
+                "shared": bool(self.shared_tenant_id
+                               and d.get("tenant_id", "") == self.shared_tenant_id),
             }
-        rows = await asyncio.gather(*(_probe_row(d) for d in self.devices))
+        rows = await asyncio.gather(*(_probe_row(d) for d in fleet))
         up = sum(1 for r in rows if r.get("reachable") is True)
         down = sum(1 for r in rows if r.get("reachable") is False)
         logger.info("nw list_devices -> %d device(s): %d reachable, %d unreachable, "
@@ -707,8 +737,8 @@ class NwEngine:
         return {"status": "SUCCESS", "data": list(rows)}
 
     # ── Per-device passthroughs ─────────────────────────────────────────────
-    async def probe(self, device_id: str) -> Dict[str, Any]:
-        drv = self._driver_for(device_id)
+    async def probe(self, device_id: str, tenant: Optional[str] = None) -> Dict[str, Any]:
+        drv = self._driver_for(device_id, tenant)
         if not drv:
             logger.warning("nw probe: device %s not in fleet", device_id)
             return _err(f"Device {device_id} not found")
@@ -719,8 +749,8 @@ class NwEngine:
                                f"latency={pd.get('latency_ms')}ms")
         return res
 
-    async def get_device_info(self, device_id: str) -> Dict[str, Any]:
-        drv = self._driver_for(device_id)
+    async def get_device_info(self, device_id: str, tenant: Optional[str] = None) -> Dict[str, Any]:
+        drv = self._driver_for(device_id, tenant)
         if not drv:
             logger.warning("nw get_device_info: device %s not in fleet", device_id)
             return _err(f"Device {device_id} not found")
@@ -728,8 +758,8 @@ class NwEngine:
         self._log_datum("device_info", drv, res)
         return res
 
-    async def get_mac_table(self, device_id: str) -> Dict[str, Any]:
-        drv = self._driver_for(device_id)
+    async def get_mac_table(self, device_id: str, tenant: Optional[str] = None) -> Dict[str, Any]:
+        drv = self._driver_for(device_id, tenant)
         if not drv:
             logger.warning("nw get_mac_table: device %s not in fleet", device_id)
             return _err(f"Device {device_id} not found")
@@ -749,8 +779,8 @@ class NwEngine:
         self._log_datum("mac_table", drv, res)
         return res
 
-    async def get_arp(self, device_id: str) -> Dict[str, Any]:
-        drv = self._driver_for(device_id)
+    async def get_arp(self, device_id: str, tenant: Optional[str] = None) -> Dict[str, Any]:
+        drv = self._driver_for(device_id, tenant)
         if not drv:
             logger.warning("nw get_arp: device %s not in fleet", device_id)
             return _err(f"Device {device_id} not found")
@@ -758,8 +788,8 @@ class NwEngine:
         self._log_datum("arp", drv, res)
         return res
 
-    async def get_interfaces(self, device_id: str) -> Dict[str, Any]:
-        drv = self._driver_for(device_id)
+    async def get_interfaces(self, device_id: str, tenant: Optional[str] = None) -> Dict[str, Any]:
+        drv = self._driver_for(device_id, tenant)
         if not drv:
             logger.warning("nw get_interfaces: device %s not in fleet", device_id)
             return _err(f"Device {device_id} not found")
@@ -767,11 +797,11 @@ class NwEngine:
         self._log_datum("interfaces", drv, res)
         return res
 
-    async def get_endpoints(self, device_id: str) -> Dict[str, Any]:
+    async def get_endpoints(self, device_id: str, tenant: Optional[str] = None) -> Dict[str, Any]:
         """Unified endpoint list: gather ARP + MAC table (+ interfaces) and fuse
         on MAC → ``[{mac, ip, vlan, interface}]`` (the "IP Addresses" view). On a
         gateway this joins ``show user-table`` with ``show datapath bridge table``."""
-        drv = self._driver_for(device_id)
+        drv = self._driver_for(device_id, tenant)
         if not drv:
             logger.warning("nw get_endpoints: device %s not in fleet", device_id)
             return _err(f"Device {device_id} not found")
@@ -783,12 +813,12 @@ class NwEngine:
             ifs.get("data") if ifs.get("status") == "SUCCESS" else [])
         return self._ok_or_partial(eps, [arp, mac], "endpoint(s)")
 
-    async def get_vlans(self, device_id: str) -> Dict[str, Any]:
+    async def get_vlans(self, device_id: str, tenant: Optional[str] = None) -> Dict[str, Any]:
         """VLANs from the authoritative ``show vlan`` list, enriched with live
         endpoint/mac/ip counts → ``[{vlan, name, ports, endpoints, macs, ips,
         gateway_ip}]`` (the "VLANs" view). Falls back to an endpoint-derived
         rollup when the device/transport has no native ``show vlan``."""
-        drv = self._driver_for(device_id)
+        drv = self._driver_for(device_id, tenant)
         if not drv:
             logger.warning("nw get_vlans: device %s not in fleet", device_id)
             return _err(f"Device {device_id} not found")
@@ -851,15 +881,17 @@ class NwEngine:
         return {"status": "PARTIAL" if errs else "SUCCESS", "data": data,
                 "message": f"{len(data)} {noun}" + (f" ({errs[0]})" if errs else "")}
 
-    async def run_config(self, device_id: str, commands: List[str]) -> Dict[str, Any]:
-        drv = self._driver_for(device_id)
+    async def run_config(self, device_id: str, commands: List[str],
+                         tenant: Optional[str] = None) -> Dict[str, Any]:
+        drv = self._driver_for(device_id, tenant)
         if not drv:
             logger.warning("nw run_config: device %s not in fleet", device_id)
             return _err(f"Device {device_id} not found")
         return await drv.run_config(commands or [])
 
     async def install_cert(self, device_id: str, fullchain: str, privkey: str,
-                           chain: str, domain: str) -> Dict[str, Any]:
+                           chain: str, domain: str,
+                           tenant: Optional[str] = None) -> Dict[str, Any]:
         """Install a hub-delivered LE cert on a fleet device. Dispatches by
         ``object_type``:
 
@@ -876,7 +908,7 @@ class NwEngine:
 
         The hub addresses a device by ``identifier`` (its fleet ``id``); the
         spoke maps that to ``device_id`` here. Returns the standard envelope."""
-        drv = self._driver_for(device_id)
+        drv = self._driver_for(device_id, tenant)
         if not drv:
             logger.warning("nw install_cert: device %s not in fleet", device_id)
             return _err(f"Device {device_id} not found")
@@ -912,15 +944,22 @@ class NwEngine:
         return _err(f"cert install not supported for object_type '{ot}'")
 
     async def install_cert_fleet(self, fullchain: str, privkey: str, chain: str,
-                                 domain: str) -> Dict[str, Any]:
+                                 domain: str,
+                                 tenant: Optional[str] = None) -> Dict[str, Any]:
         """Install a hub-delivered LE cert on the WHOLE fleet (spoke-level cert
         target). Installs on every cert-capable device (``cx_switch`` via AOS-CX
         REST, ``gateway`` via ArubaOS PKCS#12/SCP); other types are reported
         SKIPPED, not failed. Returns an aggregate envelope PLUS a per-device
-        ``devices`` list so the hub/WebUI can show which devices got the cert."""
+        ``devices`` list so the hub/WebUI can show which devices got the cert.
+
+        ``tenant`` (optional) scopes the fan-out to that tenant's own + shared
+        devices on a multi-tenant spoke (defense-in-depth; the hub already
+        resolves per-device cert targets). Omit → whole fleet."""
         results: List[Dict[str, Any]] = []
         ok = fail = 0
         for d in self.devices:
+            if not self._tenant_matches(d, tenant):
+                continue
             did = d.get("id", "")
             ot = (d.get("object_type") or "").strip().lower()
             name = d.get("name") or d.get("hostname") or did
@@ -958,12 +997,12 @@ class NwEngine:
         return {"status": "SUCCESS", "message": message, "devices": results,
                 "installed": ok, "failed": fail, "total": total}
 
-    async def poll(self, device_id: str) -> Dict[str, Any]:
+    async def poll(self, device_id: str, tenant: Optional[str] = None) -> Dict[str, Any]:
         """Run a full poll (probe + device_info + interfaces + arp + mac_table)
         for one device. Each sub-call is independent — a failure on one datum
         doesn't sink the rest; failed datums come back as empty lists + an
         entry in ``errors``. Used by the hub's POLL NOW path."""
-        drv = self._driver_for(device_id)
+        drv = self._driver_for(device_id, tenant)
         if not drv:
             logger.warning("nw poll: device %s not in fleet", device_id)
             return _err(f"Device {device_id} not found")

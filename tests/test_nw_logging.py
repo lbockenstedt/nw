@@ -80,7 +80,7 @@ class _FakeDriver:
 
 def _engine_with_fake(driver):
     eng = NwEngine([{"id": "d1", "object_type": "gateway", "address": "10.0.0.1"}])
-    eng._driver_for = lambda device_id: driver  # type: ignore
+    eng._driver_for = lambda device_id, tenant=None: driver  # type: ignore
     return eng
 
 
@@ -172,7 +172,7 @@ def test_spoke_logs_poll_suberrors(caplog):
                        "interfaces": [], "arp": [], "mac_table": []},
               "message": "reachable=True, 0 interface(s), 0 arp, 0 mac"}
 
-    async def _canned_poll(device_id):
+    async def _canned_poll(device_id, tenant=None):
         return canned
     spoke.engine.poll = _canned_poll  # type: ignore
     with caplog.at_level(logging.DEBUG, logger="NwSpoke"):
