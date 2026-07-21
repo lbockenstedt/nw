@@ -12,4 +12,4 @@ __pycache__/
 *.pfx
 keys.json
 hub_secret.json
-secrets.json
+secrets.json.claude/
