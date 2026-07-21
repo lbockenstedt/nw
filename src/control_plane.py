@@ -168,6 +168,24 @@ class NwControlPlane(BaseControlPlane):
         data = res.get("data") if isinstance(res, dict) else None
         if not isinstance(data, dict):
             return
+        # A PARTIAL poll returns EMPTY lists for datums whose SSH sub-call
+        # failed (engine.poll → errors[]). The hub folds a poll into its warm
+        # per-device cache PER-KEY on presence (nw_cache_set_poll), so pushing
+        # those []s would blank arp/mac/endpoints in the UI while it still
+        # badges LIVE. Drop the failed datums from the push — the hub keeps its
+        # last-good value for each, and only the datums that succeeded this
+        # cycle update. errors[] entries are "<label>: <msg>".
+        failed = set()
+        for msg in (res.get("errors") or []):
+            if isinstance(msg, str) and ":" in msg:
+                failed.add(msg.split(":", 1)[0].strip())
+        for label in ("device_info", "interfaces", "arp", "mac_table", "vlans"):
+            if label in failed:
+                data.pop(label, None)
+        # ``endpoints`` is a fusion of arp + mac_table + interfaces, so any of
+        # those failing taints it too — don't let a partial fusion overwrite.
+        if failed & {"arp", "mac_table", "interfaces"}:
+            data.pop("endpoints", None)
         for key in ("arp", "mac_table", "interfaces", "endpoints"):
             lst = data.get(key)
             if isinstance(lst, list):
@@ -175,8 +193,8 @@ class NwControlPlane(BaseControlPlane):
                              for r in lst if isinstance(r, dict)]
         await self.send_to_hub("NW_POLL_RESULT",
                                {"device_id": device_id, "data": data})
-        logger.info("nw auto-poll %s -> pushed (status=%s)",
-                    device_id, res.get("status"))
+        logger.info("nw auto-poll %s -> pushed (status=%s, dropped=%s)",
+                    device_id, res.get("status"), sorted(failed) or None)
 
 
 if __name__ == "__main__":

@@ -997,7 +997,25 @@ class NwEngine:
         return {"status": "SUCCESS", "message": message, "devices": results,
                 "installed": ok, "failed": fail, "total": total}
 
+    # Generous overall deadline for one full poll. Every leaf call is already
+    # timeout-bounded, but the aggregate isn't; a transport that wedges between
+    # sub-calls (or a reconnect that never returns) could otherwise pin the
+    # auto-poll worker indefinitely. 180s comfortably covers ~6 sequential
+    # sub-calls over one session at their per-call timeouts.
+    _POLL_DEADLINE_S = 180
+
     async def poll(self, device_id: str, tenant: Optional[str] = None) -> Dict[str, Any]:
+        """Full poll for one device, bounded by an overall deadline so no single
+        wedged transport can pin the caller. Delegates to :meth:`_poll_once`."""
+        try:
+            return await asyncio.wait_for(self._poll_once(device_id, tenant),
+                                          timeout=self._POLL_DEADLINE_S)
+        except asyncio.TimeoutError:
+            logger.warning("nw poll %s exceeded %ss deadline",
+                           device_id, self._POLL_DEADLINE_S)
+            return _err(f"poll timed out after {self._POLL_DEADLINE_S}s")
+
+    async def _poll_once(self, device_id: str, tenant: Optional[str] = None) -> Dict[str, Any]:
         """Run a full poll (probe + device_info + interfaces + arp + mac_table)
         for one device. Each sub-call is independent — a failure on one datum
         doesn't sink the rest; failed datums come back as empty lists + an
