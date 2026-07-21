@@ -196,9 +196,23 @@ class NwSpoke(BaseSpoke):
                         "message": "INSTALL_CERT requires fullchain + privkey"}
             # Spoke-level cert target: an empty/"*"/"all" identifier means "the nw
             # spoke" — fan the cert out to every cert-capable switch in the fleet
-            # and return a per-device report. A specific identifier still installs
-            # on that ONE device (backward compat / targeted re-push).
+            # and return a per-device report. A specific identifier that resolves
+            # to a fleet device still installs on that ONE device (targeted
+            # re-push). The hub's wildcard fan-out sends ``identifier = <this
+            # spoke's hub-registered id>``; on a generic-agent-hosted nw role that
+            # registered id is the BASE agent UUID while the role subspoke's
+            # ``self.spoke_id`` is ``{base}-nw``, so the ``self.spoke_id`` check
+            # alone mis-routes a wildcard cert to a per-device "not found." Fan
+            # out whenever the identifier isn't a real fleet device too — a
+            # targeted install always names an existing device, so this only
+            # catches the wildcard fan-out (a typo'd device id would also fan out,
+            # which is recoverable and beats a broken wildcard deploy).
             if not identifier or identifier.lower() in ("*", "all", "fleet", self.spoke_id.lower()):
+                return await self.engine.install_cert_fleet(
+                    fullchain, privkey, chain, domain, tenant)
+            if self.engine._get_device(identifier, tenant) is None:
+                logger.info("nw INSTALL_CERT: identifier %r not in fleet — "
+                            "treating as wildcard fan-out", identifier)
                 return await self.engine.install_cert_fleet(
                     fullchain, privkey, chain, domain, tenant)
             return await self.engine.install_cert(

@@ -297,3 +297,35 @@ def test_spoke_install_cert_missing_material_is_error():
         "identifier": "edge-sw-1", "fullchain": "", "privkey": ""}))
     assert res["status"] == "ERROR"
     assert "fullchain" in res["message"]
+
+
+def test_spoke_install_cert_unknown_identifier_fans_out_to_fleet():
+    # The hub's wildcard fan-out sends ``identifier = <this spoke's hub-registered
+    # id>``. On a generic-agent-hosted nw role that registered id is the BASE
+    # agent UUID while the role subspoke's self.spoke_id is "{base}-nw", so the
+    # self.spoke_id check alone mis-routes a wildcard cert to a per-device
+    # "Device not found." An identifier that isn't a real fleet device must fan
+    # out to the fleet instead — a targeted install always names an existing
+    # device, so this only catches the wildcard fan-out.
+    spoke = _spoke_with([_CX])
+    spoke.spoke_id = "037f0787-nw"           # role subspoke id
+    fanout_id = "037f0787-8049-5981-b777-0c48bb7afb4e"  # base agent UUID from hub
+    captured = {}
+
+    async def _fleet(fullchain, privkey, chain, domain, tenant=None):
+        captured["fanout"] = True
+        return {"status": "SUCCESS", "message": "fleet install",
+                "devices": [{"id": "edge-sw-1", "status": "SUCCESS"}]}
+
+    async def _engine_install(device_id, *a, **k):
+        captured["per_device"] = device_id
+        return {"status": "ERROR", "message": f"Device {device_id} not found"}
+
+    spoke.engine.install_cert_fleet = _fleet
+    spoke.engine.install_cert = _engine_install
+    res = _run(spoke.handle_command("INSTALL_CERT", {
+        "identifier": fanout_id, "fullchain": _PEM, "privkey": _KEY,
+        "chain": "", "domain": "*.lab.example.com", "module_type": "nw"}))
+    assert res["status"] == "SUCCESS"
+    assert captured.get("fanout") is True
+    assert "per_device" not in captured  # did NOT mis-route to install_cert
