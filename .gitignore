@@ -13,3 +13,29 @@ __pycache__/
 keys.json
 hub_secret.json
 secrets.json.claude/
+
+# Sibling module checkouts. Each is its OWN repository (see the remotes) and
+# lives inside this working tree for convenience. They were previously recorded
+# as gitlinks with NO .gitmodules, so every CI checkout hit
+#   fatal: No url found for submodule path '<path>' in .gitmodules
+# and the submodules never populated anyway. Ignored so they stay local-only.
+/.github/workflows/deploy.yml/
+/.scratch-shpe/client-sim/
+/.scratch-shpe/cs-webui/
+/.scratch-shpe/svr-mgmt/
+/.scratch-shpe/webui-hub/
+/bugfixer/
+/cppm/
+/cs/
+/dhcp/
+/dns/
+/kvm/
+/ldap/
+/le/
+/lm/
+/netbox/
+/nw/
+/opnsense/
+/pxmx/
+/qa/
+/tsa/

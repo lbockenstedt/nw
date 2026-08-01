@@ -9,7 +9,14 @@ on:
 jobs:
   triage:
     runs-on: ubuntu-latest
-    if: github.event.issue.labels.contains('ai-fix') || contains(github.event.comment.body, '/fix-this')
+    # `contains()` is a GitHub Actions FUNCTION, not a method on an array.
+    # `github.event.issue.labels.contains(...)` is invalid expression syntax, so
+    # the workflow failed to PARSE — which GitHub reports as a failed run on
+    # every push (attributed to the file path, not the workflow name), even
+    # though this workflow only triggers on issues/issue_comment.
+    if: >-
+      contains(github.event.issue.labels.*.name, 'ai-fix') ||
+      contains(github.event.comment.body, '/fix-this')
     steps:
       - uses: actions/checkout@v4
       - name: GitHub CLI Setup
