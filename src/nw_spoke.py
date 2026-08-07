@@ -29,7 +29,7 @@ class NwSpoke(BaseSpoke):
         # background worker sees it. The hub pushes devices via UPDATE_CONFIG
         # after approval; at cold start config may carry devices from a
         # pre-provisioned config.
-        devices = (config or {}).get("devices", []) if isinstance(config, dict) else []
+        devices = config.get("devices", []) if isinstance(config, dict) else []
         self.engine = NwEngine(devices)
         shared_tid = (config or {}).get("shared_tenant_id", "") if isinstance(config, dict) else ""
         if shared_tid:
