@@ -57,7 +57,7 @@ class _FakeDriver:
     can be asserted on."""
 
     def __init__(self, probe=None, info=None, interfaces=None, arp=None,
-                 mac=None):
+                 mac=None, vlans=None):
         self.object_type = "gateway"
         self.transport = "rest"
         self.address = "10.0.0.1"
@@ -70,12 +70,20 @@ class _FakeDriver:
             [{"ip": "10.0.0.5", "mac": "aabbccddeeff", "interface": "1"}])
         self._mac = mac if mac is not None else _ok(
             [{"mac": "aabbccddeeff", "vlan": "10", "interface": "1"}])
+        # object_type defaults to "gateway" above, and NwEngine.poll() calls
+        # get_vlans() for every gateway device (native `show vlan` fused with
+        # the endpoint-derived rollup) — added after this fixture was
+        # written. Default to an empty envelope (falsy data), which keeps
+        # poll() on its pre-existing summarize_vlans() fallback path and
+        # doesn't change any other test's assertions.
+        self._vlans = vlans if vlans is not None else _ok([])
 
     async def probe(self): return self._probe
     async def get_device_info(self): return self._info
     async def get_interfaces(self): return self._interfaces
     async def get_arp(self): return self._arp
     async def get_mac_table(self): return self._mac
+    async def get_vlans(self): return self._vlans
 
 
 def _engine_with_fake(driver):
@@ -118,7 +126,10 @@ def test_engine_poll_logs_summary_and_sub_errors(caplog):
     eng = _engine_with_fake(drv)
     with caplog.at_level(logging.INFO, logger="NwEngine"):
         res = _run(eng.poll("d1"))
-    assert res["status"] == "SUCCESS"  # probe still ok → reachable
+    # Reachable, but interfaces + mac_table sub-datums both errored — PARTIAL,
+    # not SUCCESS (a reachable device whose probes partly failed must not
+    # report a clean SUCCESS; see NwEngine.poll's status line).
+    assert res["status"] == "PARTIAL"
     recs = _records(caplog, "NwEngine")
     # one ERROR per failing sub-datum
     err_msgs = [r.getMessage() for r in recs if r.levelno == logging.ERROR]
@@ -126,7 +137,7 @@ def test_engine_poll_logs_summary_and_sub_errors(caplog):
     assert any("mac_table" in m for m in err_msgs), err_msgs
     # a final INFO summary line
     summary = [r.getMessage() for r in recs if r.levelno == logging.INFO
-               and "nw poll" in r.getMessage() and "status=SUCCESS" in r.getMessage()]
+               and "nw poll" in r.getMessage() and "status=PARTIAL" in r.getMessage()]
     assert summary, [r.getMessage() for r in recs]
 
 

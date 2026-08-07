@@ -254,10 +254,11 @@ def parse_arp_aos_s(text: str) -> List[dict]:
         if not ip or not mac or _is_null_mac(mac.group(0)):
             continue
         # tail = [Type, Port?]. Port present only when the last token is port-like
-        # (digit or a/b/c or slash form) — never the Type word ("dynamic").
+        # (digit, module/slash form like A1 or 1/2, or a named trunk like Trk2)
+        # — never the Type word ("dynamic").
         tail = line[mac.end():].split()
         port = ""
-        if len(tail) >= 2 and re.match(r"^[A-Za-z]?\d+(?:/\d+)*$", tail[-1]):
+        if len(tail) >= 2 and re.match(r"^[A-Za-z]*\d+(?:/\d+)*$", tail[-1]):
             port = tail[-1]
         rows.append({"ip": ip.group(0), "mac": mac.group(0).lower(),
                      "interface": str(port)})
@@ -266,19 +267,15 @@ def parse_arp_aos_s(text: str) -> List[dict]:
 
 def parse_mac_aos_s(text: str) -> List[dict]:
     """Aruba AOS-S ``show mac-address`` → ``[{mac, vlan, interface}]``. Columns:
-    ``MAC(aabbcc-ddeeff) | Port | VLAN`` — note Port precedes VLAN."""
+    ``MAC(aabbcc-ddeeff) | VLAN | Port`` — VLAN precedes Port."""
     rows = []
     for line in (text or "").splitlines():
         mac = _MAC_TOKEN.search(line)
         if not mac or _is_null_mac(mac.group(0)):
             continue
         rest = line[mac.end():].split()
-        port = rest[0] if rest else ""
-        vlan = rest[1] if len(rest) > 1 else ""
-        # Guard against a reversed layout: if the first token is a VLAN-sized
-        # number and the second is a small port, they're already right; but if
-        # 'port' looks like a VLAN (>4 digits impossible; 1-4094) we still trust
-        # column order (Port|VLAN) per the real AOS-S output.
+        vlan = rest[0] if rest else ""
+        port = rest[1] if len(rest) > 1 else ""
         rows.append({"mac": mac.group(0).lower(), "vlan": str(vlan),
                      "interface": str(port)})
     return rows

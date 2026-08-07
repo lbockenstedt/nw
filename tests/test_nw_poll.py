@@ -95,8 +95,11 @@ def test_poll_partial_failure_tolerated():
                       mac=_err("snmp mac table: no response"))
     eng = _engine_with_fake(drv)
     res = _run(eng.poll("d1"))
-    # probe still succeeded → reachable True → SUCCESS overall
-    assert res["status"] == "SUCCESS"
+    # Tolerated = doesn't raise, still returns the data/errors that DID come
+    # back — but "tolerated" no longer means the overall status reads as a
+    # clean SUCCESS. A reachable device whose sub-datum probes partly failed
+    # reports PARTIAL (the errors[] carry the detail); see NwEngine.poll.
+    assert res["status"] == "PARTIAL"
     assert res["data"]["reachable"] is True
     assert res["data"]["interfaces"] == []
     assert res["data"]["mac_table"] == []
