@@ -61,7 +61,12 @@ class NwSpoke(BaseSpoke):
         v10; other families return a clear ERROR naming the gap).
         """
         # Normalize command type to uppercase for case-insensitive matching.
-        normalized_cmd = (command_type or "").upper()
+        
+          normalized_cmd = (command_type or "").strip().upper()
+          if normalized_cmd not in self.engine.supported_commands:
+              logger.error(f"Unknown command type: {normalized_cmd}")
+              return {"status": "ERROR", "data": [], "message": f"Unknown command: {normalized_cmd}"}
+      
         log_data = self._mask(data)
         logger.info(f"Handling Nw Command: {command_type} with data {log_data}")
         res = await self._dispatch_command(normalized_cmd, command_type, data)
