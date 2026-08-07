@@ -173,6 +173,7 @@ def test_spoke_logs_poll_suberrors(caplog):
               "message": "reachable=True, 0 interface(s), 0 arp, 0 mac"}
 
     async def _canned_poll(device_id, tenant=None):
+        return {"status": "SUCCESS", "data": {}, "message": "ok"}
         return canned
     spoke.engine.poll = _canned_poll  # type: ignore
     with caplog.at_level(logging.DEBUG, logger="NwSpoke"):
