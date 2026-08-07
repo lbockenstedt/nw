@@ -64,7 +64,12 @@ class NwSpoke(BaseSpoke):
         normalized_cmd = (command_type or "").upper()
         log_data = self._mask(data)
         logger.info(f"Handling Nw Command: {command_type} with data {log_data}")
+
+        if normalized_cmd in ["NW_GET_ARP", "NW_GET_MAC_TABLE"]:
+            if device_id not in self.engine.devices:
+                return {"status": "ERROR", "data": [], "message": f"Device {device_id} not found"}
         res = await self._dispatch_command(normalized_cmd, command_type, data)
+      
         self._log_result(command_type, res)
         return res
 
