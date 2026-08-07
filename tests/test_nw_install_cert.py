@@ -237,7 +237,7 @@ def test_engine_install_cert_gateway_is_error():
     eng = NwEngine([_GW])
     res = _run(eng.install_cert("gw-1", _PEM, _KEY, "", "a.example.com"))
     assert res["status"] == "ERROR"
-    assert "not yet implemented" in res["message"]
+    assert "not implemented" in res["message"]
 
 
 def test_engine_install_cert_unknown_device_is_error():
@@ -283,12 +283,17 @@ def test_spoke_install_cert_accepts_device_id_fallback():
     assert res["status"] == "SUCCESS"
 
 
-def test_spoke_install_cert_missing_identifier_is_error():
+def test_spoke_install_cert_missing_identifier_wildcards_fleet():
+    # Predates the wildcard fan-out fix (nw "wildcard cert fan-out mis-routed
+    # to per-device 'not found'"): a missing identifier is no longer an error
+    # — it means "the whole spoke", so INSTALL_CERT fans out to every
+    # cert-capable device instead. See NwSpoke.handle_command's INSTALL_CERT
+    # branch and NwEngine.install_cert_fleet.
     spoke = _spoke_with([_CX])
     res = _run(spoke.handle_command("INSTALL_CERT", {
         "fullchain": _PEM, "privkey": _KEY, "domain": "a.example.com"}))
-    assert res["status"] == "ERROR"
-    assert "identifier" in res["message"]
+    assert res["status"] == "SUCCESS"
+    assert any(d.get("device_id") == "edge-sw-1" for d in res.get("devices", []))
 
 
 def test_spoke_install_cert_missing_material_is_error():
