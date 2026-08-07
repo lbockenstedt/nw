@@ -30,7 +30,7 @@ class NwSpoke(BaseSpoke):
         # after approval; at cold start config may carry devices from a
         # pre-provisioned config.
         devices = (config or {}).get("devices", []) if isinstance(config, dict) else []
-        self.engine = NwEngine(devices)
+        self.engine = NwEngine(devices if devices else [])
         shared_tid = (config or {}).get("shared_tenant_id", "") if isinstance(config, dict) else ""
         if shared_tid:
             self.engine.shared_tenant_id = shared_tid
