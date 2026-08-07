@@ -37,8 +37,8 @@ class NwSpoke(BaseSpoke):
         super().__init__(spoke_id, config)
 
     # ── Logging helper: mask sensitive fields in any command data ───────────
-    @staticmethod
-    def _mask(data: Any) -> Any:
+@staticmethod
+def _mask(data: Any) -> Dict[str, Any]:
         if not isinstance(data, dict):
             return data
         return {k: ("********" if k in _SENSITIVE else v) for k, v in data.items()}
