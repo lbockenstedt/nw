@@ -16,7 +16,7 @@ This file contains general rules and preferences for how Claude should behave du
 - You cannot leave the directory /Users/lbockenstedt/vscode. You can look at subfolders and files but you cannot go anywhere else.
 
 ## Logging & Observability — MANDATORY for every module and agent
-The operator cannot always reach a box's CLI, and the **BugFixer** module reads
+The operator cannot always reach a box's CLI, and the **AppBuilder** module reads
 relayed logs/errors to auto-fix issues and open GitHub issues. Therefore every
 module and agent we build or touch MUST get its diagnostic logs to the hub. This
 is a hard requirement, not a nice-to-have. Canonical spec: `lm/docs/logging-observability-contract.md`.
@@ -25,7 +25,7 @@ Every module/agent MUST:
 1. **Relay its own logs to the hub once connected.** Attach the hub log relay
    (spoke: SPOKE_LOG / control-plane relay; agent: `WebSocketLogHandler` →
    `AGENT_LOG`) so records appear in the hub's **Setup → Agent/Spoke Logs** and
-   reach the BugFixer. Relay INFO and above (WARNING/ERROR always included).
+   reach the AppBuilder. Relay INFO and above (WARNING/ERROR always included).
 2. **Install the relay ONCE for the process lifetime**, not per-connection.
    Never add-on-connect / remove-on-disconnect (that drops startup + gap logs).
 3. **Buffer while disconnected, flush on (re)connect.** Use a bounded ring
@@ -52,10 +52,10 @@ steady state, it's DEBUG, not INFO.
 
 The hub keeps **two** logs, both fed by the relay: the aggregated **Error Log**
 (all `error|exception|traceback|critical` lines across every module → WebUI Error
-Log tab + BugFixer) and the **per-module log**. A remote module's local
+Log tab + AppBuilder) and the **per-module log**. A remote module's local
 `/var/log/lm` file is NOT visible to the hub, so the relay is its only path into
 either log. Relay error lines through the standard `... - LEVELNAME - ...`
-formatter so the level word survives and the Error-Log/BugFixer filter catches them.
+formatter so the level word survives and the Error-Log/AppBuilder filter catches them.
 
 When building a NEW module/agent, wire all six from the start. When touching an
 existing one, verify it and fix any gap as part of the change. Reference

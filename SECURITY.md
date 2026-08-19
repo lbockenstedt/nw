@@ -1,9 +1,9 @@
 # SECURITY — Cross-Repo Audit Log
 
 **Date:** 2026-06-24
-**Scope:** all 12 git repos under `/Users/lbockenstedt/vscode/` — `bugfixer`, `cppm`, `cs`, `dhcp`, `dns`, `kvm`, `ldap`, `lm`, `netbox`, `opnsense`, `pxmx`, `qa` (~58k lines of Python across 131 files).
-**Method:** deterministic sweep (`py_compile` every file + `grep` for `shell=True` / `eval` / `exec` / hardcoded secrets / bare `except`) followed by 5 parallel read-only review agents grouped by repo size (cs, lm, bugfixer, medium-group, small-group). All findings line-verified by the agents.
-**Status:** scan only — **no code was modified** for this audit (the `bugfixer` Resolved-button fix shipped separately as commit `fa2b657`). This file is a record for later triage.
+**Scope:** all 12 git repos under `/Users/lbockenstedt/vscode/` — `ab`, `cppm`, `cs`, `dhcp`, `dns`, `kvm`, `ldap`, `lm`, `netbox`, `opnsense`, `pxmx`, `qa` (~58k lines of Python across 131 files).
+**Method:** deterministic sweep (`py_compile` every file + `grep` for `shell=True` / `eval` / `exec` / hardcoded secrets / bare `except`) followed by 5 parallel read-only review agents grouped by repo size (cs, lm, ab, medium-group, small-group). All findings line-verified by the agents.
+**Status:** scan only — **no code was modified** for this audit (the `ab` Resolved-button fix shipped separately as commit `fa2b657`). This file is a record for later triage.
 
 ---
 
@@ -11,7 +11,7 @@
 
 - **Syntax errors: 0** (131 Python files compiled clean)
 - `shell=True`: 0 · `eval`/`exec`: 0 · hardcoded secrets in source: 0
-- Bare `except:`: 12 (all in bugfixer; assessed individually — most are acceptable best-effort cleanup)
+- Bare `except:`: 12 (all in ab; assessed individually — most are acceptable best-effort cleanup)
 - **Critical: 11 · High: ~30** across the fleet
 
 ---
@@ -20,9 +20,9 @@
 
 | # | Repo | Location | Issue |
 |---|------|----------|-------|
-| C1 | **bugfixer** | `main.py:7568` + all routes | **No authentication on any endpoint** while the app runs **as root** on `0.0.0.0:8000`. Anyone reachable can `/restart`, overwrite the GitHub PAT + all LLM keys, close/resolve issues, run sandbox shell commands, clear history. *Enables C2–C5 below.* Fix: mandatory bearer token from a `0600` root-owned secret; refuse to start if unset; bind `127.0.0.1` by default. |
-| C2 | **bugfixer** | `main.py:5760` + `templates/index.html:476,555` | `/settings` renders the **GitHub token and all LLM API keys into the HTML** response. Unauthenticated full secret theft (combined with C1). Fix: send only masked placeholders / "configured" flags (mirror `/api/llm/config` at 6056). |
-| C3 | **bugfixer** | `main.py:5939` + `run_sandboxed_command:1518` | `repo_tests` accepts an **arbitrary shell string** run as root in a Docker container with the cloned repo mounted RW + default capabilities + outbound network → RCE that can read `.env`/secrets. Fix: restrict to a fixed enum (`pytest`/`npm test`/`go test`/`make test`) or validated argv; harden container (`--read-only`, `--cap-drop=ALL`, `--security-opt=no-new-privileges`, `--network=none`, non-root user); auth on `/save_settings`. |
+| C1 | **ab** | `main.py:7568` + all routes | **No authentication on any endpoint** while the app runs **as root** on `0.0.0.0:8000`. Anyone reachable can `/restart`, overwrite the GitHub PAT + all LLM keys, close/resolve issues, run sandbox shell commands, clear history. *Enables C2–C5 below.* Fix: mandatory bearer token from a `0600` root-owned secret; refuse to start if unset; bind `127.0.0.1` by default. |
+| C2 | **ab** | `main.py:5760` + `templates/index.html:476,555` | `/settings` renders the **GitHub token and all LLM API keys into the HTML** response. Unauthenticated full secret theft (combined with C1). Fix: send only masked placeholders / "configured" flags (mirror `/api/llm/config` at 6056). |
+| C3 | **ab** | `main.py:5939` + `run_sandboxed_command:1518` | `repo_tests` accepts an **arbitrary shell string** run as root in a Docker container with the cloned repo mounted RW + default capabilities + outbound network → RCE that can read `.env`/secrets. Fix: restrict to a fixed enum (`pytest`/`npm test`/`go test`/`make test`) or validated argv; harden container (`--read-only`, `--cap-drop=ALL`, `--security-opt=no-new-privileges`, `--network=none`, non-root user); auth on `/save_settings`. |
 | C4 | **lm** | `core/.../control_plane.py:724` (+ `dhcp`, `dns`, `opnsense:407-411`) | **`sed` script-injection RCE** in `SPOKE_SET_HOSTNAME`: hub-supplied `new_hostname` is interpolated into a sed script; a `/`-bearing payload closes the replacement early and GNU sed's `e` command executes its argument as a shell command — RCE as root (via sudo). Fix: validate `new_hostname` against `^[A-Za-z0-9._-]{1,63}$` (RFC 1123) before any subprocess call; prefer a templated `/etc/hosts` write. |
 | C5 | **lm** | `core/.../control_plane.py:800-806` (+ `opnsense:446`) | **Signature verification silently disables itself** when no spoke secret is set (`--hub-secret` defaults to empty in dhcp/dns mains). With it off, every hub command — incl. C4's hostname RCE and `SPOKE_UPDATE` git re-point — is accepted unsigned. Fix: empty spoke/hub secret = hard startup error; require signatures for all non-handshake commands. |
 | C6 | **lm** | `main.py:2094` | Hub WebSocket server has **no TLS** (`websockets.serve(..., ssl=None)`); root/session HMAC secrets traverse the network in cleartext. A MITM recovers spoke/hub secrets and impersonates the hub. Fix: terminate TLS at `websockets.serve(..., ssl=ssl_context)` or a reverse proxy; refuse to send secrets over unencrypted transport. |
@@ -47,9 +47,9 @@
 - **cs** `lm-spoke/src/control_plane.py:55-78`: standalone control plane binds `0.0.0.0:8000` with no auth on `/config` (overwrites engine), `/simulate/trigger`, `/status`. Fix: shared-secret token or bind `127.0.0.1`.
 - **cppm** `src/control_plane.py:67` / **opnsense** `src/control_plane.py:42-43` / **qa** `control_plane.py:33` + `main.py:46-47`: hardcoded weak default secrets (`lm-secret`, empty hub-secret, `admin:password`). Fix: required, fail fast if absent.
 - **cs** `routers/auth.py:55`, `routers/qa.py:22`, `webui-spoke/server.py:8750`: **no rate limiting** on login / QA-token-exchange (QA token grants 2h tenant-admin on one guess). Fix: per-IP/per-identifier throttle with backoff.
-- **bugfixer** `main.py:3437`: GitHub PAT embedded in clone URL (`url.replace("https://", f"https://{token}@")`) leaks into `bugfixer.log` (via `logger.exception` on `GitCommandError`) and HTTP error bodies (via `catch_exceptions_mid:1550` returning `str(e)`), reachable via unauthenticated `/logs:5644`. Fix: use a credential helper / `GIT_ASKPASS` / `github.Auth.Token`; add a log sanitizer; stop echoing `str(e)`.
-- **bugfixer** `main.py:5244-5312`: `/api/diagnostics` leaks PID, commit SHAs, `started_at`, `main_mtime`, `last_known_good_commit`, `failed_commits`, `restart_log` to any caller. Fix: auth-gate or strip sensitive fields.
-- **bugfixer** `main.py:5853-5865` + `_request_*` (1002/1064/1122/1166): **SSRF** via user-controllable LLM `base_url` (accepted verbatim, redirects followed, `_normalize_lmstudio_url` accepts RFC1918) → root process issues authenticated POSTs to internal targets (`169.254.169.254` etc.); response bodies reachable via `/api/task-details:5037` / `/api/chat/stream:7444`. Fix: allowlist provider hosts; reject private/loopback/link-local unless explicit local-LLM flag; `allow_redirects=False`.
+- **ab** `main.py:3437`: GitHub PAT embedded in clone URL (`url.replace("https://", f"https://{token}@")`) leaks into `ab.log` (via `logger.exception` on `GitCommandError`) and HTTP error bodies (via `catch_exceptions_mid:1550` returning `str(e)`), reachable via unauthenticated `/logs:5644`. Fix: use a credential helper / `GIT_ASKPASS` / `github.Auth.Token`; add a log sanitizer; stop echoing `str(e)`.
+- **ab** `main.py:5244-5312`: `/api/diagnostics` leaks PID, commit SHAs, `started_at`, `main_mtime`, `last_known_good_commit`, `failed_commits`, `restart_log` to any caller. Fix: auth-gate or strip sensitive fields.
+- **ab** `main.py:5853-5865` + `_request_*` (1002/1064/1122/1166): **SSRF** via user-controllable LLM `base_url` (accepted verbatim, redirects followed, `_normalize_lmstudio_url` accepts RFC1918) → root process issues authenticated POSTs to internal targets (`169.254.169.254` etc.); response bodies reachable via `/api/task-details:5037` / `/api/chat/stream:7444`. Fix: allowlist provider hosts; reject private/loopback/link-local unless explicit local-LLM flag; `allow_redirects=False`.
 - **ldap** `src/ldap_spoke.py:46-103` + `ldap_manager.py:16-19`: **blocking sync LDAP I/O inside async** (`simple_bind_s`/`search_s`/`add_s`), re-binds on every call, **no timeout** (`OPT_NETWORK_TIMEOUT` unset), never `unbind_s`. Fix: `asyncio.to_thread`, set timeouts, pool/unbind.
 - **ldap** `src/ldap_manager.py:2,225`: `ldap.filter` imported but manual filter escaping used (misses null/`/`) → filter-injection / DoS. Fix: `ldap.filter.escape_filter_chars(q)`.
 - **ldap** `base_structure.ldif:16`: seed LDIF ships `userPassword: password123`. Fix: hashed/`CHANGEME` placeholder.
@@ -70,10 +70,10 @@
 
 ### Performance — blocking the event loop (recurring pattern)
 - **cs** `routers/spokes.py:440,1296,394,851,929,952,1238,1347`: sync `store.*` (file I/O under `threading.RLock`+`fcntl.flock`) called directly inside `async def` endpoints on the spoke-ack hot path — each ack does 4 blocking store writes, stalling the single event loop (exactly what cs's own `loop_lag_monitor` warns about). Fix: wrap every `store.*` in `asyncio.to_thread` (pattern exists at 354,379,385,389).
-- **bugfixer** `main.py:6490,6567`: `/delete_issue` and `/resolve_issue` are `async def` doing synchronous PyGithub + disk I/O, blocking every other request for seconds. *(Directly relevant to the just-shipped Resolved work.)* Fix: `await asyncio.to_thread(...)` (pattern used at 5614).
-- **bugfixer** `/update_now:6651`, `/trigger_hub_update:6768`, `/api/models:5175`, `/api/fetch-models:5192`: sync `git`/`requests` inline in async handlers. Fix: `asyncio.to_thread`; `asyncio.gather` the two model fetches.
-- **bugfixer** `main.py:1977-2078`: N+1 GitHub API calls in `find_global_duplicate_issue` — `O(errors × repos × pages)` per scan cycle, re-fetching identical issue lists. Fix: one `{repo: [issues]}` snapshot per scan phase.
-- **bugfixer** `main.py:3435-3439`: no clone cache; fresh full `git clone` per issue (concurrent via `ThreadPoolExecutor:4452`). Fix: `clone_from(..., depth=1)` or one bare mirror per repo per cycle with `--reference`.
+- **ab** `main.py:6490,6567`: `/delete_issue` and `/resolve_issue` are `async def` doing synchronous PyGithub + disk I/O, blocking every other request for seconds. *(Directly relevant to the just-shipped Resolved work.)* Fix: `await asyncio.to_thread(...)` (pattern used at 5614).
+- **ab** `/update_now:6651`, `/trigger_hub_update:6768`, `/api/models:5175`, `/api/fetch-models:5192`: sync `git`/`requests` inline in async handlers. Fix: `asyncio.to_thread`; `asyncio.gather` the two model fetches.
+- **ab** `main.py:1977-2078`: N+1 GitHub API calls in `find_global_duplicate_issue` — `O(errors × repos × pages)` per scan cycle, re-fetching identical issue lists. Fix: one `{repo: [issues]}` snapshot per scan phase.
+- **ab** `main.py:3435-3439`: no clone cache; fresh full `git clone` per issue (concurrent via `ThreadPoolExecutor:4452`). Fix: `clone_from(..., depth=1)` or one bare mirror per repo per cycle with `--reference`.
 - **lm** + **dhcp/dns/ldap/opnsense/pxmx/qa**: blocking `subprocess`/`requests`/`python-ldap` inside async handlers across the spokes. Fix: `asyncio.to_thread` / async clients (`httpx.AsyncClient`).
 - **lm** `generic_agent/.../agent.py:56-62`: `psutil.cpu_percent(interval=1)` blocks 1s inside async `_telemetry_loop` every 60s. Fix: `asyncio.to_thread`.
 - **lm** `main.py:242`: busy-poll `while…: await asyncio.sleep(0.1)` in `request_response` (10 wakeups/sec, 100ms latency). Fix: `asyncio.Future` per `msg_id` + `wait_for`.
@@ -96,11 +96,11 @@
 - **lm** `broadcaster.py:26-31`: sequential broadcast fanout; one slow client blocks all subscribers. Fix: `asyncio.gather(..., return_exceptions=True)`.
 
 ### Optimization — re-reading disk on every call
-- **bugfixer** `main.py:122-161`: `load_config()` re-reads+parses `config.json` on **~40 call sites with no cache** — every HTTP request and every worker iteration pays a disk read + JSON parse + dict merge for config that only changes on Save Settings. *Biggest single waste in the codebase.* Fix: mtime-invalidated `_CONFIG_CACHE`, rebuilt on Save.
-- **bugfixer** `load_processed()` called up to **7× inside one `process_single_issue`** (3375,3384,3408,3466,3489,3538,3567). Fix: load once at entry, mutate, save once per persistent exit.
-- **bugfixer** `main.py:343,371,382,334,310`: duplicated provider-config parsing — 5 helpers each independently iterate `llm_entries`; legacy flat keys + vault shape coexist (`/save_settings` writes flat, vault writes `llm_entries[]`) → consistency surface. Fix: one `_resolve_slots(config) -> {1..4: ProviderSlot}` memoized on config identity; pick one canonical shape.
-- **bugfixer** `main.py:2495-2524`: `heartbeat_worker` re-parses all 4 provider slots every 5s forever (12 disk reads/min); duplicated in `connectivity_worker:2480` + `poller_worker:4986`. Fix: drive refresh off config-cache invalidation, or 60s+ interval.
-- **bugfixer** `discover_labels:1852` + `get_monitored_repos:1652`: re-fetched every scan cycle (effectively static). Fix: TTL cache / cache by config identity per cycle.
+- **ab** `main.py:122-161`: `load_config()` re-reads+parses `config.json` on **~40 call sites with no cache** — every HTTP request and every worker iteration pays a disk read + JSON parse + dict merge for config that only changes on Save Settings. *Biggest single waste in the codebase.* Fix: mtime-invalidated `_CONFIG_CACHE`, rebuilt on Save.
+- **ab** `load_processed()` called up to **7× inside one `process_single_issue`** (3375,3384,3408,3466,3489,3538,3567). Fix: load once at entry, mutate, save once per persistent exit.
+- **ab** `main.py:343,371,382,334,310`: duplicated provider-config parsing — 5 helpers each independently iterate `llm_entries`; legacy flat keys + vault shape coexist (`/save_settings` writes flat, vault writes `llm_entries[]`) → consistency surface. Fix: one `_resolve_slots(config) -> {1..4: ProviderSlot}` memoized on config identity; pick one canonical shape.
+- **ab** `main.py:2495-2524`: `heartbeat_worker` re-parses all 4 provider slots every 5s forever (12 disk reads/min); duplicated in `connectivity_worker:2480` + `poller_worker:4986`. Fix: drive refresh off config-cache invalidation, or 60s+ interval.
+- **ab** `discover_labels:1852` + `get_monitored_repos:1652`: re-fetched every scan cycle (effectively static). Fix: TTL cache / cache by config identity per cycle.
 - **cs** `store.py:325,361,600,728,608,…`: `json.load` from disk on every `get_tenant`/`list_spokes`/`get_approved_spoke_by_*`; no in-memory cache; `save_spoke`/`ensure_config_update_command` always full-file read+rewrite. Fix: module-level mtime-keyed cache invalidated on `save_*`.
 - **lm** `core/.../control_plane.py:125-172` vs `621-690`: duplicated git self-update logic within core (`perform_self_update_check` and `SPOKE_UPDATE` handler duplicate fetch/rebase/abort/reset/restart). Fix: extract `_do_git_update(cwd, repo_url=None)`.
 - **lm** `api.py:2866-2890` + `2908-2917`: duplicated module→script-path table. Fix: hoist to module-level constant.
@@ -114,15 +114,15 @@
 - **cs** `aggregate.py:1914-1919,2247-2255,2277-2293` (+ ~20 more): Aruba `decrypt_dict → ArubaClient → is_configured()` boilerplate repeated ~23×. Fix: `_aruba_client_for_tenant` helper.
 - **cs** `acme.py` (21 sites): fresh `httpx.AsyncClient(timeout=20)` each call. Fix: shared `_acme_request` helper.
 - **cs** `store.py:608,659,493,694,1353,1396,1755,1788`: dead store funcs (zero refs): `get_spoke_by_api_key`, `get_spoke_by_name`, `get_spoke_by_pending_hostname`, `get_pending_spoke_by_name`, `get_spoke_processing_stats`, `approve_spoke`, `list_mac_profiles`/`save_oui_pool`. Fix: delete.
-- **bugfixer** `main.py:1391-1395`: inconsistent error contract from `handle_hub_request`. Fix: standardize envelope.
+- **ab** `main.py:1391-1395`: inconsistent error contract from `handle_hub_request`. Fix: standardize envelope.
 
 ### Workflow / concurrency
-- **bugfixer** `main.py:3514,3528,3706,3794,6511,6631,6513,6633,3707,3795,6642`: **counter read-modify-write race** with no lock under `ThreadPoolExecutor(max_workers=MAX_CONCURRENT_FIXES:4452)` + `retry_all_failed:6743` — `success_count`/`failure_count`/`closed_count` `+=` and `max(0,x-1)` are non-atomic; two workers can both read the same value and both write `+1`, losing an increment. UI buckets drift from reality. Fix: dedicated `threading.Lock`, or derive counts from `state["processed"]` on read (startup rehydration at 1587-1592 already does this). *(Ties to the lifecycle work.)*
-- **bugfixer** `main.py:6451-6463` (`clear_history`): resets `success_count`/`failure_count` **but not `closed_count`** → after Clear History the UI shows closed issues while `processed` is empty, inconsistent with startup rehydration. Fix: add `state["closed_count"] = 0` at 6459. *(Drift in the lifecycle feature just shipped — one-liner.)*
-- **bugfixer** `main.py:7553-7557`: workers started at module top level with no shutdown coordination (`@app.on_event("shutdown")`/`lifespan`/`atexit`/signal handler all absent). A `process_single_issue` can be killed mid-`git clone`/mid-`save_processed`, leaving `processed_issues.json` half-written or a temp clone orphaned. Under `gunicorn --workers N`, each worker starts its own poller/heartbeat/updater/restart threads → N pollers racing on the same repos and `processed_issues.json`, double-processing and clobbering saves. Fix: start workers in `lifespan` startup; shutdown event checked in `while True` loops; single-instance file lock.
-- **bugfixer** `state["processed"] = processed` at 3379,3416,3497,3546,3575,3725,6514,6638: replaced wholesale without a lock; concurrent saves lose updates (last writer wins on same disk snapshot). Fix: serialize with a lock or single-writer design.
-- **bugfixer** `_log_restart_event:3260-3269` + `daily_fixes_count`/`daily_budget_date:4887-4888`: never persisted → Diagnostics panel loses history on restart and a mid-day restart resets the daily fix budget to 0 (cap bypass). Likewise `state["paused"]/["blackout"]:5011,5017` never saved → restart un-pauses and resumes autonomous fixing unexpectedly. Fix: persist to `config.json`/state file.
-- **bugfixer** `main.py:3637`: bare `except:` swallows `SystemExit`/`KeyboardInterrupt` for control flow (checkout-then-create-branch) — Ctrl-C during checkout is swallowed and branch creation attempted instead of letting the process die; wrong exception type. Fix: `except git.exc.GitCommandError:`.
+- **ab** `main.py:3514,3528,3706,3794,6511,6631,6513,6633,3707,3795,6642`: **counter read-modify-write race** with no lock under `ThreadPoolExecutor(max_workers=MAX_CONCURRENT_FIXES:4452)` + `retry_all_failed:6743` — `success_count`/`failure_count`/`closed_count` `+=` and `max(0,x-1)` are non-atomic; two workers can both read the same value and both write `+1`, losing an increment. UI buckets drift from reality. Fix: dedicated `threading.Lock`, or derive counts from `state["processed"]` on read (startup rehydration at 1587-1592 already does this). *(Ties to the lifecycle work.)*
+- **ab** `main.py:6451-6463` (`clear_history`): resets `success_count`/`failure_count` **but not `closed_count`** → after Clear History the UI shows closed issues while `processed` is empty, inconsistent with startup rehydration. Fix: add `state["closed_count"] = 0` at 6459. *(Drift in the lifecycle feature just shipped — one-liner.)*
+- **ab** `main.py:7553-7557`: workers started at module top level with no shutdown coordination (`@app.on_event("shutdown")`/`lifespan`/`atexit`/signal handler all absent). A `process_single_issue` can be killed mid-`git clone`/mid-`save_processed`, leaving `processed_issues.json` half-written or a temp clone orphaned. Under `gunicorn --workers N`, each worker starts its own poller/heartbeat/updater/restart threads → N pollers racing on the same repos and `processed_issues.json`, double-processing and clobbering saves. Fix: start workers in `lifespan` startup; shutdown event checked in `while True` loops; single-instance file lock.
+- **ab** `state["processed"] = processed` at 3379,3416,3497,3546,3575,3725,6514,6638: replaced wholesale without a lock; concurrent saves lose updates (last writer wins on same disk snapshot). Fix: serialize with a lock or single-writer design.
+- **ab** `_log_restart_event:3260-3269` + `daily_fixes_count`/`daily_budget_date:4887-4888`: never persisted → Diagnostics panel loses history on restart and a mid-day restart resets the daily fix budget to 0 (cap bypass). Likewise `state["paused"]/["blackout"]:5011,5017` never saved → restart un-pauses and resumes autonomous fixing unexpectedly. Fix: persist to `config.json`/state file.
+- **ab** `main.py:3637`: bare `except:` swallows `SystemExit`/`KeyboardInterrupt` for control flow (checkout-then-create-branch) — Ctrl-C during checkout is swallowed and branch creation attempted instead of letting the process die; wrong exception type. Fix: `except git.exc.GitCommandError:`.
 - **lm** `broadcaster.py:25-31,33-45`: race on subscriber sets — `broadcast` iterates `self._subscribers[tenant_id]`/`self._admins` while `await ws.send_json(...)` yields; a concurrent `subscribe`/`unsubscribe` mutates the same set → `RuntimeError: Set changed size during iteration`. Fix: snapshot before iterating (`for ws in list(...)`), or `asyncio.Lock`.
 - **lm** `core/.../mailbox.py:81-115`: race — acked message resurrected by retry loop (no lock): in `retry_loop`, message read into `to_retry`, then `await send_func(msg)` yields; a concurrent `acknowledge` can `del pending_ack[msg_id]` during that await, and line 108 re-inserts, re-sending an already-acknowledged message. Fix: re-check `msg_id in pending_ack` after the await and that the stored tuple still matches before re-inserting; guard with a lock.
 - **lm** `main.py:641`: `response_cache` grows unbounded — entries only popped by a matching waiter; responses arriving after a timeout (or for no waiter) are never evicted → slow memory leak. Fix: TTL or Futures.
@@ -165,7 +165,7 @@
 
 ## Per-repo — additional detail (lower-severity / context)
 
-### bugfixer — bare `except:` assessment (pre-identified set)
+### ab — bare `except:` assessment (pre-identified set)
 - **Acceptable (best-effort cleanup, not findings):** `watchdog.py:25,39,83,130,141` (supervisor must survive transient I/O/systemctl hiccups); `main.py:220` (`get_version` best-effort read); `main.py:5032` (dashboard `datetime.fromisoformat` fallback).
 - **Low — should log, not reported as findings but worth a tweak:** `main.py:172,181,205` silently fall back to empty state on corrupt JSON — a corrupt `processed_issues.json` would silently wipe issue history with no log line. Change to `except json.JSONDecodeError as e: logger.error(...)`; same for `main.py:3394` (timestamp parse) — catch `(ValueError, TypeError)` and `logger.debug`.
 - **Problematic (reported as workflow finding):** `main.py:3637` (swallows `SystemExit`).
@@ -244,11 +244,11 @@ Specifically duplicated:
 
 ## Recommended fix order
 
-1. **bugfixer auth (C1) + bind `127.0.0.1`** — one change defangs C2, C3, S3, S8 and the SSRF/diagnostics leaks. Mandatory bearer token from a `0600` root-owned secret; refuse to start if unset.
+1. **ab auth (C1) + bind `127.0.0.1`** — one change defangs C2, C3, S3, S8 and the SSRF/diagnostics leaks. Mandatory bearer token from a `0600` root-owned secret; refuse to start if unset.
 2. **lm signature-bypass (C5) + sed RCE (C4) + hub WS TLS (C6)** — make empty secret a hard startup error; validate `new_hostname` against `^[A-Za-z0-9._-]{1,63}$`; terminate TLS on the hub WS.
 3. **netbox unauth privileged commands (C7) + cppm `verify=False`/SSRF (C8) + pxmx WS TLS (C9) + ldap `admin` fallback (C10)** — per-spoke auth + fail-closed secrets.
 4. **cs `store.get_spokes` → `list_spokes` (C11)** — one-line fix that un-breaks config-override propagation across 7 endpoints.
-5. **bugfixer perf/consistency batch:** `asyncio.to_thread` for `/delete_issue`, `/resolve_issue`, `/update_now`, `/api/models`; mtime `_CONFIG_CACHE`; guard counters (or derive from `processed`); `clear_history` reset `closed_count`; stop embedding the PAT in clone URLs + log sanitizer.
+5. **ab perf/consistency batch:** `asyncio.to_thread` for `/delete_issue`, `/resolve_issue`, `/update_now`, `/api/models`; mtime `_CONFIG_CACHE`; guard counters (or derive from `processed`); `clear_history` reset `closed_count`; stop embedding the PAT in clone URLs + log sanitizer.
 6. **cs perf:** wrap sync `store.*` in `asyncio.to_thread`; in-memory store cache; batch the spokes fan-out write.
 7. **Structural:** extract `BaseControlPlane`/`BaseSpoke` so the 4–10× duplicated fixes become 1×.
 
@@ -260,11 +260,11 @@ Specifically duplicated:
 
 ## Appendix — deterministic sweep results (for reference)
 
-- `py_compile`: 131 files, **0 syntax errors**. (The only syntax issue found during the session was a linter-mangled f-string in bugfixer's uncommitted "File a Bug" WIP — fixed locally, left uncommitted as it's not this audit's code.)
+- `py_compile`: 131 files, **0 syntax errors**. (The only syntax issue found during the session was a linter-mangled f-string in ab's uncommitted "File a Bug" WIP — fixed locally, left uncommitted as it's not this audit's code.)
 - `shell=True`: **0** across all repos.
 - `eval(` / `exec(`: **0**.
 - Hardcoded credential literals in source: **0** found (the credential issues above are defaults/argv/env-fallbacks, not literal secrets in committed Python — except `ldap/base_structure.ldif:16` `password123` and `qa/qa_tester.py:111` `qa-secret-123`/`hub-secret-abc`).
-- Bare `except:`: **12**, all in bugfixer (`watchdog.py` ×5, `main.py` ×7) — assessed individually above.
+- Bare `except:`: **12**, all in ab (`watchdog.py` ×5, `main.py` ×7) — assessed individually above.
 - `subprocess` call sites: **76** across repos (reviewed for timeouts/silent failures — see per-repo performance/workflow sections).
 
 ---
