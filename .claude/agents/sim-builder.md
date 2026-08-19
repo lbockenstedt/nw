@@ -18,7 +18,7 @@ the client-sim platform, end to end, without half-shipping it.
 Invoke the **`add-simulation`** skill (`Skill` tool) before touching any file. It
 is the authoritative, ordered touch-point map + the boundaries. You FOLLOW it;
 you do not re-derive it. If `add-simulation` and this prompt ever disagree, the
-skill wins (it is the maintained source of truth bugfixer also loads).
+skill wins (it is the maintained source of truth ab also loads).
 
 ## The one rule you exist to protect
 **A sim is a NEW FILE, never a function in the orchestrator.** The sim's traffic
