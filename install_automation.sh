@@ -1,7 +1,8 @@
 #!/bin/bash
 
 # Lab Manager Autonomous Setup Script for LXC
-# This script installs the environment, clones the repos, and sets up the AI-driven issue fix loop.
+# This script installs the environment, clones the repos, and sets up the
+# AI-driven issue fix loop (AppBuilder — repo lbockenstedt/ab).
 
 set -e
 
@@ -40,7 +41,7 @@ WORK_DIR="/opt/labmanager"
 mkdir -p $WORK_DIR
 cd $WORK_DIR
 
-repos=("lbockenstedt/lm" "lbockenstedt/cppm" "lbockenstedt/cs" "lbockenstedt/ldap" "lbockenstedt/netbox" "lbockenstedt/opnsense" "lbockenstedt/pxmx")
+repos=("lbockenstedt/lm" "lbockenstedt/ab" "lbockenstedt/cppm" "lbockenstedt/cs" "lbockenstedt/ldap" "lbockenstedt/netbox" "lbockenstedt/opnsense" "lbockenstedt/pxmx")
 
 echo "📂 Cloning repositories..."
 for repo in "${repos[@]}"; do
@@ -51,6 +52,22 @@ for repo in "${repos[@]}"; do
         echo "Repo $repo_name already exists, skipping clone."
     fi
 done
+
+# 3b. Install AppBuilder (the AI-driven issue fix agent — repo lbockenstedt/ab).
+# AppBuilder ships its own idempotent installer (installs to /opt/ab, config in
+# /etc/ab, log at /var/log/ab.log). Connect it to an LM hub by exporting
+# HUB_WS_URL (a bare host is fine — the agent normalizes it to
+# wss://<host>:443/ws/spoke).
+if [ -x "$WORK_DIR/ab/install.sh" ] || [ -f "$WORK_DIR/ab/install.sh" ]; then
+    echo "🤖 Installing AppBuilder (AI fix agent)..."
+    if [ -n "${HUB_WS_URL:-}" ]; then
+        bash "$WORK_DIR/ab/install.sh" "$HUB_WS_URL"
+    else
+        bash "$WORK_DIR/ab/install.sh"
+    fi
+else
+    echo "⚠️  AppBuilder installer not found at $WORK_DIR/ab/install.sh — skipping."
+fi
 
 # 4. Setup the AI Automation Bridge
 echo "🤖 Setting up AI Automation bridge..."
@@ -117,5 +134,7 @@ echo "------------------------------------------------------------------"
 echo "NEXT STEPS:"
 echo "1. Authenticate GitHub CLI: 'gh auth login'"
 echo "2. Start the Hub: 'cd $WORK_DIR/lm && ./start.sh'"
-echo "3. When you see issues in the logs, run: 'claude \"Run the issue-fix workflow\"'"
+echo "3. AppBuilder (the AI fix agent) is installed and runs automatically."
+echo "   Open its dashboard at http://<this-host>:8000 to configure tokens/LLMs."
+echo "   (Re-run $WORK_DIR/ab/install.sh <hub-ws-url> to (re)connect it to a hub.)"
 echo "------------------------------------------------------------------"
