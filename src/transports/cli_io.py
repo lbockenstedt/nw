@@ -71,6 +71,31 @@ class CliSession:
     async def __aexit__(self, *exc):
         await self.close()
 
+    _SESSION_CLOSED_HINT = (
+        "device closed the SSH session right after login — the account may "
+        "lack CLI/exec privilege, the device may require different "
+        "credentials, or it may not grant an interactive PTY")
+
+    def _channel_closed(self) -> bool:
+        """True if the device has already torn the interactive channel down
+        (e.g. an exit status arrived during the banner read). Best-effort:
+        any attribute error means we can't tell, so assume still open."""
+        proc = self._proc
+        if proc is None:
+            return True
+        try:
+            if proc.exit_status is not None or proc.exit_signal is not None:
+                return True
+        except Exception:
+            pass
+        try:
+            chan = proc.channel
+            if chan is not None and chan.is_closing():
+                return True
+        except Exception:
+            pass
+        return False
+
     async def connect(self) -> None:
         import asyncssh
         try:
@@ -84,6 +109,14 @@ class CliSession:
         self._proc = await self._conn.create_process(term_type="vt100",
                                                       encoding="utf-8")
         await self._read_until_prompt()  # banner
+        # Some devices accept the SSH login but tear the interactive session
+        # down immediately (restricted role / no CLI-exec privilege / a PTY
+        # the platform refuses). asyncssh then surfaces this later as a bare
+        # "Channel not open for sending" on the first command write, which is
+        # opaque. Detect the already-closed channel here and raise an
+        # actionable error instead.
+        if self._channel_closed():
+            raise CliError(self._SESSION_CLOSED_HINT)
         paging = _PAGING_CMD.get(self.object_type)
         if paging:
             await self._send(paging)
@@ -108,7 +141,14 @@ class CliSession:
             pass
 
     async def _send(self, line: str) -> None:
-        self._proc.stdin.write(line + "\n")
+        try:
+            self._proc.stdin.write(line + "\n")
+        except (BrokenPipeError, ConnectionError, OSError) as e:
+            # asyncssh raises BrokenPipeError("Channel not open for sending")
+            # once the peer has closed the channel. Translate it into an
+            # operator-actionable message (same root cause as the connect-time
+            # check, but for a mid-session teardown).
+            raise CliError(f"{self._SESSION_CLOSED_HINT} ({e})")
 
     async def _read_until_prompt(self, timeout: float = 12.0) -> str:
         """Drain stdout until a prompt-looking line appears (or timeout).

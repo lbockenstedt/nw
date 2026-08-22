@@ -6,6 +6,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+import pytest  # noqa: E402
 from transports import cli_io  # noqa: E402
 
 
@@ -196,3 +197,23 @@ def test_read_eof_drops_trailing_partial_line():
     s = _reader_session(["a\nb\npartial"], eof=True)
     res = _read(s)
     assert res == "a\nb\n"
+
+
+class _ClosedStdin:
+    def write(self, s):
+        # asyncssh raises exactly this once the peer closed the channel.
+        raise BrokenPipeError("Channel not open for sending")
+
+
+def test_send_on_closed_channel_raises_actionable_clierror():
+    # A device that tears the session down right after login makes the first
+    # command write fail with a bare BrokenPipeError. _send must translate it
+    # into an operator-actionable CliError, not leak the opaque asyncssh text.
+    s = cli_io.CliSession({"address": "10.0.0.1", "username": "admin"})
+    s._proc = _FakeProc([])
+    s._proc.stdin = _ClosedStdin()
+    with pytest.raises(cli_io.CliError) as ei:
+        asyncio.get_event_loop().run_until_complete(s._send("show version"))
+    msg = str(ei.value)
+    assert "CLI/exec privilege" in msg
+    assert "Channel not open for sending" in msg
