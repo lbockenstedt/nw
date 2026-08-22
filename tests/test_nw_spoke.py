@@ -303,3 +303,68 @@ def test_get_status():
     assert st["module"] == "nw"
     assert st["device_count"] == 1
     assert st["connection"] == "CONNECTED"
+
+# ── NW_SCAN dispatch ─────────────────────────────────────────────────────────
+def test_nw_scan_requires_targets():
+    spoke = _spoke_with([])
+    res = _run(spoke.handle_command("NW_SCAN", {"credentials": [{"name": "c", "username": "u"}]}))
+    assert res["status"] == "ERROR"
+    assert "targets" in res["message"]
+
+
+def test_nw_scan_requires_credentials():
+    spoke = _spoke_with([])
+    res = _run(spoke.handle_command("NW_SCAN", {"targets": ["10.0.0.1"]}))
+    assert res["status"] == "ERROR"
+    assert "credential" in res["message"]
+
+
+def test_nw_scan_masks_nested_credentials():
+    # Nested per-credential secrets must be masked in the log-data view.
+    masked = NwSpoke._mask({
+        "targets": ["10.0.0.1"],
+        "credentials": [{"name": "c", "username": "admin", "password": "hunter2",
+                         "snmp_community": "public"}],
+    })
+    cred = masked["credentials"][0]
+    assert cred["password"] == "********"
+    assert cred["snmp_community"] == "********"
+    assert cred["username"] == "admin"  # non-secret passes through
+
+
+def test_nw_scan_runs_with_injected_scanner(monkeypatch):
+    # Patch NwScanner so no real network is touched; assert the envelope flows.
+    import nw_scanner
+
+    class _FakeScanner:
+        def __init__(self, creds, **kw):
+            self.creds = creds
+            self.kw = kw
+        async def scan(self, targets, **kw):
+            return {"status": "SUCCESS", "scanned": len(targets),
+                    "identified": [{"address": targets[0], "object_type": "cx_switch"}],
+                    "reachable": []}
+
+    monkeypatch.setattr(nw_scanner, "NwScanner", _FakeScanner)
+    spoke = _spoke_with([])
+    res = _run(spoke.handle_command("NW_SCAN", {
+        "targets": ["10.0.0.1"],
+        "credentials": [{"name": "c", "username": "admin", "password": "x"}],
+        "options": {"try_snmp": False},
+    }))
+    assert res["status"] == "SUCCESS"
+    assert res["identified"][0]["object_type"] == "cx_switch"
+
+
+# ── LLDP neighbor parsing (crawl) ───────────────────────────────────────────
+def test_parse_lldp_neighbors():
+    from transports.cli_io import parse_lldp_neighbors
+    text = """
+    Local Port : 1/1/1
+      Management Address : 10.0.0.2
+    Local Port : 1/1/2
+      Management Address : 10.0.0.3
+      Neighbor Address   : 999.1.1.1
+    """
+    ips = parse_lldp_neighbors(text)
+    assert ips == ["10.0.0.2", "10.0.0.3"]

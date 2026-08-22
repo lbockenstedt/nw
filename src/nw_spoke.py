@@ -41,7 +41,17 @@ class NwSpoke(BaseSpoke):
     def _mask(data: Any) -> Any:
         if not isinstance(data, dict):
             return data
-        return {k: ("********" if k in _SENSITIVE else v) for k, v in data.items()}
+        out = {}
+        for k, v in data.items():
+            if k in _SENSITIVE:
+                out[k] = "********"
+            elif k == "credentials" and isinstance(v, list):
+                # NW_SCAN carries a list of credential dicts — mask each nested
+                # secret so a scan never leaks candidate passwords/communities.
+                out[k] = [NwSpoke._mask(c) if isinstance(c, dict) else c for c in v]
+            else:
+                out[k] = v
+        return out
 
     async def handle_command(self, command_type: str, data: Dict[str, Any]) -> Dict[str, Any]:
         """Dispatch a hub NW_* command to the engine.
@@ -177,6 +187,13 @@ class NwSpoke(BaseSpoke):
             commands = (data or {}).get("commands", []) if isinstance(data, dict) else []
             return await self.engine.run_config(device_id, commands, tenant)
 
+        if normalized_cmd in ("NW_SCAN", "NW_DISCOVER"):
+            # Fingerprint scan: the hub sends candidate target IPs + candidate
+            # scan credentials (already overlaid from the vault) + options. The
+            # spoke probes each target and returns identified manageable devices
+            # for the hub to auto-add. No fleet mutation happens here.
+            return await self._run_scan(data or {})
+
         if normalized_cmd == "INSTALL_CERT":
             # Hub-brokered cert distribution: install the delivered LE cert on
             # the target fleet device. The hub addresses a device by
@@ -222,6 +239,85 @@ class NwSpoke(BaseSpoke):
         logger.warning(f"Unknown Nw command type: {command_type}")
         return {"status": "ERROR",
                 "message": f"Command {command_type} not supported by nw module"}
+
+    async def _run_scan(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute an NW_SCAN: build an :class:`NwScanner` from the pushed
+        credentials + options and fingerprint the target IP list. Returns an
+        envelope carrying identified/reachable device fingerprints. Never
+        raises — a scan failure is reported as an ERROR envelope so the hub
+        ledger surfaces it."""
+        from nw_scanner import NwScanner, DEFAULT_TCP_PORTS
+        targets = data.get("targets") if isinstance(data.get("targets"), list) else []
+        credentials = data.get("credentials") if isinstance(data.get("credentials"), list) else []
+        opts = data.get("options") if isinstance(data.get("options"), dict) else {}
+        if not targets:
+            return {"status": "ERROR", "message": "NW_SCAN requires a non-empty targets list"}
+        if not credentials:
+            return {"status": "ERROR", "message": "NW_SCAN requires at least one credential set"}
+        ports = opts.get("tcp_ports") or DEFAULT_TCP_PORTS
+        try:
+            ports = tuple(int(p) for p in ports)
+        except (TypeError, ValueError):
+            ports = DEFAULT_TCP_PORTS
+        crawl = bool(opts.get("crawl", False))
+        try:
+            scanner = NwScanner(
+                credentials,
+                tcp_ports=ports,
+                try_snmp=bool(opts.get("try_snmp", True)),
+                use_nmap=bool(opts.get("use_nmap", False)),
+                concurrency=int(opts.get("concurrency") or 32),
+                tcp_timeout=float(opts.get("tcp_timeout") or 1.5),
+                target_timeout=float(opts.get("target_timeout") or 20.0),
+                lldp_neighbors=self._lldp_neighbors if crawl else None,
+            )
+            result = await scanner.scan(
+                targets,
+                crawl=crawl,
+                max_targets=int(opts.get("max_targets") or 4096),
+                max_depth=int(opts.get("max_depth") or 1),
+            )
+            return result
+        except Exception as e:  # noqa: BLE001
+            logger.exception("NW_SCAN failed")
+            return {"status": "ERROR", "message": f"scan failed: {e}"}
+
+    @staticmethod
+    async def _lldp_neighbors(host: str, credentials: list) -> list:
+        """LLDP-crawl callable: SSH into ``host`` with each candidate credential,
+        identify the family from the banner, and return neighbor management IPs.
+        Best-effort — any failure yields ``[]`` so the crawl simply stops here."""
+        from transports import cli_io
+        from nw_scanner import classify_platform
+        for cred in credentials or []:
+            dev = {"address": host, "port": 22,
+                   "username": cred.get("username") or cred.get("user") or "",
+                   "password": cred.get("password") or "",
+                   "enable_secret": cred.get("enable_secret") or "",
+                   "object_type": ""}
+            if not dev["username"]:
+                continue
+            try:
+                session = cli_io.CliSession(dev, command_timeout=15.0)
+            except cli_io.CliError:
+                continue
+            try:
+                await session.connect()
+                banner = ""
+                try:
+                    banner = await session.run("show version")
+                except Exception:  # noqa: BLE001
+                    pass
+                ot = classify_platform(banner) or "aos_switch"
+                return await cli_io.cli_get_lldp_neighbors(session, ot)
+            except Exception:  # noqa: BLE001
+                continue
+            finally:
+                try:
+                    await session.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        return []
 
     async def get_status(self) -> Dict[str, Any]:
         """Native LM status report for the nw fleet."""

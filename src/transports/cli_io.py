@@ -528,6 +528,48 @@ def parse_vlans_gateway(text: str) -> List[dict]:
     return rows
 
 
+def parse_lldp_neighbors(text: str) -> List[str]:
+    """Best-effort extract neighbor management IPv4 addresses from an LLDP
+    neighbor listing across the Aruba/Junos families. Different platforms format
+    LLDP output very differently, so rather than column-parse, scan for any
+    'management address' / 'mgmt' line carrying an IPv4, plus a fallback of any
+    dotted-quad on a line mentioning 'address'. Deduped, order-preserving.
+    Used by the scanner's optional LLDP crawl to enqueue neighbors."""
+    ips: List[str] = []
+    seen = set()
+    ipv4 = re.compile(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b")
+    for line in (text or "").splitlines():
+        low = line.lower()
+        if not ("address" in low or "mgmt" in low or "management" in low):
+            continue
+        for m in ipv4.finditer(line):
+            ip = m.group(1)
+            octs = ip.split(".")
+            if any(int(o) > 255 for o in octs):
+                continue
+            if ip in ("0.0.0.0", "255.255.255.255") or ip.startswith("127."):
+                continue
+            if ip not in seen:
+                seen.add(ip)
+                ips.append(ip)
+    return ips
+
+
+async def cli_get_lldp_neighbors(session: CliSession, object_type: str) -> List[str]:
+    """Run the vendor LLDP-neighbor command and return neighbor management IPs.
+    Best-effort — returns ``[]`` on any failure (a device without LLDP simply
+    doesn't extend the crawl)."""
+    cmd = {"aos_switch": "show lldp info remote-device",
+           "cx_switch": "show lldp neighbor-info detail",
+           "ex_switch": "show lldp neighbors",
+           "gateway": "show ap lldp neighbors"}.get(object_type, "show lldp neighbors")
+    try:
+        text = await session.run(cmd)
+    except Exception:
+        return []
+    return parse_lldp_neighbors(text)
+
+
 # object_type → (arp, mac, interfaces) parser triple
 PARSERS: Dict[str, Any] = {
     "aos_switch": (parse_arp_aos_s, parse_mac_aos_s, parse_interfaces_aos_s),
