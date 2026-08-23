@@ -145,7 +145,23 @@ class CliSession:
                 self._proc.stdin.write("\n")
             except Exception:  # noqa: BLE001 — channel may already be closed
                 pass
-            self._banner = await self._read_until_prompt()  # banner / first output
+            # Bounded re-nudge: some AOS-S switches only emit the banner/prompt
+            # after an Enter, and the pre-read CR above can be lost if it lands
+            # before the shell is ready. Re-send a CR on each idle second until
+            # the first byte arrives (capped so a truly mute device still fails
+            # via the read timeout / fleet idle-guard rather than looping).
+            self._nudges_left = 6
+
+            def _renudge():
+                if self._nudges_left <= 0:
+                    return
+                self._nudges_left -= 1
+                try:
+                    self._proc.stdin.write("\n")
+                except Exception:  # noqa: BLE001 — channel may already be closed
+                    pass
+
+            self._banner = await self._read_until_prompt(on_idle=_renudge)  # banner / first output
             if self._banner.strip():
                 logger.info("cli %s: login banner/first output (%d bytes): %r",
                             self.host, len(self._banner), self._banner[-500:])
@@ -230,8 +246,17 @@ class CliSession:
             # check, but for a mid-session teardown).
             raise CliError(self._session_closed_error(exc=e))
 
-    async def _read_until_prompt(self, timeout: float = 12.0) -> str:
+    async def _read_until_prompt(self, timeout: float = 12.0, on_idle=None) -> str:
         """Drain stdout until a prompt-looking line appears (or timeout).
+
+        ``on_idle`` (optional) is called once per second of silence (an inner
+        read that returned no bytes) BEFORE any output has arrived. The banner
+        read uses it to re-send a CR: some AOS-S switches render the login
+        banner + prompt only after they receive an Enter, and a single pre-read
+        nudge can be lost if it lands before the shell is ready — so the switch
+        sits mute and the read stalls its whole budget (and, under the fleet
+        idle-guard, gets cancelled). Re-nudging every idle second actively
+        elicits the prompt; it stops once the first byte arrives.
 
         Linear cost: complete lines are drained into ``out`` every iteration,
         so ``buf`` only ever holds the trailing partial line + the newest
@@ -259,6 +284,12 @@ class CliSession:
                     # prompt regex on its tail == the old whole-last-line check.
                     if buf and _PROMPT_RE.search(buf[-_PROMPT_TAIL:]):
                         break
+                    # Nothing yet from the device — actively re-nudge (bounded,
+                    # via on_idle) to elicit a switch that only renders its
+                    # prompt after an Enter. Only before ANY output (out empty
+                    # AND buf empty); once bytes flow we just keep reading.
+                    if on_idle is not None and not out and not buf:
+                        on_idle()
                     continue
                 if not chunk:
                     break

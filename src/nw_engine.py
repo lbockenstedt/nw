@@ -425,12 +425,13 @@ class SshCliDriver(NwDriver):
     transport = "ssh"
     shares_session = True
     # SSH/CLI probes stream progress (banner, gates, command output) through
-    # heartbeat.beat(), so the fleet guard extends past 3 s as long as the
-    # switch keeps sending bytes. AOS-S renders a slow multi-line login banner +
-    # "Press any key to continue" gate + terminal repaint before its prompt —
-    # legitimately several seconds — so allow up to 4 s of silence between
-    # progress, capped at 30 s total to keep the fleet list bounded.
-    fleet_idle_timeout = 4.0
+    # heartbeat.beat(), so the fleet guard extends past the base budget as long
+    # as the switch keeps sending bytes. AOS-S can sit MUTE for several seconds
+    # after the shell opens (it renders the banner/prompt only once its pre-read
+    # Enter is accepted — cli_io re-nudges to elicit it), so allow up to 8s of
+    # initial silence before giving up, capped at 30s total to keep the fleet
+    # list bounded. A genuinely dead device still fails within the 8s window.
+    fleet_idle_timeout = 8.0
     fleet_hard_cap = 30.0
 
     def _session(self):

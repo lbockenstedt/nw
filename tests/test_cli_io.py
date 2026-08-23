@@ -339,3 +339,68 @@ def test_connect_nudges_with_cr_before_banner_read():
             del sys.modules["asyncssh"]
     assert proc.stdin.writes and proc.stdin.writes[0] == "\n", \
         "connect() must send a CR nudge before reading the banner"
+
+
+class _MuteUntilNudgedStdout:
+    """Stays silent (raises the same TimeoutError an idle read raises) until the
+    session has written >= ``need`` CRs, then yields the banner+prompt once.
+    Models an AOS-S switch that renders its prompt only after enough Enters."""
+    def __init__(self, stdin, need, banner):
+        self._stdin = stdin
+        self._need = need
+        self._banner = banner
+        self._sent = False
+
+    async def read(self, n):
+        if not self._sent and len(self._stdin.writes) >= self._need:
+            self._sent = True
+            return self._banner
+        if self._sent:
+            return ""  # EOF after the banner
+        raise asyncio.TimeoutError  # simulate an idle (no-data) read second
+
+
+def test_connect_renudges_until_mute_switch_answers():
+    """A switch that swallows the first CR must still connect: connect() must
+    re-nudge on each idle second until the banner/prompt finally arrives.
+    Verify more than the single initial CR was sent and the prompt was reached."""
+    proc = _FakeProc([])
+    # Switch responds only after the initial nudge + at least 2 re-nudges.
+    proc.stdout = _MuteUntilNudgedStdout(proc.stdin, need=3, banner="switch# ")
+    conn = _FakeConn(proc)
+
+    async def _fake_connect(*a, **k):
+        return conn
+
+    import types
+    stub = types.ModuleType("asyncssh")
+    stub.connect = _fake_connect
+    prev = sys.modules.get("asyncssh")
+    sys.modules["asyncssh"] = stub
+    try:
+        s = cli_io.CliSession({"address": "10.0.0.1", "username": "admin"})
+        asyncio.get_event_loop().run_until_complete(s.connect())
+    finally:
+        if prev is not None:
+            sys.modules["asyncssh"] = prev
+        else:
+            del sys.modules["asyncssh"]
+    assert len(proc.stdin.writes) >= 3, \
+        "connect() must re-nudge a mute switch, not rely on a single CR"
+    assert "switch#" in s._banner
+
+
+def test_read_renudge_stops_once_output_arrives():
+    """on_idle must only fire BEFORE the first byte — once output flows it must
+    not keep nudging (extra CRs would pollute the session)."""
+    calls = {"n": 0}
+
+    def _on_idle():
+        calls["n"] += 1
+
+    # First read yields the prompt immediately → no idle second before output.
+    s = _reader_session(["switch# "])
+    asyncio.get_event_loop().run_until_complete(
+        s._read_until_prompt(on_idle=_on_idle))
+    assert calls["n"] == 0
+
