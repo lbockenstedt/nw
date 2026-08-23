@@ -203,6 +203,70 @@ def test_list_devices_no_shared_tenant_excludes_shared_flag(monkeypatch):
     assert ids == {"acme-sw"}
 
 
+# ── Fleet reachability uses the heartbeat idle-guard, not a fixed wall clock ─
+# Regression for the AOS-S DIST-SW case: a switch that streams a slow login
+# banner takes longer than the old fixed 3s budget to reach a prompt, but keeps
+# sending bytes — so it must stay reachable. A device that goes silent still
+# fails fast. These stub build_driver with fakes whose probe beats (or doesn't).
+import heartbeat  # noqa: E402
+
+
+class _SlowButStreamingDriver:
+    """probe() runs well past its idle_timeout in total, but beats on every
+    step — the guard must let it finish and report reachable."""
+    address = "10.0.0.9"
+    fleet_idle_timeout = 0.2
+    fleet_hard_cap = 5.0
+
+    def __init__(self, device):
+        self.device = device
+
+    async def probe(self):
+        for _ in range(6):                 # ~0.6s total, 0.1s < idle_timeout gaps
+            await asyncio.sleep(0.1)
+            heartbeat.beat()
+        return {"status": "SUCCESS",
+                "data": {"reachable": True, "latency_ms": 600}}
+
+
+class _StalledDriver:
+    """probe() never beats — the guard must cancel it and report unreachable."""
+    address = "10.0.0.10"
+    fleet_idle_timeout = 0.2
+    fleet_hard_cap = 5.0
+
+    def __init__(self, device):
+        self.device = device
+
+    async def probe(self):
+        await asyncio.sleep(10)            # silent → idle timeout fires
+        return {"status": "SUCCESS", "data": {"reachable": True}}
+
+
+def test_fleet_probe_keeps_slow_streaming_device_reachable(monkeypatch):
+    import nw_engine as _ne
+    monkeypatch.setattr(_ne, "build_driver", lambda d: _SlowButStreamingDriver(d))
+    spoke = _spoke_with([
+        {"id": "sw1", "name": "DIST-SW", "object_type": "aos_switch",
+         "address": "10.0.0.9"},
+    ])
+    res = _run(spoke.handle_command("NW_LIST_DEVICES", {}))
+    row = res["data"][0]
+    assert row["reachable"] is True
+    assert row["latency_ms"] == 600
+
+
+def test_fleet_probe_marks_silent_device_unreachable(monkeypatch):
+    import nw_engine as _ne
+    monkeypatch.setattr(_ne, "build_driver", lambda d: _StalledDriver(d))
+    spoke = _spoke_with([
+        {"id": "sw1", "name": "DEAD-SW", "object_type": "aos_switch",
+         "address": "10.0.0.10"},
+    ])
+    res = _run(spoke.handle_command("NW_LIST_DEVICES", {}))
+    assert res["data"][0]["reachable"] is False
+
+
 def test_per_device_command_rejects_other_tenant(monkeypatch):
     _no_probe(monkeypatch)
     spoke = _spoke_with(_fleet())

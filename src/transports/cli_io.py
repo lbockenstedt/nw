@@ -16,6 +16,8 @@ import os
 import re
 from typing import Any, Dict, List
 
+import heartbeat
+
 logger = logging.getLogger("NwCli")
 
 
@@ -125,8 +127,10 @@ class CliSession:
                 timeout=15.0)
         except Exception as e:
             raise CliError(f"SSH connect to {self.host}: {e}")
+        heartbeat.beat()  # progress: TCP+auth done
         self._proc = await self._conn.create_process(term_type="vt100",
                                                       encoding="utf-8")
+        heartbeat.beat()  # progress: interactive PTY open
         try:
             # Nudge with a bare CR before reading the banner. AOS-S prints a
             # multi-line copyright / RESTRICTED-RIGHTS legend after login and
@@ -218,6 +222,7 @@ class CliSession:
     async def _send(self, line: str) -> None:
         try:
             self._proc.stdin.write(line + "\n")
+            heartbeat.beat()  # progress: command sent
         except (BrokenPipeError, ConnectionError, OSError) as e:
             # asyncssh raises BrokenPipeError("Channel not open for sending")
             # once the peer has closed the channel. Translate it into an
@@ -257,6 +262,7 @@ class CliSession:
                     continue
                 if not chunk:
                     break
+                heartbeat.beat()  # progress: bytes arrived from the device
                 # If paging is still on despite `no page`, advance the pager (send
                 # a space) and strip the marker so output isn't truncated/polluted.
                 # Scan only the newest chunk + a small overlap — older text was

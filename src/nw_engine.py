@@ -27,6 +27,8 @@ import re
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
+import heartbeat
+
 logger = logging.getLogger("NwEngine")
 
 # ── Vendor command reference (used by the CLI driver + logged for diagnostics)─
@@ -247,6 +249,15 @@ class NwDriver:
     IO; the base provides transport resolution + envelope helpers."""
 
     transport = "base"
+    # Fleet-list reachability budget (see NwEngine.list_devices). A device
+    # streams progress via heartbeat.beat() during its probe; the guard cancels
+    # only after this many seconds of NO progress (not a fixed wall clock), so a
+    # slow-but-working device stays reachable while a dead one still fails fast.
+    # SNMP/REST probes emit no beats, so this degrades to a plain total timeout
+    # for them — preserving their original fixed 3 s budget. ``fleet_hard_cap``
+    # bounds total runtime as a safety net (None = rely on inner IO timeouts).
+    fleet_idle_timeout = 3.0
+    fleet_hard_cap: "Optional[float]" = None
     # Transports with a costly per-connection handshake (SSH banner/no-page/
     # enable, REST TLS+auth) set this True so poll/composite fetches open ONE
     # session per device and run their commands over it sequentially (some
@@ -413,6 +424,14 @@ class SshCliDriver(NwDriver):
     enable mode on AOS-S."""
     transport = "ssh"
     shares_session = True
+    # SSH/CLI probes stream progress (banner, gates, command output) through
+    # heartbeat.beat(), so the fleet guard extends past 3 s as long as the
+    # switch keeps sending bytes. AOS-S renders a slow multi-line login banner +
+    # "Press any key to continue" gate + terminal repaint before its prompt —
+    # legitimately several seconds — so allow up to 4 s of silence between
+    # progress, capped at 30 s total to keep the fleet list bounded.
+    fleet_idle_timeout = 4.0
+    fleet_hard_cap = 30.0
 
     def _session(self):
         from transports import cli_io
@@ -687,8 +706,10 @@ class NwEngine:
     # ── Fleet ───────────────────────────────────────────────────────────────
     async def list_devices(self, tenant: Optional[str] = None) -> Dict[str, Any]:
         """Fleet summary (no credentials) with live reachability via a
-        concurrent lightweight probe per device (3s timeout each). Falls back
-        to ``unknown`` on probe error so the UI never shows a stale 'up'.
+        concurrent progress-guarded probe per device (see :mod:`heartbeat`: an
+        idle watchdog that keeps a still-streaming device alive but fails a
+        dead one fast). Falls back to ``unknown`` on probe error so the UI
+        never shows a stale 'up'.
 
         ``tenant`` (optional) scopes the returned rows to that tenant's own
         devices + the shared tenant (defense-in-depth: the hub already gates
@@ -702,7 +723,10 @@ class NwEngine:
             rcell = {"reachable": None, "latency_ms": None}
             if drv:
                 try:
-                    pr = await asyncio.wait_for(drv.probe(), timeout=3.0)
+                    pr = await heartbeat.guard(
+                        drv.probe(),
+                        idle_timeout=getattr(drv, "fleet_idle_timeout", 3.0),
+                        hard_cap=getattr(drv, "fleet_hard_cap", None))
                     if pr.get("status") == "SUCCESS":
                         rcell.update(pr.get("data") or {})
                     else:
