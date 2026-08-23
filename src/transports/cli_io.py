@@ -12,6 +12,7 @@ whole poll.
 """
 import asyncio
 import logging
+import os
 import re
 from typing import Any, Dict, List
 
@@ -34,6 +35,12 @@ _PAGING_CMD = {
 }
 # Pager continuation marker (belt-and-suspenders if paging is still on).
 _PAGER_RE = re.compile(r"--\s*More\s*--", re.IGNORECASE)
+# AOS-S (ArubaOS-Switch) prints a "Press any key to continue" gate after the
+# login banner, BEFORE the CLI prompt. If the client never answers it the
+# session stalls at the banner until the switch closes it — which surfaces
+# downstream as an opaque "Channel not open for sending" on the first command.
+# Detect it and answer with a CR so the session reaches the real prompt.
+_CONTINUE_RE = re.compile(r"press any key to continue", re.IGNORECASE)
 # Prompt ends in '#' (enabled) or '>' (user) for AOS-S/gateway; Junos ends in
 # '>' or '#'. Match a line ending in a prompt char after optional whitespace.
 _PROMPT_RE = re.compile(r"[>#]\s*$")
@@ -63,6 +70,7 @@ class CliSession:
         self.command_timeout = command_timeout
         self._conn = None
         self._proc = None
+        self._banner = ""      # login banner / first output (captured for debug)
 
     async def __aenter__(self):
         await self.connect()
@@ -98,6 +106,17 @@ class CliSession:
 
     async def connect(self) -> None:
         import asyncssh
+        # Opt-in wire-level debug: set LM_NW_SSH_DEBUG=1 (or 2 for packet dumps)
+        # on the spoke to turn on asyncssh's own protocol logging, so an auth /
+        # channel-open / channel-close failure is visible in the spoke log.
+        _dbg = os.environ.get("LM_NW_SSH_DEBUG", "").strip()
+        if _dbg:
+            try:
+                logging.getLogger("asyncssh").setLevel(logging.DEBUG)
+                asyncssh.set_log_level(logging.DEBUG)
+                asyncssh.set_debug_level(2 if _dbg == "2" else 1)
+            except Exception:  # noqa: BLE001 — best-effort debug toggle
+                pass
         try:
             self._conn = await asyncio.wait_for(
                 asyncssh.connect(self.host, port=self.port, username=self.username,
@@ -108,26 +127,69 @@ class CliSession:
             raise CliError(f"SSH connect to {self.host}: {e}")
         self._proc = await self._conn.create_process(term_type="vt100",
                                                       encoding="utf-8")
-        await self._read_until_prompt()  # banner
-        # Some devices accept the SSH login but tear the interactive session
-        # down immediately (restricted role / no CLI-exec privilege / a PTY
-        # the platform refuses). asyncssh then surfaces this later as a bare
-        # "Channel not open for sending" on the first command write, which is
-        # opaque. Detect the already-closed channel here and raise an
-        # actionable error instead.
-        if self._channel_closed():
-            raise CliError(self._SESSION_CLOSED_HINT)
-        paging = _PAGING_CMD.get(self.object_type)
-        if paging:
-            await self._send(paging)
-            await self._read_until_prompt()
-        if self.enable_secret and self.object_type == "aos_switch":
-            await self._send("enable")
-            await self._read_until_prompt()
-            await self._send(self.enable_secret)
-            await self._read_until_prompt()
+        try:
+            self._banner = await self._read_until_prompt()  # banner / first output
+            if self._banner.strip():
+                logger.info("cli %s: login banner/first output (%d bytes): %r",
+                            self.host, len(self._banner), self._banner[-500:])
+            # A device that accepts the login but tears the session down right
+            # after — restricted role, no CLI-exec privilege, no PTY, or (AOS-S)
+            # "maximum number of sessions are active" — shows up as an already-
+            # closed channel here, or as a bare "Channel not open for sending"
+            # on the first write. Detect it and raise a banner-enriched,
+            # actionable error instead of the opaque asyncssh text.
+            if self._channel_closed():
+                raise CliError(self._session_closed_error())
+            paging = _PAGING_CMD.get(self.object_type)
+            if paging:
+                await self._send(paging)
+                await self._read_until_prompt()
+            if self.enable_secret and self.object_type == "aos_switch":
+                await self._send("enable")
+                await self._read_until_prompt()
+                await self._send(self.enable_secret)
+                await self._read_until_prompt()
+        except BaseException:
+            # CRITICAL: connect() runs inside __aenter__; if it raises here,
+            # __aexit__ (hence close()) never fires — so without this the
+            # authenticated asyncssh connection, and the device's session/vty
+            # slot, would LEAK. On small-session-cap switches (AOS-S) leaked
+            # sessions pile up until the device refuses ALL logins ("maximum
+            # number of sessions are active"), locking out polling AND humans.
+            # Always tear the half-open session down before propagating.
+            await self.close()
+            raise
+
+    def _session_closed_error(self, exc=None) -> str:
+        """Actionable message for a session the device tore down right after
+        login, enriched with a tail of the banner/first output it sent (so the
+        poll error — cached + shown in the UI — carries a debuggable clue).
+        Special-cases the AOS-S session-pool-exhausted disconnect."""
+        banner = (self._banner or "").strip()
+        if re.search(r"maximum number of sessions", banner, re.IGNORECASE):
+            msg = ('device refused the login: its SSH/console session pool is '
+                   'full ("maximum number of sessions are active") — free stale '
+                   'sessions or raise the cap on the device (AOS-S: '
+                   '"show ip ssh" to list, "ip ssh" / "console" session limits '
+                   'to raise)')
+        else:
+            msg = self._SESSION_CLOSED_HINT
+        if banner:
+            msg += f"; device sent before closing: {banner[-300:]!r}"
+        if exc is not None:
+            msg += f" ({exc})"
+        return msg
 
     async def close(self) -> None:
+        # Best-effort clean logout so the device frees its vty/session slot
+        # IMMEDIATELY rather than holding it until idle-timeout. On small-cap
+        # switches (AOS-S) a TCP-drop-only close lingers and, across repeated
+        # polls, exhausts the session pool. Guarded: a closed channel skips.
+        try:
+            if self._proc is not None and not self._channel_closed():
+                self._proc.stdin.write("exit\n")
+        except Exception:
+            pass
         try:
             if self._proc:
                 self._proc.close()
@@ -148,7 +210,7 @@ class CliSession:
             # once the peer has closed the channel. Translate it into an
             # operator-actionable message (same root cause as the connect-time
             # check, but for a mid-session teardown).
-            raise CliError(f"{self._SESSION_CLOSED_HINT} ({e})")
+            raise CliError(self._session_closed_error(exc=e))
 
     async def _read_until_prompt(self, timeout: float = 12.0) -> str:
         """Drain stdout until a prompt-looking line appears (or timeout).

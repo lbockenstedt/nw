@@ -217,3 +217,68 @@ def test_send_on_closed_channel_raises_actionable_clierror():
     msg = str(ei.value)
     assert "CLI/exec privilege" in msg
     assert "Channel not open for sending" in msg
+
+def test_session_closed_error_reports_session_pool_full():
+    # When the AOS-S banner carries the "maximum number of sessions are active"
+    # disconnect text, the enriched error must call that out specifically (so
+    # the poll error tells the operator to free/raise sessions, not chase
+    # credentials) and include a tail of what the device sent.
+    s = cli_io.CliSession({"address": "10.0.0.1", "username": "admin"})
+    s._banner = ("Sorry, the maximum number of sessions are active.  "
+                 "Try again later.")
+    msg = s._session_closed_error()
+    assert "session pool is full" in msg
+    assert "maximum number of sessions are active" in msg
+    assert "device sent before closing" in msg
+
+
+def test_session_closed_error_generic_without_banner():
+    s = cli_io.CliSession({"address": "10.0.0.1", "username": "admin"})
+    s._banner = ""
+    msg = s._session_closed_error()
+    assert "CLI/exec privilege" in msg
+    assert "device sent before closing" not in msg
+
+
+class _FakeConn:
+    def __init__(self, proc):
+        self._proc = proc
+        self.closed = False
+
+    async def create_process(self, **kw):
+        return self._proc
+
+    def close(self):
+        self.closed = True
+
+    async def wait_closed(self):
+        return None
+
+
+def test_connect_failure_does_not_leak_connection():
+    # THE session-exhaustion bug: connect() runs inside __aenter__, so if it
+    # raises after the SSH connection is established, close() would never fire
+    # and the device's vty slot would leak. Verify connect() tears the
+    # connection down itself before propagating.
+    proc = _FakeProc([""], eof=True)  # banner read hits EOF → channel closed
+    proc.exit_status = 0              # _channel_closed() → True
+    conn = _FakeConn(proc)
+
+    async def _fake_connect(*a, **k):
+        return conn
+
+    import types
+    stub = types.ModuleType("asyncssh")
+    stub.connect = _fake_connect
+    prev = sys.modules.get("asyncssh")
+    sys.modules["asyncssh"] = stub  # connect() does a runtime `import asyncssh`
+    try:
+        s = cli_io.CliSession({"address": "10.0.0.1", "username": "admin"})
+        with pytest.raises(cli_io.CliError):
+            asyncio.get_event_loop().run_until_complete(s.connect())
+    finally:
+        if prev is not None:
+            sys.modules["asyncssh"] = prev
+        else:
+            del sys.modules["asyncssh"]
+    assert conn.closed is True, "connection leaked: close() not called on failure"
