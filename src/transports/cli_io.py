@@ -128,6 +128,19 @@ class CliSession:
         self._proc = await self._conn.create_process(term_type="vt100",
                                                       encoding="utf-8")
         try:
+            # Nudge with a bare CR before reading the banner. AOS-S prints a
+            # multi-line copyright / RESTRICTED-RIGHTS legend after login and
+            # only renders the CLI prompt once it receives an Enter, so a
+            # prompt-anchored read would otherwise stall the FULL timeout on
+            # every connect — wasting ~12s per session and failing the 3s fleet
+            # reachability probe (the device shows "unreachable" even though its
+            # datums fetch fine). A CR is harmless on devices that already show
+            # a prompt (it just reprints it) and answers any "Press any key to
+            # continue" gate. Best-effort: a closed channel is caught below.
+            try:
+                self._proc.stdin.write("\n")
+            except Exception:  # noqa: BLE001 — channel may already be closed
+                pass
             self._banner = await self._read_until_prompt()  # banner / first output
             if self._banner.strip():
                 logger.info("cli %s: login banner/first output (%d bytes): %r",

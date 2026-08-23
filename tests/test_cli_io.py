@@ -282,3 +282,32 @@ def test_connect_failure_does_not_leak_connection():
         else:
             del sys.modules["asyncssh"]
     assert conn.closed is True, "connection leaked: close() not called on failure"
+
+
+def test_connect_nudges_with_cr_before_banner_read():
+    """AOS-S renders its CLI prompt only after an Enter (it prints a copyright
+    legend first), so connect() must send a bare CR before the prompt-anchored
+    banner read — otherwise the read stalls the full timeout and the 3s fleet
+    reachability probe marks the device unreachable. Verify the nudge is the
+    first thing written, and that a device presenting a prompt then connects."""
+    proc = _FakeProc(["switch# "])  # prompt present after the nudge
+    conn = _FakeConn(proc)
+
+    async def _fake_connect(*a, **k):
+        return conn
+
+    import types
+    stub = types.ModuleType("asyncssh")
+    stub.connect = _fake_connect
+    prev = sys.modules.get("asyncssh")
+    sys.modules["asyncssh"] = stub
+    try:
+        s = cli_io.CliSession({"address": "10.0.0.1", "username": "admin"})
+        asyncio.get_event_loop().run_until_complete(s.connect())
+    finally:
+        if prev is not None:
+            sys.modules["asyncssh"] = prev
+        else:
+            del sys.modules["asyncssh"]
+    assert proc.stdin.writes and proc.stdin.writes[0] == "\n", \
+        "connect() must send a CR nudge before reading the banner"
