@@ -175,6 +175,34 @@ def test_read_pager_marker_split_across_chunk_boundary():
     assert " " in s._proc.stdin.writes
 
 
+def test_read_answers_aos_s_press_any_key_gate():
+    # AOS-S (JL-series 2540/2930) prints a copyright legend ending in "Press any
+    # key to continue" and BLOCKS until a key is sent; only then does the CLI
+    # prompt render. _read_until_prompt must answer the gate (write a key), strip
+    # the marker, and go on to detect the prompt — otherwise the device stalls
+    # the full timeout and shows "unreachable" even though it is fully reachable.
+    banner = ("Aruba JL354A 2540-24G-4SFP+ Switch\n"
+              "  (C) Copyright 2026 Hewlett Packard Enterprise\n\n"
+              "Press any key to continue")
+    prompt = "\nDIST-SW# "
+    s = _reader_session([banner, prompt])
+    res = _read(s)
+    assert " " in s._proc.stdin.writes             # gate answered with a key
+    assert "Press any key to continue" not in res  # marker stripped from output
+    assert res.endswith("DIST-SW# ")               # prompt reached after the gate
+
+
+def test_read_answers_press_any_key_split_across_chunk_boundary():
+    # The overlap window must also catch the continue gate split across chunks.
+    part1 = "legend line\nPress any key to co"
+    part2 = "ntinue\nDIST-SW# "
+    s = _reader_session([part1, part2])
+    res = _read(s)
+    assert " " in s._proc.stdin.writes
+    assert "Press any key" not in res
+    assert res.endswith("DIST-SW# ")
+
+
 def test_read_prompt_on_complete_final_line():
     # A prompt followed by a newline (complete last line) must still terminate
     # the read immediately — the old splitlines()[-1] semantics.

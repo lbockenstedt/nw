@@ -263,12 +263,22 @@ class CliSession:
                 # already scanned (and scrubbed) when its own chunk arrived.
                 keep = max(0, len(buf) - _PAGER_OVERLAP)
                 window = buf[keep:] + chunk
-                if _PAGER_RE.search(window):
+                # Two stream-blocking gates need a key sent before more output
+                # arrives: the "-- More --" pager AND the AOS-S login banner's
+                # "Press any key to continue" (the JL-series 2540/2930 legend
+                # blocks here and only renders the CLI prompt once a key is
+                # pressed). Answer either the moment it actually appears in the
+                # stream — a fixed pre-read nudge races the banner and is lost,
+                # leaving the switch blocked so a prompt-anchored read stalls the
+                # full timeout and the device shows "unreachable". Strip the
+                # marker so it can't truncate/pollute parsed output, then keep
+                # reading toward the prompt.
+                if _PAGER_RE.search(window) or _CONTINUE_RE.search(window):
                     try:
                         self._proc.stdin.write(" ")
                     except Exception:
                         pass
-                    buf = buf[:keep] + _PAGER_RE.sub("", window)
+                    buf = buf[:keep] + _CONTINUE_RE.sub("", _PAGER_RE.sub("", window))
                     deadline = loop.time() + timeout  # keep reading further pages
                 else:
                     buf += chunk
