@@ -43,6 +43,20 @@ _PAGER_RE = re.compile(r"--\s*More\s*--", re.IGNORECASE)
 # downstream as an opaque "Channel not open for sending" on the first command.
 # Detect it and answer with a CR so the session reaches the real prompt.
 _CONTINUE_RE = re.compile(r"press any key to continue", re.IGNORECASE)
+# AOS-S (and other full-screen VT100 CLIs) auto-detect the terminal size after
+# login by parking the cursor far off-screen (e.g. ESC[1920;1920H) and issuing a
+# DSR — "Device Status Report", ESC[6n — a cursor-POSITION request. A real
+# terminal answers ESC[<row>;<col>R; the switch BLOCKS on that answer before it
+# renders the CLI prompt. asyncssh doesn't emulate a terminal, so unanswered the
+# switch sits mute after the banner and the prompt read stalls its whole budget
+# (device shows "unreachable" even though the login succeeded). Detect the DSR
+# and reply with a plausible 24x80 position so the switch proceeds to the prompt.
+_DSR_RE = re.compile(r"\x1b\[6n")
+_DSR_REPLY = "\x1b[24;80R"
+# Strip ANSI/VT100 control sequences (CSI ... final-byte) so prompt detection
+# and parsed output aren't defeated by a switch that cursor-positions its prompt
+# (ESC[24;1HDIST-SW# ) or wraps output in scroll-region / clear-screen escapes.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 # Prompt ends in '#' (enabled) or '>' (user) for AOS-S/gateway; Junos ends in
 # '>' or '#'. Match a line ending in a prompt char after optional whitespace.
 _PROMPT_RE = re.compile(r"[>#]\s*$")
@@ -295,8 +309,10 @@ class CliSession:
                         self._proc.stdout.read(4096), timeout=min(remaining, 1.0))
                 except asyncio.TimeoutError:
                     # buf is the current (only) partial line; the end-anchored
-                    # prompt regex on its tail == the old whole-last-line check.
-                    if buf and _PROMPT_RE.search(buf[-_PROMPT_TAIL:]):
+                    # prompt regex on its ANSI-stripped tail == the old
+                    # whole-last-line check, but tolerant of a cursor-positioned
+                    # prompt.
+                    if buf and _PROMPT_RE.search(_ANSI_RE.sub("", buf[-_PROMPT_TAIL:])):
                         break
                     # Nothing yet from the device — actively re-nudge (bounded,
                     # via on_idle) to elicit a switch that only renders its
@@ -324,7 +340,19 @@ class CliSession:
                 # full timeout and the device shows "unreachable". Strip the
                 # marker so it can't truncate/pollute parsed output, then keep
                 # reading toward the prompt.
-                if _PAGER_RE.search(window) or _CONTINUE_RE.search(window):
+                # A DSR cursor-position request (ESC[6n) blocks the switch until
+                # answered — reply with a 24x80 position so it proceeds to render
+                # the prompt. Strip the marker from the buffer (it's a control
+                # query, not output) and keep reading. Checked FIRST because it
+                # gates everything after the banner on a full-screen AOS-S CLI.
+                if _DSR_RE.search(window):
+                    try:
+                        self._proc.stdin.write(_DSR_REPLY)
+                    except Exception:
+                        pass
+                    buf = buf[:keep] + _DSR_RE.sub("", window)
+                    deadline = loop.time() + timeout  # keep reading toward the prompt
+                elif _PAGER_RE.search(window) or _CONTINUE_RE.search(window):
                     try:
                         self._proc.stdin.write(" ")
                     except Exception:
@@ -335,12 +363,14 @@ class CliSession:
                     buf += chunk
                 # Prompt check on the LAST line only (same semantics as the old
                 # splitlines()[-1].rstrip() over the whole buffer, but bounded).
+                # ANSI-strip the candidate line so a cursor-positioned prompt
+                # (ESC[24;1HDIST-SW# ) still matches the end-anchored regex.
                 tail = buf[-_PROMPT_TAIL:]
                 if tail.endswith("\n"):
                     tail = tail[:-1]
                     if tail.endswith("\r"):
                         tail = tail[:-1]
-                last_line = tail[tail.rfind("\n") + 1:]
+                last_line = _ANSI_RE.sub("", tail[tail.rfind("\n") + 1:])
                 if last_line and _PROMPT_RE.search(last_line.rstrip()):
                     out.append(buf)
                     return "".join(out)
@@ -360,6 +390,10 @@ class CliSession:
         stripped)."""
         await self._send(command)
         raw = await self._read_until_prompt(timeout=self.command_timeout)
+        # Strip ANSI/VT100 control sequences first: a full-screen AOS-S CLI
+        # wraps output in cursor-move / scroll-region / clear escapes that would
+        # otherwise pollute the parsed serial/MAC/hostname datums.
+        raw = _ANSI_RE.sub("", raw)
         # Strip the echoed command line (first line) if present.
         text = raw
         if command in text:

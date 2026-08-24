@@ -203,6 +203,41 @@ def test_read_answers_press_any_key_split_across_chunk_boundary():
     assert res.endswith("DIST-SW# ")
 
 
+def test_read_answers_dsr_cursor_position_request():
+    # A full-screen AOS-S CLI auto-detects terminal size by parking the cursor
+    # off-screen and issuing a DSR (ESC[6n). It BLOCKS on the reply before it
+    # renders the CLI prompt; _read_until_prompt must answer with a cursor-
+    # position report so the switch proceeds — otherwise it stalls the whole
+    # timeout after the banner and shows "unreachable" despite a good login.
+    banner = ("Your previous successful login (as manager) was on ...\n"
+              " from 172.16.1.9\r\n\x1b[1920;1920H\x1b[6n")
+    prompt = "\x1b[24;1HDIST-SW# "
+    s = _reader_session([banner, prompt])
+    res = _read(s)
+    assert cli_io._DSR_REPLY in s._proc.stdin.writes  # answered the DSR query
+    assert "\x1b[6n" not in res                        # DSR marker stripped
+    assert res.rstrip().endswith("DIST-SW#")           # prompt reached
+
+
+def test_read_prompt_detected_through_ansi_cursor_positioning():
+    # A switch that cursor-positions its prompt (ESC[24;1H before "DIST-SW# ")
+    # must still be detected — the prompt check ANSI-strips the candidate line.
+    s = _reader_session(["\x1b[2J\x1b[24;1HDIST-SW# "])
+    res = _read(s)
+    assert res.endswith("DIST-SW# ")
+
+
+def test_read_answers_dsr_split_across_chunk_boundary():
+    # ESC[6n split across a chunk boundary is still caught by the overlap window.
+    part1 = "banner text\r\n\x1b[1920;1920H\x1b"
+    part2 = "[6nmore\n\x1b[24;1HDIST-SW# "
+    s = _reader_session([part1, part2])
+    res = _read(s)
+    assert cli_io._DSR_REPLY in s._proc.stdin.writes
+    assert "\x1b[6n" not in res
+    assert res.rstrip().endswith("DIST-SW#")
+
+
 def test_read_prompt_on_complete_final_line():
     # A prompt followed by a newline (complete last line) must still terminate
     # the read immediately — the old splitlines()[-1] semantics.
