@@ -321,12 +321,23 @@ class NwSpoke(BaseSpoke):
 
     async def get_status(self) -> Dict[str, Any]:
         """Native LM status report for the nw fleet."""
-        return {
+        status = {
             "spoke_id": self.spoke_id,
             "module": "nw",
             "device_count": len(self.engine.devices),
             "connection": "CONNECTED",
         }
+        # Surface the learned per-device connection profiles (prompt / paging /
+        # login gates / banner fingerprint) so the record of how we reach each
+        # device is visible without a code/log dig. Best-effort.
+        try:
+            from transports import device_profile
+            profiles = device_profile.store().all()
+            if profiles:
+                status["device_profiles"] = profiles
+        except Exception:  # noqa: BLE001 — status must not fail on profiling
+            pass
+        return status
 
     def get_version(self) -> str:
         """Current nw module version (repo-root VERSION).

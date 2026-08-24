@@ -19,6 +19,7 @@ from typing import Any, Dict, List
 import heartbeat
 
 from .vtscreen import TerminalScreen
+from . import device_profile
 
 logger = logging.getLogger("NwCli")
 
@@ -95,12 +96,15 @@ class CliSession:
         self.password = str(d.get("password") or "")
         self.enable_secret = str(d.get("enable_secret") or "")
         self.object_type = str(d.get("object_type") or "").strip()
+        self.device_id = str(d.get("id") or "")
         if not self.host or not self.username:
             raise CliError("device address/username not configured")
         self.command_timeout = command_timeout
         self._conn = None
         self._proc = None
         self._term = None      # shadow VT100 emulator for generic query replies
+        self._gates: set = set()   # login gates observed this connect (profile)
+        self._last_prompt = ""     # most recently detected prompt line (profile)
         self._banner = ""      # login banner / first output (captured for debug)
 
     async def __aenter__(self):
@@ -166,6 +170,8 @@ class CliSession:
                                                       term_size=(80, 24),
                                                       encoding="utf-8")
         heartbeat.beat()  # progress: interactive PTY open
+        self._gates = set()      # fresh gate observations for this connect
+        self._last_prompt = ""
         try:
             # Nudge with a bare CR before reading the banner. AOS-S prints a
             # multi-line copyright / RESTRICTED-RIGHTS legend after login and
@@ -229,6 +235,19 @@ class CliSession:
                 await self._read_until_prompt()
                 await self._send(self.enable_secret)
                 await self._read_until_prompt()
+            # Connect succeeded — record what it took to reach this device
+            # (prompt, paging command, login gates seen, a fingerprint of the
+            # login banner) so we have a durable, per-device connection profile
+            # and can flag when it changes (e.g. a T&C banner is added later).
+            # Best-effort: profiling must never break a good connect.
+            try:
+                device_profile.record(
+                    address=self.host, device_id=self.device_id,
+                    object_type=self.object_type, prompt=self._last_prompt,
+                    paging_cmd=_PAGING_CMD.get(self.object_type, "") or "",
+                    gates=sorted(self._gates), banner=self._banner)
+            except Exception:  # noqa: BLE001 — never fail connect on profiling
+                pass
         except BaseException:
             # CRITICAL: connect() runs inside __aenter__; if it raises here,
             # __aexit__ (hence close()) never fires — so without this the
@@ -361,6 +380,8 @@ class CliSession:
                     # whole-last-line check, but tolerant of a cursor-positioned
                     # prompt.
                     if buf and _PROMPT_RE.search(_ANSI_RE.sub("", buf[-_PROMPT_TAIL:])):
+                        self._last_prompt = _ANSI_RE.sub(
+                            "", buf[-_PROMPT_TAIL:]).rstrip().rsplit("\n", 1)[-1]
                         break
                     # Nothing yet from the device — actively re-nudge (bounded,
                     # via on_idle) to elicit a switch that only renders its
@@ -400,6 +421,12 @@ class CliSession:
                 # on a full-screen AOS-S CLI.
                 if _QUERY_RE.search(window):
                     self._flush_term_replies()
+                    # Record which terminal probe(s) the device blocked on, for
+                    # the connection profile.
+                    if re.search(r"\x1b\[[0-9]*n", window):
+                        self._gates.add("dsr_probe")
+                    if re.search(r"\x1b\[[0-9]*c", window):
+                        self._gates.add("da_probe")
                     buf = buf[:keep] + _QUERY_RE.sub("", window)
                     deadline = loop.time() + timeout  # keep reading toward the prompt
                 elif _PAGER_RE.search(window) or _CONTINUE_RE.search(window):
@@ -407,6 +434,10 @@ class CliSession:
                         self._proc.stdin.write(" ")
                     except Exception:
                         pass
+                    if _CONTINUE_RE.search(window):
+                        self._gates.add("press_any_key")
+                    if _PAGER_RE.search(window):
+                        self._gates.add("pager")
                     buf = buf[:keep] + _CONTINUE_RE.sub("", _PAGER_RE.sub("", window))
                     deadline = loop.time() + timeout  # keep reading further pages
                 else:
@@ -422,6 +453,7 @@ class CliSession:
                         tail = tail[:-1]
                 last_line = _ANSI_RE.sub("", tail[tail.rfind("\n") + 1:])
                 if last_line and _PROMPT_RE.search(last_line.rstrip()):
+                    self._last_prompt = last_line.rstrip()
                     out.append(buf)
                     return "".join(out)
                 # Drain complete lines; keep only the trailing partial line so
