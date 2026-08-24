@@ -1106,6 +1106,16 @@ class NwEngine:
         logger.info("nw poll %s -> status=%s reachable=%s interfaces=%d arp=%d "
                     "mac=%d errors=%d", getattr(drv, "address", ""), status,
                     reachable, n_if, n_arp, n_mac, len(errors))
+        if errors:
+            # A reachable-but-PARTIAL poll (one or more sub-datums failed) must
+            # also raise the aggregate at ERROR so it lands in the hub's
+            # GET_ERROR_LOGS / Error Log tab with the actual failure text — the
+            # per-datum ERROR lines live in the spoke log, but the operator who
+            # sees "errors=1" in the Poll Now result needs the "what" surfaced
+            # in one place without a spoke-log dig.
+            logger.error("nw poll %s -> %d error(s): %s",
+                         getattr(drv, "address", ""), len(errors),
+                         "; ".join(errors))
         return {
             "status": status,
             "data": {

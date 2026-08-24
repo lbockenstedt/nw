@@ -179,20 +179,24 @@ class CliSession:
                 if self._nudges_left <= 0:
                     return
                 self._nudges_left -= 1
-                # Short, high-signal diagnostic (survives fleet-guard
-                # cancellation, unlike the post-read banner log): shows the
-                # switch is still mute and we're actively re-nudging.
-                logger.info("cli %s: banner still silent, re-nudge #%d (CR)",
-                            self.host, 6 - self._nudges_left)
+                # DEBUG-only re-nudge trace: the CR-nudge banner handshake is
+                # locked in for AOS-S, so this is no longer worth an INFO line on
+                # every connect — kept at debug for opt-in troubleshooting.
+                logger.debug("cli %s: banner still silent, re-nudge #%d (CR)",
+                             self.host, 6 - self._nudges_left)
                 try:
                     self._proc.stdin.write("\r")
                 except Exception as e:  # noqa: BLE001 — channel may already be closed
-                    logger.info("cli %s: re-nudge write failed: %r", self.host, e)
+                    logger.debug("cli %s: re-nudge write failed: %r", self.host, e)
 
             self._banner = await self._read_until_prompt(on_idle=_renudge)  # banner / first output
             if self._banner.strip():
-                logger.info("cli %s: login banner/first output (%d bytes): %r",
-                            self.host, len(self._banner), self._banner[-500:])
+                # The raw login banner / VT100 session content is only useful
+                # while bringing up a new device transport; now that the AOS-S
+                # handshake is locked in, keep it at debug so it no longer dumps
+                # SSH connection content into the normal (INFO) spoke log.
+                logger.debug("cli %s: login banner/first output (%d bytes): %r",
+                             self.host, len(self._banner), self._banner[-500:])
             # A device that accepts the login but tears the session down right
             # after — restricted role, no CLI-exec privilege, no PTY, or (AOS-S)
             # "maximum number of sessions are active" — shows up as an already-
