@@ -25,6 +25,7 @@ except ImportError:
     from messaging.control_plane import BaseControlPlane
 from nw_spoke import NwSpoke
 from nw_engine import _norm_mac
+from nw_poll_scheduler import plan_poll_tick, POLL_MAX_CONCURRENCY
 
 try:
     from logging_setup import configure_logging
@@ -66,11 +67,10 @@ class NwControlPlane(BaseControlPlane):
         super().__init__(spoke_id, secret, hub_secret, hub_url)
         self.module_type = "nw"
 
-    # Poll-loop tick granularity + per-device interval floor (seconds). The
-    # cadence itself is per-device (``poll_interval`` on each nw_devices entry);
-    # these bound the scheduler, not the user's choice.
+    # Poll-loop tick granularity + default cadence. The per-device cadence lives
+    # on each nw_devices entry (``poll_interval``); the scheduler bounds
+    # (floor / per-tick cap / jitter / concurrency) live in nw_poll_scheduler.
     _NW_POLL_TICK = 10
-    _NW_POLL_FLOOR = 30
     # Default cadence when a device has no poll_interval set at all. An explicit
     # 0 (the UI "Off" choice) disables; only an absent/blank value defaults.
     _NW_POLL_DEFAULT = 900  # 15 minutes
@@ -97,10 +97,13 @@ class NwControlPlane(BaseControlPlane):
         elapsed, pushing the result to the hub (``NW_POLL_RESULT``) so the hub
         warms its per-device cache — every sub-view (info/arp/macs/interfaces/
         endpoints/vlans) then loads instantly instead of blocking on a live
-        SSH round-trip. ``poll_interval`` ≤ 0 / absent = disabled. Intervals are
-        floored to ``_NW_POLL_FLOOR`` to avoid hammering a device. A newly-seen
-        device is scheduled (not polled immediately) so a fleet reload staggers
-        rather than stampedes."""
+        SSH round-trip. ``poll_interval`` ≤ 0 / absent = disabled.
+
+        Anti-stampede (so a 100-device fleet never polls all at once): the
+        scheduling in ``nw_poll_scheduler.plan_poll_tick`` jitters every
+        (re)schedule and caps how many devices dispatch per tick, and this loop
+        caps how many run **concurrently** via a semaphore (``max_poll_concurrency``
+        from module config, else ``POLL_MAX_CONCURRENCY``)."""
         next_due: Dict[str, float] = {}
         while True:
             await asyncio.sleep(self._NW_POLL_TICK)
@@ -109,43 +112,28 @@ class NwControlPlane(BaseControlPlane):
                 engine = getattr(module, "engine", None)
                 if engine is None or getattr(self, "_hub_ws", None) is None:
                     continue
+                mod_cfg = getattr(module, "config", {}) or {}
                 # Module-level default cadence (pushed via UPDATE_CONFIG); a
                 # device with no poll_interval inherits it, else the 15m built-in.
-                mod_raw = (getattr(module, "config", {}) or {}).get("default_poll_interval")
+                mod_raw = mod_cfg.get("default_poll_interval")
                 try:
                     module_default = (self._NW_POLL_DEFAULT
                                       if mod_raw in (None, "") else int(mod_raw))
                 except (TypeError, ValueError):
                     module_default = self._NW_POLL_DEFAULT
                 now = time.monotonic()
-                due, seen = [], set()
-                for d in list(engine.devices):
-                    did = d.get("id")
-                    if not did:
-                        continue
-                    seen.add(did)
-                    raw = d.get("poll_interval")
-                    if raw is None or raw == "":
-                        interval = module_default          # inherit module default
-                    else:
-                        try:
-                            interval = int(raw)            # device wins (incl 0=Off)
-                        except (TypeError, ValueError):
-                            interval = module_default
-                    if interval <= 0:                       # explicit Off
-                        next_due.pop(did, None)
-                        continue
-                    interval = max(interval, self._NW_POLL_FLOOR)
-                    deadline = next_due.get(did)
-                    if deadline is None:          # first sight → stagger
-                        next_due[did] = now + interval
-                    elif now >= deadline:
-                        next_due[did] = now + interval
-                        due.append(did)
-                for gone in set(next_due) - seen:  # prune removed devices
-                    next_due.pop(gone, None)
+                due = plan_poll_tick(list(engine.devices), next_due, now,
+                                     module_default)
                 if due:
-                    sem = asyncio.Semaphore(3)
+                    # Concurrency ceiling — how many devices may poll at the same
+                    # time. Operator-tunable via module config; clamped to sane
+                    # bounds so a bad value can't unleash or stall the fleet.
+                    try:
+                        conc = int(mod_cfg.get("max_poll_concurrency"))
+                    except (TypeError, ValueError):
+                        conc = POLL_MAX_CONCURRENCY
+                    conc = max(1, min(conc, 50))
+                    sem = asyncio.Semaphore(conc)
 
                     async def _one(device_id):
                         async with sem:
