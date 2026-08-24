@@ -238,6 +238,33 @@ def test_read_answers_dsr_split_across_chunk_boundary():
     assert res.rstrip().endswith("DIST-SW#")
 
 
+def test_read_dsr_reply_is_generic_actual_cursor_position():
+    # The reply is computed from the REAL cursor the device parked at, not a
+    # hard-coded constant: a device that parks at row 10 col 20 before the DSR
+    # gets ESC[10;20R (not ESC[24;80R). Proves the emulator-driven generalization.
+    banner = "prep\r\n\x1b[10;20H\x1b[6n"
+    prompt = "\x1b[24;1HSW# "
+    s = _reader_session([banner, prompt])
+    res = _read(s)
+    assert "\x1b[10;20R" in s._proc.stdin.writes
+    assert "\x1b[6n" not in res
+    assert res.rstrip().endswith("SW#")
+
+
+def test_read_answers_primary_da_query():
+    # A device that asks "what terminal are you?" (Primary DA, ESC[c) and blocks
+    # is answered generically with a terminal id; the query is stripped from the
+    # captured output.
+    banner = "hi\r\n\x1b[c"
+    prompt = "\nSW# "
+    s = _reader_session([banner, prompt])
+    res = _read(s)
+    from transports.vtscreen import DA_REPLY
+    assert DA_REPLY in s._proc.stdin.writes
+    assert "\x1b[c" not in res
+    assert res.rstrip().endswith("SW#")
+
+
 def test_read_prompt_on_complete_final_line():
     # A prompt followed by a newline (complete last line) must still terminate
     # the read immediately — the old splitlines()[-1] semantics.

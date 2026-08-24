@@ -18,6 +18,8 @@ from typing import Any, Dict, List
 
 import heartbeat
 
+from .vtscreen import TerminalScreen
+
 logger = logging.getLogger("NwCli")
 
 
@@ -49,10 +51,22 @@ _CONTINUE_RE = re.compile(r"press any key to continue", re.IGNORECASE)
 # terminal answers ESC[<row>;<col>R; the switch BLOCKS on that answer before it
 # renders the CLI prompt. asyncssh doesn't emulate a terminal, so unanswered the
 # switch sits mute after the banner and the prompt read stalls its whole budget
-# (device shows "unreachable" even though the login succeeded). Detect the DSR
-# and reply with a plausible 24x80 position so the switch proceeds to the prompt.
+# (device shows "unreachable" even though the login succeeded).
+#
+# We answer these queries GENERICALLY via a small VT100 emulator (``vtscreen``):
+# it tracks the real cursor as the stream is processed and replies to a DSR with
+# the ACTUAL (clamped) cursor position, and to a Primary DA (ESC[c) with a
+# terminal id — no per-device hard-coded reply. ``_QUERY_RE`` matches the query
+# bytes so they can be scrubbed from the captured output (they're control
+# queries, not device output). ``_DSR_REPLY`` is the reply for a cursor parked at
+# the bottom-right of an 80x24 screen (the common auto-size probe) — retained as
+# a named constant for tests / documentation; the live reply is computed.
 _DSR_RE = re.compile(r"\x1b\[6n")
 _DSR_REPLY = "\x1b[24;80R"
+# Terminal queries the device may issue and block on: DSR (ESC[<n>n) and Primary
+# DA (ESC[<n>c). Matched so we can strip them from the captured output after the
+# emulator has answered them.
+_QUERY_RE = re.compile(r"\x1b\[[0-9]*n|\x1b\[[0-9]*c")
 # Strip ANSI/VT100 control sequences (CSI ... final-byte) so prompt detection
 # and parsed output aren't defeated by a switch that cursor-positions its prompt
 # (ESC[24;1HDIST-SW# ) or wraps output in scroll-region / clear-screen escapes.
@@ -86,6 +100,7 @@ class CliSession:
         self.command_timeout = command_timeout
         self._conn = None
         self._proc = None
+        self._term = None      # shadow VT100 emulator for generic query replies
         self._banner = ""      # login banner / first output (captured for debug)
 
     async def __aenter__(self):
@@ -267,6 +282,22 @@ class CliSession:
         except Exception:
             pass
 
+    def _flush_term_replies(self) -> bool:
+        """Write any host-bound replies the shadow emulator queued in answer to
+        a device terminal query (DSR cursor-position report, DA). Returns True if
+        anything was written. Best-effort: a closed channel is ignored."""
+        term = getattr(self, "_term", None)
+        if term is None:
+            return False
+        data = term.pending_replies()
+        if not data:
+            return False
+        try:
+            self._proc.stdin.write(data)
+        except Exception:  # noqa: BLE001 — channel may already be closed
+            pass
+        return True
+
     async def _send(self, line: str) -> None:
         try:
             self._proc.stdin.write(line + "\n")
@@ -301,6 +332,13 @@ class CliSession:
         # Invariant: between iterations buf holds only the trailing partial
         # line (no newline) — complete lines are drained below.
         buf = ""
+        # Shadow VT100 emulator: fed the raw stream so it can answer any
+        # terminal query the device blocks on (DSR cursor-position, DA) with a
+        # GENERIC, correct reply computed from the real cursor — replacing the
+        # old hard-coded ESC[24;80R. The captured output stays the raw device
+        # bytes (below); the emulator is used only for its query replies.
+        term = TerminalScreen(cols=80, rows=24)
+        self._term = term
         try:
             loop = asyncio.get_event_loop()
             deadline = loop.time() + timeout
@@ -312,6 +350,12 @@ class CliSession:
                     chunk = await asyncio.wait_for(
                         self._proc.stdout.read(4096), timeout=min(remaining, 1.0))
                 except asyncio.TimeoutError:
+                    # A query may have arrived just before the device went quiet
+                    # (it's now blocked waiting for our reply) — flush any the
+                    # emulator queued so the session can proceed.
+                    if self._flush_term_replies():
+                        deadline = loop.time() + timeout
+                        continue
                     # buf is the current (only) partial line; the end-anchored
                     # prompt regex on its ANSI-stripped tail == the old
                     # whole-last-line check, but tolerant of a cursor-positioned
@@ -328,6 +372,9 @@ class CliSession:
                 if not chunk:
                     break
                 heartbeat.beat()  # progress: bytes arrived from the device
+                # Feed the shadow emulator so it can answer any terminal query
+                # this chunk carried (DSR/DA) generically — see below.
+                term.feed(chunk)
                 # If paging is still on despite `no page`, advance the pager (send
                 # a space) and strip the marker so output isn't truncated/polluted.
                 # Scan only the newest chunk + a small overlap — older text was
@@ -344,17 +391,16 @@ class CliSession:
                 # full timeout and the device shows "unreachable". Strip the
                 # marker so it can't truncate/pollute parsed output, then keep
                 # reading toward the prompt.
-                # A DSR cursor-position request (ESC[6n) blocks the switch until
-                # answered — reply with a 24x80 position so it proceeds to render
-                # the prompt. Strip the marker from the buffer (it's a control
-                # query, not output) and keep reading. Checked FIRST because it
-                # gates everything after the banner on a full-screen AOS-S CLI.
-                if _DSR_RE.search(window):
-                    try:
-                        self._proc.stdin.write(_DSR_REPLY)
-                    except Exception:
-                        pass
-                    buf = buf[:keep] + _DSR_RE.sub("", window)
+                # Terminal queries (DSR cursor-position ESC[6n, DA ESC[c) block
+                # the switch until answered. The emulator computed the correct
+                # reply from the REAL cursor as it processed this chunk above;
+                # flush it, then strip the query bytes from the captured output
+                # (they're control queries, not device output) and keep reading.
+                # Checked FIRST because the DSR gates everything after the banner
+                # on a full-screen AOS-S CLI.
+                if _QUERY_RE.search(window):
+                    self._flush_term_replies()
+                    buf = buf[:keep] + _QUERY_RE.sub("", window)
                     deadline = loop.time() + timeout  # keep reading toward the prompt
                 elif _PAGER_RE.search(window) or _CONTINUE_RE.search(window):
                     try:
