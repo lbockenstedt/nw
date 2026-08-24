@@ -908,7 +908,7 @@ async def cli_get_device_info(session: CliSession, object_type: str) -> dict:
         getattr(session, "_last_prompt", ""))
     return {"model": _first_hw_token(text), "serial": _serial_from(text),
             "firmware": _firmware_from(text), "os": os_name, "hostname": hostname,
-            "interfaces_count": 0}
+            "mac": _base_mac_from(text), "interfaces_count": 0}
 
 
 async def cli_get_arp(session: CliSession, object_type: str) -> List[dict]:
@@ -1072,6 +1072,25 @@ def _serial_from(text: str) -> str:
     m = re.search(r"(?:Serial|S/N|Serial Number)\s*[:#]\s*(\S+)", text or "",
                   re.IGNORECASE)
     return m.group(1) if m else ""
+
+
+def _base_mac_from(text: str) -> str:
+    """Best-effort chassis/base MAC from an ``info`` show command — the
+    'Base MAC Addr' (AOS-S ``show system-information``), 'System MAC' /
+    'MAC Address' (AOS-CX / gateway) field. Accepts Aruba dash form
+    ``3863bb-a1b2c3``, colon, or dot form; normalized to lower colon-form
+    ``38:63:bb:a1:b2:c3``. Empty when absent — helps operators positively ID
+    the physical box alongside the serial number."""
+    m = re.search(
+        r"(?im)^\s*(?:base\s*mac(?:\s*addr(?:ess)?)?|system\s*mac|mac\s*address)"
+        r"\s*[:=]\s*([0-9A-Fa-f][0-9A-Fa-f:.\-]{10,})",
+        text or "")
+    if not m:
+        return ""
+    hexes = re.sub(r"[^0-9a-f]", "", m.group(1).lower())
+    if len(hexes) == 12:
+        return ":".join(hexes[i:i + 2] for i in range(0, 12, 2))
+    return m.group(1).strip()
 
 
 def _firmware_from(text: str) -> str:

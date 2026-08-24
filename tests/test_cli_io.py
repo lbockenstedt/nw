@@ -112,6 +112,17 @@ def test_hostname_from_text_system_name():
     assert cli_io._hostname_from_text("Model: 6300M\nVersion 10.09") == ""
 
 
+def test_base_mac_from_extractors():
+    # AOS-S `show system-information` prints 'Base MAC Addr' in Aruba dash form.
+    aos = "  Software revision  : WC.16.10\n  Base MAC Addr      : 3863bb-a1b2c3\n"
+    assert cli_io._base_mac_from(aos) == "38:63:bb:a1:b2:c3"
+    # AOS-CX / gateway spellings + colon form also normalize.
+    assert cli_io._base_mac_from("System MAC : 38:63:bb:a1:b2:c3") == "38:63:bb:a1:b2:c3"
+    assert cli_io._base_mac_from("MAC Address: 3863.bba1.b2c3") == "38:63:bb:a1:b2:c3"
+    # No such line → empty.
+    assert cli_io._base_mac_from("System Name : DIST-SW") == ""
+
+
 def test_hostname_from_prompt_token():
     assert cli_io._hostname_from_prompt("DIST-SW# ") == "DIST-SW"
     assert cli_io._hostname_from_prompt("DIST-SW> ") == "DIST-SW"

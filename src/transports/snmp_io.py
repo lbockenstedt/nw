@@ -345,6 +345,7 @@ async def snmp_get_device_info(session: SnmpSession) -> dict:
         "serial": "",  # serial via ENTITY-MIB entPhysicalSerialNum — not walked
         "firmware": descr,
         "hostname": str(sysname or "").strip(),  # sysName IS the configured hostname
+        "mac": "",  # base MAC via BRIDGE-MIB dot1dBaseBridgeAddress — not walked
         "interfaces_count": ifnum_i,
     }
 
