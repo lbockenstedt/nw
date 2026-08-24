@@ -73,7 +73,7 @@ class NwControlPlane(BaseControlPlane):
     _NW_POLL_TICK = 10
     # Default cadence when a device has no poll_interval set at all. An explicit
     # 0 (the UI "Off" choice) disables; only an absent/blank value defaults.
-    _NW_POLL_DEFAULT = 900  # 15 minutes
+    _NW_POLL_DEFAULT = 21600  # 6 hours
 
     async def run_hub_mode(self):
         """Native LM Spoke behavior."""
