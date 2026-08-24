@@ -25,7 +25,9 @@ except ImportError:
     from messaging.control_plane import BaseControlPlane
 from nw_spoke import NwSpoke
 from nw_engine import _norm_mac
-from nw_poll_scheduler import plan_poll_tick, POLL_MAX_CONCURRENCY
+from nw_poll_scheduler import (
+    plan_poll_tick, POLL_MAX_CONCURRENCY, POLL_MAX_PER_TICK, POLL_JITTER_FRAC,
+)
 
 try:
     from logging_setup import configure_logging
@@ -122,8 +124,23 @@ class NwControlPlane(BaseControlPlane):
                 except (TypeError, ValueError):
                     module_default = self._NW_POLL_DEFAULT
                 now = time.monotonic()
+                # Anti-stampede knobs — operator-tunable via module config
+                # (Setup → Module Management), each clamped to a safe range so a
+                # bad value can't defeat the protection. Jitter fraction spreads
+                # (re)schedules; per-tick cap bounds how many dispatch at once.
+                try:
+                    jf = float(mod_cfg.get("poll_jitter_frac"))
+                except (TypeError, ValueError):
+                    jf = POLL_JITTER_FRAC
+                jf = max(0.0, min(jf, 0.9))
+                try:
+                    mpt = int(mod_cfg.get("max_poll_per_tick"))
+                except (TypeError, ValueError):
+                    mpt = POLL_MAX_PER_TICK
+                mpt = max(1, min(mpt, 100))
                 due = plan_poll_tick(list(engine.devices), next_due, now,
-                                     module_default)
+                                     module_default,
+                                     max_per_tick=mpt, jitter_frac=jf)
                 if due:
                     # Concurrency ceiling — how many devices may poll at the same
                     # time. Operator-tunable via module config; clamped to sane
