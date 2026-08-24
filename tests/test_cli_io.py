@@ -337,7 +337,7 @@ def test_connect_nudges_with_cr_before_banner_read():
             sys.modules["asyncssh"] = prev
         else:
             del sys.modules["asyncssh"]
-    assert proc.stdin.writes and proc.stdin.writes[0] == "\n", \
+    assert proc.stdin.writes and proc.stdin.writes[0] == "\r", \
         "connect() must send a CR nudge before reading the banner"
 
 

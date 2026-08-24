@@ -128,7 +128,13 @@ class CliSession:
         except Exception as e:
             raise CliError(f"SSH connect to {self.host}: {e}")
         heartbeat.beat()  # progress: TCP+auth done
+        # Request a REAL terminal size (80x24), not asyncssh's default 0x0 PTY.
+        # openssh always negotiates a concrete window size; some AOS-S switches
+        # won't render/paginate their post-login banner into a 0x0 terminal and
+        # sit mute — which stalls the banner read past the fleet idle-guard and
+        # makes a perfectly reachable switch (e.g. DIST-SW) show "unreachable".
         self._proc = await self._conn.create_process(term_type="vt100",
+                                                      term_size=(80, 24),
                                                       encoding="utf-8")
         heartbeat.beat()  # progress: interactive PTY open
         try:
@@ -138,11 +144,14 @@ class CliSession:
             # prompt-anchored read would otherwise stall the FULL timeout on
             # every connect — wasting ~12s per session and failing the 3s fleet
             # reachability probe (the device shows "unreachable" even though its
-            # datums fetch fine). A CR is harmless on devices that already show
-            # a prompt (it just reprints it) and answers any "Press any key to
-            # continue" gate. Best-effort: a closed channel is caught below.
+            # datums fetch fine). Use "\r" (CR) — the byte a real terminal sends
+            # on Enter over a PTY; "\n" (LF) is NOT what the switch's line
+            # discipline expects and can be ignored. A CR is harmless on devices
+            # that already show a prompt (it just reprints it) and answers any
+            # "Press any key to continue" gate. Best-effort: a closed channel is
+            # caught below.
             try:
-                self._proc.stdin.write("\n")
+                self._proc.stdin.write("\r")
             except Exception:  # noqa: BLE001 — channel may already be closed
                 pass
             # Bounded re-nudge: some AOS-S switches only emit the banner/prompt
@@ -156,10 +165,15 @@ class CliSession:
                 if self._nudges_left <= 0:
                     return
                 self._nudges_left -= 1
+                # Short, high-signal diagnostic (survives fleet-guard
+                # cancellation, unlike the post-read banner log): shows the
+                # switch is still mute and we're actively re-nudging.
+                logger.info("cli %s: banner still silent, re-nudge #%d (CR)",
+                            self.host, 6 - self._nudges_left)
                 try:
-                    self._proc.stdin.write("\n")
-                except Exception:  # noqa: BLE001 — channel may already be closed
-                    pass
+                    self._proc.stdin.write("\r")
+                except Exception as e:  # noqa: BLE001 — channel may already be closed
+                    logger.info("cli %s: re-nudge write failed: %r", self.host, e)
 
             self._banner = await self._read_until_prompt(on_idle=_renudge)  # banner / first output
             if self._banner.strip():
