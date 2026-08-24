@@ -344,6 +344,7 @@ async def snmp_get_device_info(session: SnmpSession) -> dict:
         "model": model,
         "serial": "",  # serial via ENTITY-MIB entPhysicalSerialNum — not walked
         "firmware": descr,
+        "hostname": str(sysname or "").strip(),  # sysName IS the configured hostname
         "interfaces_count": ifnum_i,
     }
 

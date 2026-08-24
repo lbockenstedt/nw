@@ -102,6 +102,29 @@ def test_serial_and_firmware_extractors():
     assert "16.02.0023" == cli_io._firmware_from(text)
 
 
+def test_hostname_from_text_system_name():
+    # AOS-S `show system-information` prints a 'System Name' field.
+    text = "System Information\n  System Name : DIST-SW\n  System Contact :"
+    assert cli_io._hostname_from_text(text) == "DIST-SW"
+    # 'Hostname'/'Host Name' spellings also match.
+    assert cli_io._hostname_from_text("Hostname: core-sw01") == "core-sw01"
+    # No such line → empty (caller falls back to the prompt token).
+    assert cli_io._hostname_from_text("Model: 6300M\nVersion 10.09") == ""
+
+
+def test_hostname_from_prompt_token():
+    assert cli_io._hostname_from_prompt("DIST-SW# ") == "DIST-SW"
+    assert cli_io._hostname_from_prompt("DIST-SW> ") == "DIST-SW"
+    # Config-mode suffix is stripped.
+    assert cli_io._hostname_from_prompt("DIST-SW(config)# ") == "DIST-SW"
+    assert cli_io._hostname_from_prompt("DIST-SW(config-if)# ") == "DIST-SW"
+    # ANSI-decorated prompt + multi-line: last clean line wins.
+    assert cli_io._hostname_from_prompt("\x1b[1;1Hbanner line\nCORE-1# ") == "CORE-1"
+    # Whitespace/banner noise (no clean single token) → empty.
+    assert cli_io._hostname_from_prompt("Press any key to continue") == ""
+    assert cli_io._hostname_from_prompt("") == ""
+
+
 # ── _read_until_prompt: linear tail-window reader (FIX B) ─────────────────────
 import asyncio  # noqa: E402
 import time  # noqa: E402

@@ -901,8 +901,14 @@ async def cli_get_device_info(session: CliSession, object_type: str) -> dict:
     _os_m = re.search(r"\b(ArubaOS-CX|ArubaOS|AOS-CX|AOS-S|JUNOS|Junos)\b", text or "", re.IGNORECASE)
     os_name = _os_m.group(1) if _os_m else {"gateway": "ArubaOS", "cx_switch": "ArubaOS-CX",
                                             "aos_switch": "AOS-S", "ex_switch": "Junos"}.get(object_type, "")
+    # Configured hostname (system name) so the hub can reconcile the stored NW
+    # Devices display name to what's actually set on the box: prefer the info
+    # command's 'System Name' field, fall back to the live CLI prompt token.
+    hostname = _hostname_from_text(text) or _hostname_from_prompt(
+        getattr(session, "_last_prompt", ""))
     return {"model": _first_hw_token(text), "serial": _serial_from(text),
-            "firmware": _firmware_from(text), "os": os_name, "interfaces_count": 0}
+            "firmware": _firmware_from(text), "os": os_name, "hostname": hostname,
+            "interfaces_count": 0}
 
 
 async def cli_get_arp(session: CliSession, object_type: str) -> List[dict]:
@@ -1035,6 +1041,31 @@ async def cli_get_vlans(session: CliSession, object_type: str) -> List[dict]:
 def _first_hw_token(text: str) -> str:
     m = re.search(r"\b([A-Z]{2,4}[-\s]?\d{2,4}[A-Z]*)\b", text or "")
     return m.group(1) if m else ""
+
+
+def _hostname_from_text(text: str) -> str:
+    """Best-effort configured hostname from an ``info`` show command — the
+    'System Name'/'Hostname'/'Name' field AOS-S ``show system-information`` (and
+    friends) print. Empty when no such line is present."""
+    m = re.search(r"(?im)^\s*(?:system name|hostname|host name|name)\s*[:=]\s*(\S+)",
+                  text or "")
+    return m.group(1).strip() if m else ""
+
+
+def _hostname_from_prompt(prompt: str) -> str:
+    """Cross-vendor hostname fallback: the CLI prompt token (the switch renders
+    ``<hostname>#`` / ``<hostname>(config)#``). Strips ANSI, the trailing
+    prompt char, and any ``(config…)`` mode suffix. Rejects a prompt with
+    embedded whitespace (banner noise, not a clean hostname)."""
+    p = _ANSI_RE.sub("", str(prompt or "")).strip()
+    if not p:
+        return ""
+    p = p.splitlines()[-1].strip()
+    p = re.sub(r"[>#]\s*$", "", p).strip()   # drop the prompt char
+    p = re.sub(r"\(.*\)$", "", p).strip()    # drop a (config…) mode suffix
+    if not p or any(c.isspace() for c in p):
+        return ""
+    return p
 
 
 def _serial_from(text: str) -> str:
