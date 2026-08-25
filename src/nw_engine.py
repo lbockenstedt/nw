@@ -24,6 +24,9 @@ hub's POLL NOW path.
 import asyncio
 import logging
 import re
+import shutil
+import sys
+import time
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
@@ -196,6 +199,61 @@ def enrich_vlans(native_rows: Any, endpoints: Any,
 def _err(message: str, data: Any = None) -> Dict[str, Any]:
     return {"status": "ERROR", "data": data if data is not None else [],
             "message": message}
+
+
+async def icmp_ping(host: str, timeout: float = 2.0, count: int = 1) -> Dict[str, Any]:
+    """Unprivileged ICMP reachability check via the system ``ping`` binary.
+
+    Returns ``{"reachable": bool|None, "latency_ms": float|None}``. Never
+    raises. The three-state result is deliberate so the caller can tell a
+    CONFIRMED down (``False``) apart from *couldn't tell* (``None``):
+      * ``False`` — ping ran and the host did not answer (gate the poll).
+      * ``None``  — no ``ping`` binary / spawn error / blank host (UNKNOWN:
+                    fail OPEN, never gate the real poll on a probe we
+                    couldn't run).
+      * ``True``  — host answered; ``latency_ms`` parsed from the reply.
+
+    ``ping`` runs unprivileged on Linux (net.ipv4.ping_group_range) and macOS,
+    so no CAP_NET_RAW / root is needed on the spoke.
+    """
+    if not host:
+        return {"reachable": None, "latency_ms": None}
+    ping_bin = shutil.which("ping")
+    if not ping_bin:
+        return {"reachable": None, "latency_ms": None}
+    to = int(max(1, round(timeout)))
+    # -W is a per-reply wait in SECONDS on Linux/iputils but MILLISECONDS on
+    # BSD/macOS; macOS uses -t for an overall deadline instead.
+    if sys.platform == "darwin":
+        args = [ping_bin, "-c", str(count), "-t", str(to), host]
+    else:
+        args = [ping_bin, "-c", str(count), "-W", str(to), host]
+    proc = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL)
+        out, _ = await asyncio.wait_for(proc.communicate(),
+                                        timeout=to * count + 3)
+    except asyncio.TimeoutError:
+        if proc is not None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+        return {"reachable": False, "latency_ms": None}
+    except Exception:  # noqa: BLE001 - spawn failure -> unknown, fail open
+        return {"reachable": None, "latency_ms": None}
+    reachable = proc.returncode == 0
+    latency_ms = None
+    m = re.search(r"time[=<]\s*([\d.]+)\s*ms",
+                  (out or b"").decode("utf-8", "replace"))
+    if m:
+        try:
+            latency_ms = float(m.group(1))
+        except ValueError:
+            latency_ms = None
+    return {"reachable": reachable, "latency_ms": latency_ms}
 
 
 class _SharedTransportSession:
@@ -640,6 +698,13 @@ class NwEngine:
         # hub's shared-tenant-flag invariant). Empty when the hub hasn't pushed
         # it yet (legacy) → a ``tenant`` filter then matches only own-tenant.
         self.shared_tenant_id: str = ""
+        # Per-device ICMP reachability cache, refreshed by the spoke's 5-min
+        # jittered ping sweep (control_plane._nw_reachability_loop). Maps
+        # device_id -> {"reachable": bool|None, "latency_ms": float|None,
+        # "checked_at": monotonic}. Gates the expensive SNMP/SSH/API poll so a
+        # box confirmed DOWN by a cheap ping isn't hammered with a full
+        # transport poll (each sub-call would just time out).
+        self.reachability: Dict[str, Dict[str, Any]] = {}
 
     def set_devices(self, devices: List[Dict[str, Any]],
                     shared_tenant_id: str = "") -> None:
@@ -762,6 +827,49 @@ class NwEngine:
         return {"status": "SUCCESS", "data": list(rows)}
 
     # ── Per-device passthroughs ─────────────────────────────────────────────
+
+    # ICMP reachability sweep tunables. ``_PING_TIMEOUT_S`` bounds one probe;
+    # ``_REACH_GATE_TTL_S`` is how long a CONFIRMED-down result gates the
+    # transport poll before it's considered stale — a touch longer than the
+    # 5-min ping cadence so a just-missed sweep still gates.
+    _PING_TIMEOUT_S = 2.0
+    _REACH_GATE_TTL_S = 420
+
+    async def ping(self, device_id: str, tenant: Optional[str] = None
+                   ) -> Dict[str, Any]:
+        """Lightweight ICMP-only reachability check for one device, caching the
+        result in ``self.reachability``. Cheap alternative to a full
+        :meth:`probe` (no SSH/SNMP/REST) used by the spoke's periodic sweep to
+        keep fleet up/down fresh and to gate the expensive poll. Returns
+        ``{status, reachable (bool|None), latency_ms}``."""
+        d = self._get_device(device_id, tenant)
+        if not d:
+            logger.warning("nw ping: device %s not in fleet", device_id)
+            return _err(f"Device {device_id} not found")
+        res = await icmp_ping(d.get("address", ""), timeout=self._PING_TIMEOUT_S)
+        self.reachability[device_id] = {
+            "reachable": res.get("reachable"),
+            "latency_ms": res.get("latency_ms"),
+            "checked_at": time.monotonic(),
+        }
+        logger.debug("nw ping %s (%s) -> reachable=%s latency=%sms",
+                     device_id, d.get("address", ""), res.get("reachable"),
+                     res.get("latency_ms"))
+        return {"status": "SUCCESS", "reachable": res.get("reachable"),
+                "latency_ms": res.get("latency_ms")}
+
+    def recently_unreachable(self, device_id: str,
+                             ttl: Optional[float] = None) -> bool:
+        """True iff the last ICMP ping for this device was a CONFIRMED down
+        (``reachable is False``) within ``ttl`` seconds. An UNKNOWN result
+        (ping unavailable) or a stale/absent entry never gates — the poll must
+        fail OPEN so a spoke without a usable ``ping`` binary still polls."""
+        ttl = self._REACH_GATE_TTL_S if ttl is None else ttl
+        r = self.reachability.get(device_id)
+        if not r or r.get("reachable") is not False:
+            return False
+        return (time.monotonic() - float(r.get("checked_at", 0.0))) <= ttl
+
     async def probe(self, device_id: str, tenant: Optional[str] = None) -> Dict[str, Any]:
         drv = self._driver_for(device_id, tenant)
         if not drv:
@@ -1052,6 +1160,28 @@ class NwEngine:
         errors: List[str] = []
         reachable = False
         latency_ms = None
+
+        # ICMP gate: a device the 5-min ping sweep just confirmed DOWN is not
+        # worth a full SSH/SNMP/REST poll — every sub-call would only burn the
+        # 180s deadline timing out. Short-circuit to an UNREACHABLE result (the
+        # same shape a failed-probe poll returns: reachable=False, empty
+        # datums, status=ERROR). The hub's nw_cache_set_poll mirrors datums
+        # only when reachable is truthy, so this preserves last-known-good and
+        # never blanks the UI tabs. UNKNOWN (ping unavailable) does NOT gate.
+        if self.recently_unreachable(device_id):
+            logger.info("nw poll %s -> skipped: ICMP-confirmed offline "
+                        "(no SSH/SNMP/REST attempted)",
+                        getattr(drv, "address", device_id))
+            return {
+                "status": "ERROR",
+                "data": {
+                    "reachable": False, "latency_ms": None,
+                    "device_info": {}, "interfaces": [], "arp": [],
+                    "mac_table": [], "endpoints": [], "vlans": [],
+                },
+                "errors": ["probe: device offline (ICMP) — poll skipped"],
+                "message": "reachable=False (ICMP offline — poll skipped)",
+            }
 
         async def _safe(coro, label):
             r = await coro
