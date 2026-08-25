@@ -1,4 +1,6 @@
+import asyncio
 import logging
+import time
 from pathlib import Path
 from typing import Dict, Any
 
@@ -7,6 +9,9 @@ try:
 except ImportError:
     from base_spoke import BaseSpoke
 from nw_engine import NwEngine, _norm_mac
+from nw_poll_scheduler import (
+    plan_poll_tick, POLL_MAX_CONCURRENCY, POLL_MAX_PER_TICK, POLL_JITTER_FRAC,
+)
 
 logger = logging.getLogger("NwSpoke")
 
@@ -34,7 +39,211 @@ class NwSpoke(BaseSpoke):
         shared_tid = (config or {}).get("shared_tenant_id", "") if isinstance(config, dict) else ""
         if shared_tid:
             self.engine.shared_tenant_id = shared_tid
+        # Control-plane back-reference. Set by the standalone NwControlPlane AND
+        # by the generic agent's RoleConnection (_start_role_local_services) —
+        # the autonomous loops reach the hub through it (send_to_hub) and read
+        # its live-connection state. Must init to None so RoleConnection's
+        # "only set if None" back-ref assignment fires.
+        self.control_plane = None
+        self._bg_tasks: list = []
         super().__init__(spoke_id, config)
+
+    # ── Autonomous background loops (poll + reachability sweep) ──────────────
+    # Cadence granularity + defaults. The per-device data-poll cadence lives on
+    # each device (``poll_interval``); the fleet-wide reachability sweep uses
+    # ``ping_interval``. Both share the anti-stampede knobs in nw_poll_scheduler.
+    _NW_POLL_TICK = 10
+    _NW_POLL_DEFAULT = 21600   # 6h — data-poll cadence when a device sets none
+    _NW_PING_TICK = 10
+    _NW_PING_DEFAULT = 300     # 5m — reachability sweep cadence default
+
+    def start_background_loops(self) -> None:
+        """Start the spoke's autonomous data-poll loop + ICMP reachability
+        sweep. Idempotent, PROCESS-scoped (survives hub reconnects). Called from
+        BOTH the standalone ``NwControlPlane.run_hub_mode`` AND the generic
+        agent's ``RoleConnection._start_role_local_services`` — so a role-HOSTED
+        nw spoke actually polls + pings its fleet (previously these loops lived
+        only on NwControlPlane, so a role-hosted nw ran neither: devices never
+        got the ping sweep and so never flipped to offline)."""
+        if self._bg_tasks:
+            return
+        self._bg_tasks = [
+            asyncio.create_task(self._nw_poll_loop()),
+            asyncio.create_task(self._nw_reachability_loop()),
+        ]
+        logger.info("nw background loops started (poll + reachability sweep)")
+
+    def _hub_ready(self):
+        """The control-plane back-ref, iff it's live-connected to the hub; else
+        None (loops idle until connected)."""
+        cp = self.control_plane
+        if cp is None or getattr(cp, "_hub_ws", None) is None:
+            return None
+        return cp
+
+    async def _nw_poll_loop(self):
+        """Per-device autonomous polling. Each device may set ``poll_interval``
+        (seconds); this ticks every ``_NW_POLL_TICK`` and polls any device whose
+        interval elapsed, pushing ``NW_POLL_RESULT`` so the hub warms its cache.
+        Anti-stampede via ``plan_poll_tick`` (jitter + per-tick cap) plus a
+        concurrency semaphore."""
+        next_due: Dict[str, float] = {}
+        while True:
+            await asyncio.sleep(self._NW_POLL_TICK)
+            try:
+                cp = self._hub_ready()
+                if cp is None:
+                    continue
+                engine = self.engine
+                mod_cfg = self.config or {}
+                mod_raw = mod_cfg.get("default_poll_interval")
+                try:
+                    module_default = (self._NW_POLL_DEFAULT
+                                      if mod_raw in (None, "") else int(mod_raw))
+                except (TypeError, ValueError):
+                    module_default = self._NW_POLL_DEFAULT
+                now = time.monotonic()
+                try:
+                    jf = float(mod_cfg.get("poll_jitter_frac"))
+                except (TypeError, ValueError):
+                    jf = POLL_JITTER_FRAC
+                jf = max(0.0, min(jf, 0.9))
+                try:
+                    mpt = int(mod_cfg.get("max_poll_per_tick"))
+                except (TypeError, ValueError):
+                    mpt = POLL_MAX_PER_TICK
+                mpt = max(1, min(mpt, 100))
+                due = plan_poll_tick(list(engine.devices), next_due, now,
+                                     module_default,
+                                     max_per_tick=mpt, jitter_frac=jf)
+                if due:
+                    try:
+                        conc = int(mod_cfg.get("max_poll_concurrency"))
+                    except (TypeError, ValueError):
+                        conc = POLL_MAX_CONCURRENCY
+                    conc = max(1, min(conc, 50))
+                    sem = asyncio.Semaphore(conc)
+
+                    async def _one(device_id):
+                        async with sem:
+                            await self._nw_poll_and_push(device_id)
+                    await asyncio.gather(*(_one(x) for x in due))
+            except Exception as e:  # noqa: BLE001 - loop must never die
+                logger.debug("nw poll loop tick error: %s", e)
+
+    async def _nw_poll_and_push(self, device_id: str):
+        """Run one full engine poll + push it to the hub as NW_POLL_RESULT."""
+        cp = self.control_plane
+        if cp is None:
+            return
+        engine = self.engine
+        try:
+            res = await engine.poll(device_id)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("nw auto-poll %s failed: %s", device_id, e)
+            return
+        data = res.get("data") if isinstance(res, dict) else None
+        if not isinstance(data, dict):
+            return
+        # A PARTIAL poll returns EMPTY lists for datums whose SSH sub-call
+        # failed; the hub folds a poll per-key on presence, so pushing those []s
+        # would blank arp/mac/endpoints while it still badges LIVE. Drop the
+        # failed datums so the hub keeps its last-good for each.
+        failed = set()
+        for msg in (res.get("errors") or []):
+            if isinstance(msg, str) and ":" in msg:
+                failed.add(msg.split(":", 1)[0].strip())
+        for label in ("device_info", "interfaces", "arp", "mac_table", "vlans"):
+            if label in failed:
+                data.pop(label, None)
+        if failed & {"arp", "mac_table", "interfaces"}:
+            data.pop("endpoints", None)
+        for key in ("arp", "mac_table", "interfaces", "endpoints"):
+            lst = data.get(key)
+            if isinstance(lst, list):
+                data[key] = [{**r, "mac": _norm_mac(r.get("mac", ""))}
+                             for r in lst if isinstance(r, dict)]
+        await cp.send_to_hub("NW_POLL_RESULT",
+                             {"device_id": device_id, "data": data})
+        logger.info("nw auto-poll %s -> pushed (status=%s, dropped=%s)",
+                    device_id, res.get("status"), sorted(failed) or None)
+
+    async def _nw_reachability_loop(self):
+        """Lightweight ICMP reachability sweep — independent of the (slow) data
+        poll. Every device is ICMP-pinged on a ~5-min cadence (operator-tunable
+        ``ping_interval``; ``0`` disables) and the result is (a) cached on the
+        engine so a box confirmed DOWN is NOT hammered with a full SSH/SNMP/REST
+        poll, and (b) pushed to the hub (``NW_REACHABILITY``) so the fleet
+        up/down/unknown badge stays fresh between the hours-apart data polls.
+        Same anti-stampede machinery + knobs as the poll loop; the cadence is
+        fleet-wide (``ping_interval``), so every device is shadowed to id-only."""
+        next_ping_due: Dict[str, float] = {}
+        while True:
+            await asyncio.sleep(self._NW_PING_TICK)
+            try:
+                cp = self._hub_ready()
+                if cp is None:
+                    continue
+                engine = self.engine
+                mod_cfg = self.config or {}
+                raw = mod_cfg.get("ping_interval")
+                try:
+                    ping_interval = (self._NW_PING_DEFAULT
+                                     if raw in (None, "") else int(raw))
+                except (TypeError, ValueError):
+                    ping_interval = self._NW_PING_DEFAULT
+                if ping_interval <= 0:            # operator disabled the sweep
+                    continue
+                now = time.monotonic()
+                try:
+                    jf = float(mod_cfg.get("poll_jitter_frac"))
+                except (TypeError, ValueError):
+                    jf = POLL_JITTER_FRAC
+                jf = max(0.0, min(jf, 0.9))
+                try:
+                    mpt = int(mod_cfg.get("max_poll_per_tick"))
+                except (TypeError, ValueError):
+                    mpt = POLL_MAX_PER_TICK
+                mpt = max(1, min(mpt, 100))
+                shadow = [{"id": d.get("id")} for d in engine.devices
+                          if d.get("id")]
+                due = plan_poll_tick(shadow, next_ping_due, now, ping_interval,
+                                     max_per_tick=mpt, jitter_frac=jf)
+                if due:
+                    try:
+                        conc = int(mod_cfg.get("max_poll_concurrency"))
+                    except (TypeError, ValueError):
+                        conc = POLL_MAX_CONCURRENCY
+                    conc = max(1, min(conc, 50))
+                    sem = asyncio.Semaphore(conc)
+
+                    async def _one(device_id):
+                        async with sem:
+                            await self._nw_ping_and_push(device_id)
+                    await asyncio.gather(*(_one(x) for x in due))
+            except Exception as e:  # noqa: BLE001 - loop must never die
+                logger.debug("nw reachability loop tick error: %s", e)
+
+    async def _nw_ping_and_push(self, device_id: str):
+        """ICMP-ping one device (engine caches the verdict to gate polling) and
+        push it to the hub as ``NW_REACHABILITY`` so the fleet badge flips
+        promptly. Best-effort; never raises into the loop."""
+        cp = self.control_plane
+        if cp is None:
+            return
+        try:
+            res = await self.engine.ping(device_id)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("nw reachability ping %s failed: %s", device_id, e)
+            return
+        if not isinstance(res, dict) or res.get("status") != "SUCCESS":
+            return
+        await cp.send_to_hub("NW_REACHABILITY", {
+            "device_id": device_id,
+            "reachable": res.get("reachable"),
+            "latency_ms": res.get("latency_ms"),
+        })
+
 
     # ── Logging helper: mask sensitive fields in any command data ───────────
     @staticmethod

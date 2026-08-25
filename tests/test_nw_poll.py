@@ -292,3 +292,22 @@ def test_poll_rest_reuses_single_client():
     assert calls["close"] == 1
     assert len(calls["gets"]) == 5        # probe + info + interfaces + arp + mac
     assert res["data"]["reachable"] is True
+
+# ── role-hosted wiring: NwSpoke owns the autonomous loops ─────────────────────
+def test_nwspoke_exposes_background_loop_hook_and_backref():
+    """The generic agent's RoleConnection starts a role's loops via the module's
+    start_background_loops() hook and sets control_plane iff it's None. A
+    role-hosted nw spoke only polls/pings if NwSpoke exposes both — this locks
+    that contract (regression: the loops used to live only on NwControlPlane, so
+    a role-hosted nw ran neither the poll nor the reachability sweep)."""
+    async def _run_():
+        sp = NwSpoke("nw-1", {"devices": []})
+        assert sp.control_plane is None            # RoleConnection back-ref target
+        assert callable(getattr(sp, "start_background_loops", None))
+        sp.start_background_loops()
+        assert len(sp._bg_tasks) == 2              # poll loop + reachability sweep
+        sp.start_background_loops()                 # idempotent
+        assert len(sp._bg_tasks) == 2
+        for t in sp._bg_tasks:
+            t.cancel()
+    _run(_run_())
