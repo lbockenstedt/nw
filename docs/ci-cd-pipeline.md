@@ -91,27 +91,37 @@ and puts it on `PYTHONPATH`. Without that, collection fails with
 `ModuleNotFoundError: No module named 'core'`.
 
 A repo's CI is a **required** check on `qa` and `main` only once its suite is
-green. Repos still carrying pre-existing test failures run CI for signal but do
-not gate on it — a permanently red required check blocks every promotion and
-trains people to ignore the signal.
+green. A permanently red required check blocks every promotion and trains people
+to ignore the signal, so gating was switched on per repo as each suite went
+green. **Every repo with a suite now gates.**
 
 | Repo | Suite | Gating on qa/main |
 |---|---|---|
-| `nw` | green (181 passed) | yes (`test-unit`) |
+| `nw` | green | yes (`lint-python`, `lint-shell`, `test-unit`) |
 | `cs` | green (503 passed) | yes |
 | `ab` | green | yes |
 | `dns`, `dhcp`, `ldap`, `opnsense`, `truenas` | green | yes |
-| `cppm` | 1 failed / 51 passed | not yet |
-| `netbox` | 11 failed / 176 passed | not yet |
-| `pxmx` | collection error in `test_normalize_spoke_url.py`, plus 8 failures | not yet |
-| `le` | 4 failed / 86 passed | not yet |
-| `qa` | collection error (`hub_client` not importable) | not yet |
-| `lm` | ~169 pre-existing failures | not yet |
+| `lm` | green (~2908 passed, one process per component) | yes (`test`) |
+| `pxmx` | green (406 passed) | yes (`test`) |
+| `netbox` | green (191 passed) | yes (`test`) |
+| `cppm` | green (73 passed) | yes (`test`) |
+| `le` | green (90 passed) | yes (`test`) |
+| `qa` | green (7 passed) | yes (`test`) |
 | `kvm`, `tsa` | no test suite | n/a |
 
 Promoting a repo to gating is a one-line ruleset change once its suite is green:
 add a `required_status_checks` rule naming the job (`test`) to its
 `protect-main` and `protect-qa` rulesets.
+
+## Hang protection
+
+Every job carries `timeout-minutes: 20` and every pytest invocation runs under
+`pytest-timeout` (`--timeout=300 --timeout-method=thread`). This is not
+belt-and-braces: `le`'s CI had **never once completed** — each run hung in
+"Run tests" and was killed at GitHub's 6h ceiling, so the repo showed a
+perpetual *in progress* rather than a red X and the failure stayed invisible.
+With both caps a hang now fails in minutes and the thread method prints the
+traceback of the test that stuck.
 
 ## Required repository settings
 
