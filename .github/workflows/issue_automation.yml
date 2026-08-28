@@ -9,6 +9,7 @@ on:
 jobs:
   triage:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     # `contains()` is a GitHub Actions FUNCTION, not a method on an array.
     # `github.event.issue.labels.contains(...)` is invalid expression syntax, so
     # the workflow failed to PARSE — which GitHub reports as a failed run on
@@ -40,6 +41,7 @@ jobs:
   execute:
     needs: triage
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Signal Agent Runner
         run: |
