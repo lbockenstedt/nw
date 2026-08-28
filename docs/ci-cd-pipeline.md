@@ -125,6 +125,21 @@ Two settings must be on, or the pipeline silently half-works:
 - **Automatically delete head branches**, so merged `promote/*` branches are
   cleaned up.
 
+### First promotion PR in a repo needs a one-time workflow approval
+
+`Actions -> General -> Fork pull request workflows from outside collaborators`
+defaults to `first_time_contributors`, and `github-actions[bot]` counts as one.
+So the **first** promotion PR a repo ever raises shows `action_required` with no
+checks reported, and — on a repo that gates on CI — sits `MERGEABLE / BLOCKED`
+because the required check can never appear.
+
+Approve that first run once (`gh api -X POST
+repos/<owner>/<repo>/actions/runs/<run_id>/approve`, or the "Approve and run"
+button). Subsequent promotion PRs run automatically.
+
+Do **not** "fix" this by setting the approval policy to `never`: that also lets
+unapproved workflows run for genuine fork PRs from strangers.
+
 ## Changing the pipeline
 
 The workflow files, `promote.sh` and `bump_version.py` are **byte-identical
