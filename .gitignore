@@ -39,3 +39,7 @@ secrets.json.claude/
 /pxmx/
 /qa/
 /tsa/
+
+# Local git worktrees — never part of the repo
+.claude/worktrees/
+.wt-*/
