@@ -13,11 +13,14 @@ name: CI Pipeline
 # tests/, scripts/, audit/*.sh. The split-out modules run their own CI in their
 # own repos; duplicating it here could only ever test a stale copy.
 
+# `qa` and `main` require a PR; this job is the status check that makes those
+# gates mean something. dev also runs on direct pushes, which contributors are
+# allowed to make.
 on:
   push:
-    branches: [ main ]
+    branches: [ main, dev ]
   pull_request:
-    branches: [ main ]
+    branches: [ main, qa, dev ]
 
 jobs:
   lint-python:
