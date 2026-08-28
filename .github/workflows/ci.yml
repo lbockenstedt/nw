@@ -25,6 +25,7 @@ on:
 jobs:
   lint-python:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v4
@@ -43,6 +44,7 @@ jobs:
 
   lint-shell:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Run ShellCheck
@@ -53,13 +55,14 @@ jobs:
   test-unit:
     needs: [lint-python, lint-shell]
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v4
         with: { python-version: '3.11' }
       - name: Install deps
         run: |
-          pip install pytest
+          pip install pytest pytest-timeout
           [ -f requirements.txt ] && pip install -r requirements.txt || true
       - name: Compile check
         run: find src scripts -name '*.py' -exec python -m py_compile {} +
@@ -68,7 +71,7 @@ jobs:
           # Only run pytest when this repo actually has tests, so an empty
           # tests/ reports honestly instead of failing with "no tests ran".
           if [ -n "$(find tests -name 'test_*.py' -print -quit 2>/dev/null)" ]; then
-            pytest tests/
+            pytest --timeout=300 --timeout-method=thread tests/
           else
             echo "no test_*.py under tests/ — skipping pytest"
           fi
