@@ -44,6 +44,10 @@ Rather than raising the PR from `dev` directly, it builds a
 If the merge conflicts on anything **other** than `VERSION`, the job fails and
 asks a human to resolve it. Bots do not guess at real code.
 
+A promotion that would carry no code change is a no-op: the job reports
+"Nothing to promote" and opens no PR. So a `VERSION`-only commit never produces
+an empty promotion PR.
+
 ## VERSION is branch-owned
 
 **A version set on one branch never leaks to another.** Each branch advances its
@@ -86,9 +90,55 @@ in CI the repo is alone, so the workflow sparse-checks-out `lm/core` into `_lm`
 and puts it on `PYTHONPATH`. Without that, collection fails with
 `ModuleNotFoundError: No module named 'core'`.
 
-CI is a **required** check on `qa` and `main` for repos whose suite is green.
-Repos still carrying test failures run CI for signal but do not gate on it yet;
-see the table in the pipeline PR.
+A repo's CI is a **required** check on `qa` and `main` only once its suite is
+green. Repos still carrying pre-existing test failures run CI for signal but do
+not gate on it — a permanently red required check blocks every promotion and
+trains people to ignore the signal.
+
+| Repo | Suite | Gating on qa/main |
+|---|---|---|
+| `nw` | green (181 passed) | yes (`test-unit`) |
+| `cs` | green (503 passed) | yes |
+| `ab` | green | yes |
+| `dns`, `dhcp`, `ldap`, `opnsense`, `truenas` | green | yes |
+| `cppm` | 1 failed / 51 passed | not yet |
+| `netbox` | 11 failed / 176 passed | not yet |
+| `pxmx` | collection error in `test_normalize_spoke_url.py`, plus 8 failures | not yet |
+| `le` | 4 failed / 86 passed | not yet |
+| `qa` | collection error (`hub_client` not importable) | not yet |
+| `lm` | ~169 pre-existing failures | not yet |
+| `kvm`, `tsa` | no test suite | n/a |
+
+Promoting a repo to gating is a one-line ruleset change once its suite is green:
+add a `required_status_checks` rule naming the job (`test`) to its
+`protect-main` and `protect-qa` rulesets.
+
+## Required repository settings
+
+Two settings must be on, or the pipeline silently half-works:
+
+- **Actions → General → Workflow permissions → "Allow GitHub Actions to create
+  and approve pull requests."** Without it the promotion branch is still pushed
+  but the PR step fails with `GitHub Actions is not permitted to create or
+  approve pull requests`. Set via
+  `gh api -X PUT repos/<owner>/<repo>/actions/permissions/workflow -f default_workflow_permissions=write -F can_approve_pull_request_reviews=true`.
+- **Automatically delete head branches**, so merged `promote/*` branches are
+  cleaned up.
+
+### First promotion PR in a repo needs a one-time workflow approval
+
+`Actions -> General -> Fork pull request workflows from outside collaborators`
+defaults to `first_time_contributors`, and `github-actions[bot]` counts as one.
+So the **first** promotion PR a repo ever raises shows `action_required` with no
+checks reported, and — on a repo that gates on CI — sits `MERGEABLE / BLOCKED`
+because the required check can never appear.
+
+Approve that first run once (`gh api -X POST
+repos/<owner>/<repo>/actions/runs/<run_id>/approve`, or the "Approve and run"
+button). Subsequent promotion PRs run automatically.
+
+Do **not** "fix" this by setting the approval policy to `never`: that also lets
+unapproved workflows run for genuine fork PRs from strangers.
 
 ## Changing the pipeline
 
@@ -101,3 +151,4 @@ skill reference (section 10).
 `nw/tests/test_promotion_pipeline.py` pins the branch-owned-version guarantee
 with a real git sandbox. It only runs in `nw`, so it cannot catch drift in the
 other fifteen copies — use the sweep for that.
+
