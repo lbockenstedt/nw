@@ -38,6 +38,7 @@ secrets.json.claude/
 /opnsense/
 /pxmx/
 /qa/
+/truenas/
 /tsa/
 
 # Local git worktrees — never part of the repo
