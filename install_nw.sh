@@ -1,4 +1,14 @@
 #!/bin/bash
+
+# Resolve the branch this checkout is deployed on so a dev/qa host is not
+# hard-reset back onto main by an installer re-run. Detached HEAD (or any git
+# failure) falls back to main.
+_deployed_branch() {
+  local b
+  b=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+  case "$b" in ""|HEAD) echo main ;; *) echo "$b" ;; esac
+}
+
 set -e
 
 # Default Configuration
@@ -146,15 +156,15 @@ if [ -d "nw" ]; then
     echo "📂 Network Devices directory exists. Preparing for update..."
     SPOKE_PATH="$INSTALL_DIR/nw"
     cd "$SPOKE_PATH"
-    git fetch origin -q && git reset --hard origin/main   # hard-sync (soft `git pull` no-ops on a diverged/detached clone)
+    BR=$(_deployed_branch) && git fetch origin -q "$BR" && git reset --hard "origin/$BR"   # hard-sync (soft `git pull` no-ops on a diverged/detached clone)
     cd "$INSTALL_DIR"
 elif [ -d ".git" ]; then
     # This case is for when we are already inside the nw dir
-    git fetch origin -q && git reset --hard origin/main   # hard-sync
+    BR=$(_deployed_branch) && git fetch origin -q "$BR" && git reset --hard "origin/$BR"   # hard-sync
     SPOKE_PATH="$(pwd)"
 else
     echo "🌐 Cloning Network Devices Manager repository..."
-    git clone https://github.com/lbockenstedt/nw.git
+    git clone --branch "${NW_BRANCH:-main}" https://github.com/lbockenstedt/nw.git
     SPOKE_PATH="$INSTALL_DIR/nw"
 fi
 
