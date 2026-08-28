@@ -1,3 +1,8 @@
+---
+summary: "Network-devices fleet spoke. Repo: nw. moduletype = 'nw'. See architecture-topology.md."
+keywords: [aos_switch, backends, behaviors, cx_switch, ex_switch, lm, netbox, nw, nw_poll, object_type]
+---
+
 # nw — Network Devices
 
 Network-devices fleet spoke. Repo: `nw`. `module_type = "nw"`. See [architecture-topology.md](architecture-topology.md).
