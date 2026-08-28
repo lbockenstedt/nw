@@ -111,10 +111,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BR: ${{ steps.route.outputs.branch }}
+          SHA: ${{ steps.build.outputs.sha }}
         run: |
-          for _ in $(seq 1 12); do
+          for _ in $(seq 1 24); do
             ids=$(gh api "repos/${{ github.repository }}/actions/runs?branch=$BR&status=action_required" \
-                    --jq '.workflow_runs[].id' 2>/dev/null || true)
+                    --jq ".workflow_runs[] | select(.head_sha == \"$SHA\") | .id" 2>/dev/null || true)
             if [ -n "$ids" ]; then
               for id in $ids; do
                 echo "approving parked run $id"
@@ -125,4 +126,4 @@ jobs:
             fi
             sleep 5
           done
-          echo "::notice::no parked run found for $BR"
+          echo "::notice::no parked run found for $BR @ $SHA"
