@@ -125,20 +125,29 @@ Two settings must be on, or the pipeline silently half-works:
 - **Automatically delete head branches**, so merged `promote/*` branches are
   cleaned up.
 
-### First promotion PR in a repo needs a one-time workflow approval
+### Bot-opened PRs and parked CI runs
 
-`Actions -> General -> Fork pull request workflows from outside collaborators`
-defaults to `first_time_contributors`, and `github-actions[bot]` counts as one.
-So the **first** promotion PR a repo ever raises shows `action_required` with no
-checks reported, and — on a repo that gates on CI — sits `MERGEABLE / BLOCKED`
-because the required check can never appear.
+A PR opened with `GITHUB_TOKEN` does **not** start its checks. GitHub parks the
+run as `action_required`. On a repo that requires CI on `qa`/`main` that is a
+deadlock: the required check can never report, so the promotion PR sits
+`MERGEABLE / BLOCKED` forever.
 
-Approve that first run once (`gh api -X POST
-repos/<owner>/<repo>/actions/runs/<run_id>/approve`, or the "Approve and run"
-button). Subsequent promotion PRs run automatically.
+`promote.yml` handles this itself — after opening the PR it approves the parked
+run for that exact promotion commit, so the pipeline stays hands-free.
 
-Do **not** "fix" this by setting the approval policy to `never`: that also lets
-unapproved workflows run for genuine fork PRs from strangers.
+Two things that do **not** fix it, both verified the hard way:
+
+- Relaxing `Actions -> General -> Fork pull request workflows` (the
+  `fork-pr-contributor-approval` policy, e.g. to
+  `first_time_contributors_new_to_github`). It is the *bot-authored PR* that is
+  gated, not an untrusted contributor, so the run stays parked — and relaxing it
+  would weaken a genuine protection against strangers' fork PRs.
+- Assuming `first_time_contributors` means literally once. The second promotion
+  PR was parked exactly like the first.
+
+The approval step must match on the promotion commit's `head_sha`. Approving
+whichever parked run exists first races with the run GitHub is still creating
+for the new head, which leaves the PR unchecked.
 
 ## Changing the pipeline
 
