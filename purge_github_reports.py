@@ -52,10 +52,9 @@ def main():
         is_tenant_match = args.tenant.lower() in body.lower() or args.tenant.lower() in title.lower()
         # AppBuilder stamps "<!-- bf-module: <module> -->" (see ab/github_ops.py),
         # so match the marker prefix -- the exact-string form never matched.
-        # The bare "bugfixer" body check is retained only to catch reports filed
-        # before AppBuilder was renamed; it is not a live module name.
+        # Reports filed before the rename carry the same marker, so no legacy
+        # name check is needed to catch them.
         is_report = ("<!-- bf-module" in body
-                     or "bugfixer" in body.lower()
                      or "report" in title.lower())
 
         if is_tenant_match and (is_report or args.force_all):
