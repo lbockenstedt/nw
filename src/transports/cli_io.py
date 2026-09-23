@@ -891,11 +891,31 @@ def _parse_lldp_detail_raw(text: str, object_type: str = "") -> List[dict]:
     try:
         records = []
         current_record = {}
+
+        def _flush(rec):
+            """Append ``rec`` only if it actually names a neighbour.
+
+            AOS-CX prints one block per PORT, including ports with
+            ``Neighbor Entries : 0``. Appending those unconditionally turned
+            "port exists, nobody on the other end" into an edge to a node with
+            no identity — a phantom link on the topology map, which the dedup
+            key ``(local_port, '', '')`` cannot collapse away because each
+            empty record has a different local_port.
+            """
+            if not rec:
+                return
+            if rec.pop("_no_neighbour", False):
+                return
+            if not any(rec.get(f) for f in ("remote_chassis", "remote_port",
+                                            "remote_name", "remote_mgmt_ip")):
+                return
+            records.append(rec)
+
         lines = text.splitlines()
         for line in lines:
             if not line.strip():
                 if current_record:
-                    records.append(current_record)
+                    _flush(current_record)
                     current_record = {}
                 continue
             if ':' not in line:
@@ -905,10 +925,18 @@ def _parse_lldp_detail_raw(text: str, object_type: str = "") -> List[dict]:
             value = value.strip()
             if key == 'port':
                 if current_record:
-                    records.append(current_record)
+                    _flush(current_record)
                 current_record = {"local_port": value, "remote_chassis": "",
                                   "remote_port": "", "remote_name": "",
                                   "remote_mgmt_ip": "", "remote_descr": ""}
+            elif key == 'neighborentries':
+                # Explicit "nobody here" marker — believe it even if a later
+                # stray field would otherwise make the record look populated.
+                try:
+                    if int(value) == 0:
+                        current_record["_no_neighbour"] = True
+                except ValueError:
+                    pass
             elif key == 'chassisid':
                 current_record["remote_chassis"] = normalise_mac(value)
             elif key == 'portid':
@@ -922,11 +950,13 @@ def _parse_lldp_detail_raw(text: str, object_type: str = "") -> List[dict]:
             elif key == 'managementaddress':
                 current_record["remote_mgmt_ip"] = value
         if current_record:
-            records.append(current_record)
+            _flush(current_record)
         if records:
             return records
     except Exception:
-        pass
+        logger.warning("lldp detail: FORMAT B parser raised on %d bytes of "
+                       "output; falling through to the other layouts",
+                       len(text), exc_info=True)
 
     # Try FORMAT A (AOS-S pipe-table)
     try:
@@ -963,7 +993,9 @@ def _parse_lldp_detail_raw(text: str, object_type: str = "") -> List[dict]:
         if records:
             return records
     except Exception:
-        pass
+        logger.warning("lldp detail: FORMAT A parser raised on %d bytes of "
+                       "output; falling through to the generic layout",
+                       len(text), exc_info=True)
 
     # Try generic column-table parser (FORMAT C and D)
     try:
@@ -1020,7 +1052,8 @@ def _parse_lldp_detail_raw(text: str, object_type: str = "") -> List[dict]:
         if records:
             return records
     except Exception:
-        pass
+        logger.warning("lldp detail: generic column parser raised on %d bytes "
+                       "of output", len(text), exc_info=True)
 
     return []
 
@@ -1038,12 +1071,15 @@ def parse_lldp_detail(text: str, object_type: str = "") -> List[dict]:
     Keeps the first occurrence and lets later duplicates fill in fields the
     first one left blank, so a terse row followed by a detailed one yields one
     complete edge rather than two partial ones.
+
+    Raises rather than swallowing: this used to wrap the parse in
+    ``except Exception: return []``, which made a parser crash indistinguishable
+    from "this device has no neighbours" — the caller turned both into a
+    SUCCESS envelope with empty data, so a vendor firmware changing its output
+    format became "zero edges, forever, silently". An empty list now means
+    exactly one thing: the parse ran and found no neighbours.
     """
-    try:
-        rows = _parse_lldp_detail_raw(text, object_type)
-    except Exception:
-        logger.debug("lldp detail parse failed", exc_info=True)
-        return []
+    rows = _parse_lldp_detail_raw(text, object_type)
     out: List[dict] = []
     index: Dict[tuple, dict] = {}
     for row in rows or []:
@@ -1062,6 +1098,23 @@ def parse_lldp_detail(text: str, object_type: str = "") -> List[dict]:
     return out
 
 
+#: Substrings that mean "the device refused the command", not "no neighbours".
+#: A device with LLDP disabled/unsupported answers this way, and that is a
+#: legitimate empty result — but it must be told apart from a parse that
+#: genuinely saw zero neighbours, so it is detected explicitly and logged.
+_LLDP_REJECT_MARKERS = (
+    "invalid input", "invalid command", "unknown command",
+    "incomplete command", "% error", "not supported", "ambiguous input",
+    "syntax error",
+)
+
+
+def _lldp_cmd_rejected(text: str) -> bool:
+    """True when the CLI answered with a rejection rather than LLDP output."""
+    low = (text or "").lower()
+    return any(m in low for m in _LLDP_REJECT_MARKERS)
+
+
 async def cli_get_lldp_detail(session: CliSession, object_type: str) -> List[dict]:
     """Run the vendor LLDP-neighbour command and return structured link records.
 
@@ -1070,17 +1123,34 @@ async def cli_get_lldp_detail(session: CliSession, object_type: str) -> List[dic
     remote chassis id, remote port and remote system name — the four fields a
     topology edge is made of.
 
-    Best-effort by design: a device with LLDP disabled, or one whose CLI
-    rejects the command, simply contributes no edges rather than failing the
-    whole topology build.
+    An empty list means ONE thing: the device was asked and reported no
+    neighbours. It deliberately no longer means "we could not ask".
+
+    A device with LLDP disabled, or whose CLI rejects the command, still
+    contributes no edges rather than failing the topology build — that part of
+    the original intent stands — but it is detected explicitly and logged, not
+    inferred from an empty parse. Transport failures (timeout, dropped PTY,
+    paging stall) now PROPAGATE, so ``_with_session`` renders them as an ERROR
+    envelope exactly like arp/mac/interfaces. Previously every one of those
+    states collapsed into ``[]`` → ``status: SUCCESS, data: []``, so the hub
+    could not tell "this node genuinely has no edges, fill it in from MAC
+    inference" from "we failed to ask".
     """
     cmd = _LLDP_DETAIL_CMDS.get(object_type, "show lldp neighbors")
-    try:
-        text = await session.run(cmd)
-    except Exception:
-        logger.debug("cli lldp detail failed for %s", object_type, exc_info=True)
+    text = await session.run(cmd)
+    if _lldp_cmd_rejected(text):
+        logger.warning("cli lldp detail: %s rejected %r — treating as no LLDP "
+                       "on this device (no edges contributed)", object_type, cmd)
         return []
-    return parse_lldp_detail(text, object_type)
+    rows = parse_lldp_detail(text, object_type)
+    if not rows and text and text.strip():
+        # Non-empty output that matched no layout: a parser gap, not an answer.
+        # Surfaced at warning so a vendor format change is visible instead of
+        # quietly reducing the device to zero edges.
+        logger.warning("cli lldp detail: %s returned %d bytes for %r that no "
+                       "parser understood — 0 edges (possible parser gap)",
+                       object_type, len(text), cmd)
+    return rows
 
 
 # object_type → (arp, mac, interfaces) parser triple

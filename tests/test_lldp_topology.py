@@ -148,3 +148,150 @@ def test_duplicate_edges_are_collapsed():
 def test_detail_command_is_defined_for_every_known_family():
     for ot in ("aos_switch", "cx_switch", "ex_switch", "gateway"):
         assert cli_io._LLDP_DETAIL_CMDS.get(ot)
+
+
+# ── State separation (PR #119 state-logic panel finding) ────────────────────
+# cli_get_lldp_detail used to wrap session.run AND the parse in
+# `except Exception: return []`, so four distinct states came back identical:
+#   (a) device asked, genuinely zero neighbours
+#   (b) device rejected the command / LLDP disabled
+#   (c) output arrived but matched no parser (vendor format change)
+#   (d) the session itself broke mid-command (timeout, dropped PTY)
+# _with_session wraps [] as status SUCCESS, so (b)/(c)/(d) were all reported as
+# a healthy device with no edges — and the hub could not tell "no edges here,
+# infer from MAC tables" from "we never got an answer". Every other datum on
+# this driver (arp, mac, interfaces) lets the error propagate to an ERROR
+# envelope; LLDP was the sole exception.
+
+class _FakeSession:
+    def __init__(self, text=None, exc=None):
+        self.text, self.exc, self.cmds = text, exc, []
+
+    async def run(self, cmd):
+        self.cmds.append(cmd)
+        if self.exc:
+            raise self.exc
+        return self.text
+
+
+def _run(coro):
+    import asyncio
+    return asyncio.get_event_loop().run_until_complete(coro)
+
+
+def test_transport_failure_propagates_instead_of_looking_empty():
+    """(d) A broken session must NOT read as 'this device has no neighbours'.
+
+    Propagating lets NwDriver._with_session build the ERROR envelope, which is
+    what arp/mac/interfaces already do.
+    """
+    sess = _FakeSession(exc=TimeoutError("paging stall"))
+    with pytest.raises(TimeoutError):
+        _run(cli_io.cli_get_lldp_detail(sess, "aos_switch"))
+
+
+def test_parser_crash_propagates_instead_of_looking_empty():
+    """(c, worst case) A parser blowing up must not become a silent zero-edge
+    SUCCESS that persists across a whole firmware generation."""
+    import transports.cli_io as mod
+    original = mod._parse_lldp_detail_raw
+    mod._parse_lldp_detail_raw = lambda *a, **k: (_ for _ in ()).throw(
+        ValueError("unrecognised layout"))
+    try:
+        with pytest.raises(ValueError):
+            mod.parse_lldp_detail(CX, "cx_switch")
+    finally:
+        mod._parse_lldp_detail_raw = original
+
+
+@pytest.mark.parametrize("rejection", [
+    "% Invalid input: lldp",
+    "Invalid command.",
+    "                 ^\n% Ambiguous input at '^' marker.",
+    "LLDP is not supported on this platform",
+])
+def test_rejected_command_is_no_edges_not_an_error(rejection):
+    """(b) A device that cannot answer still contributes no edges rather than
+    failing the topology build — that original intent is preserved — but it is
+    now recognised explicitly rather than inferred from an empty parse."""
+    sess = _FakeSession(text=rejection)
+    assert _run(cli_io.cli_get_lldp_detail(sess, "aos_switch")) == []
+
+
+def test_rejection_is_logged_so_it_is_not_silent(caplog):
+    sess = _FakeSession(text="% Invalid input: lldp")
+    with caplog.at_level("WARNING"):
+        _run(cli_io.cli_get_lldp_detail(sess, "aos_switch"))
+    assert any("rejected" in r.message.lower() or "rejected" in r.getMessage().lower()
+               for r in caplog.records), "a refused command logged nothing"
+
+
+def test_unparseable_output_warns_about_the_parser_gap(caplog):
+    """(c) Real output that no layout understands is a parser gap. It still
+    yields no edges, but it must be visible — this is what would otherwise
+    hide a vendor changing its output format."""
+    sess = _FakeSession(text="Neighbour table\nsome entirely novel layout\n")
+    with caplog.at_level("WARNING"):
+        rows = _run(cli_io.cli_get_lldp_detail(sess, "aos_switch"))
+    assert rows == []
+    assert any("parser gap" in r.getMessage() for r in caplog.records)
+
+
+def test_genuinely_empty_output_is_quiet():
+    """(a) The one state that SHOULD be a silent empty list."""
+    sess = _FakeSession(text="")
+    assert _run(cli_io.cli_get_lldp_detail(sess, "aos_switch")) == []
+
+
+def test_real_output_still_parses_through_the_new_path():
+    """The guard rails must not cost us the happy path."""
+    sess = _FakeSession(text=CX)
+    rows = _run(cli_io.cli_get_lldp_detail(sess, "cx_switch"))
+    assert [r["remote_name"] for r in rows] == ["OLKS-EDGE-1", "OLKS-CORE"]
+
+
+# ── FORMAT B phantom edges (second panel finding) ───────────────────────────
+
+CX_WITH_EMPTY_PORT = """Port                          : 1/1/1
+Neighbor Entries              : 1
+Chassis-id                    : 00:0b:86:bc:49:87
+Port-id                       : 2
+System Name                   : OLKS-EDGE-1
+
+Port                          : 1/1/2
+Neighbor Entries              : 0
+
+Port                          : 1/1/3
+Neighbor Entries              : 0
+"""
+
+
+def test_ports_with_zero_neighbours_do_not_become_edges():
+    """AOS-CX prints a block per PORT, including ports with nobody attached.
+    Every 'Port :' line used to start a record, so an empty port became an
+    edge to a node with no identity — and the dedup key (local_port, '', '')
+    could not collapse them because each had a different local_port.
+    """
+    rows = cli_io.parse_lldp_detail(CX_WITH_EMPTY_PORT, "cx_switch")
+    assert len(rows) == 1, f"phantom edges survived: {rows}"
+    assert rows[0]["local_port"] == "1/1/1"
+    assert rows[0]["remote_name"] == "OLKS-EDGE-1"
+
+
+def test_no_edge_is_ever_emitted_without_some_remote_identity():
+    """The invariant behind the fix: an edge needs a far end. A record with no
+    chassis, port, name or management address identifies nothing and can only
+    draw a link to a phantom node."""
+    for text in (CX_WITH_EMPTY_PORT, CX, AOS_S, JUNOS, GATEWAY):
+        for row in cli_io.parse_lldp_detail(text, "cx_switch"):
+            assert any(row.get(f) for f in ("remote_chassis", "remote_port",
+                                            "remote_name", "remote_mgmt_ip")), row
+
+
+def test_a_port_with_no_neighbour_count_but_real_data_still_counts():
+    """Not every vendor prints 'Neighbor Entries'. Absence of the counter must
+    not drop a record that plainly has a neighbour (the second CX block in the
+    main fixture has no counter and must survive)."""
+    rows = cli_io.parse_lldp_detail(CX, "cx_switch")
+    assert len(rows) == 2
+    assert rows[1]["local_port"] == "1/1/24"
