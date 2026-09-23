@@ -90,6 +90,7 @@ def classify_platform(text: str) -> Optional[str]:
 
 
 def _norm_ip(addr: str) -> str:
+    """Normalize IP address string, stripping leading/trailing whitespace."""
     try:
         return str(ipaddress.ip_address(str(addr).strip()))
     except ValueError:
@@ -97,6 +98,7 @@ def _norm_ip(addr: str) -> str:
 
 
 def _is_ipv4(addr: str) -> bool:
+    """Check if address string parses as a valid IPv4 address."""
     try:
         return isinstance(ipaddress.ip_address(str(addr).strip()),
                           ipaddress.IPv4Address)
@@ -233,6 +235,7 @@ class NwScanner:
                  ssh_identify: Callable = _ssh_identify,
                  snmp_identify: Callable = _snmp_identify,
                  lldp_neighbors: Optional[Callable] = None):
+        """Initialize the network scanner with credentials, ports, timeouts, and probe hooks."""
         self.credentials = [c for c in (credentials or []) if isinstance(c, dict)]
         self.tcp_ports = tuple(tcp_ports or DEFAULT_TCP_PORTS)
         self.try_snmp = bool(try_snmp)
@@ -246,6 +249,7 @@ class NwScanner:
         self._lldp_neighbors = lldp_neighbors  # callable(host, cred) -> [ips]
 
     async def _probe_ports(self, host: str) -> List[int]:
+        """Probe configured TCP ports concurrently on the host and return list of open ports."""
         results = await asyncio.gather(
             *(self._tcp_probe(host, p, self.tcp_timeout) for p in self.tcp_ports),
             return_exceptions=True)
@@ -344,6 +348,7 @@ class NwScanner:
         scanned = 0
 
         async def _one(host: str, depth: int) -> Tuple[Dict[str, Any], int]:
+            """Fingerprint a single target host within concurrency limits."""
             async with sem:
                 try:
                     res = await asyncio.wait_for(self._fingerprint(host),
@@ -382,6 +387,7 @@ class NwScanner:
         }
 
     async def _safe_neighbors(self, host: str) -> List[str]:
+        """Safely fetch LLDP neighbors for a host, swallowing any transport exceptions."""
         try:
             neigh = self._lldp_neighbors(host, self.credentials)
             if asyncio.iscoroutine(neigh):
