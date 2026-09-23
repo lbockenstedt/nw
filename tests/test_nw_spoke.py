@@ -554,3 +554,70 @@ def test_blank_chassis_id_survives():
     spoke = _lldp_spoke([_edge(remote_chassis="", remote_name="no-chassis")])
     res = _run(spoke.handle_command("NW_GET_LLDP_NEIGHBORS", {"device_id": "d1"}))
     assert res["data"][0]["remote_chassis"] == ""
+
+
+# ── In-session LLDP failure yields ERROR, not a clean empty SUCCESS ─────────
+# test_per_device_commands_error_against_fake_host above only covers a
+# CONNECT-time failure: it never reaches cli_get_lldp_detail, so it could not
+# see the state conflation the PR #119 panel found. This covers the in-session
+# path — connected fine, then the command itself fails — which used to return
+# `[]` and be wrapped as status SUCCESS with zero rows.
+def test_lldp_in_session_failure_is_an_error_envelope():
+    import nw_engine
+    from transports import cli_io
+
+    class _BrokenSession:
+        async def run(self, cmd):
+            raise cli_io.CliError("session dropped mid-command")
+
+    class _CM:
+        async def __aenter__(self):
+            return _BrokenSession()
+
+        async def __aexit__(self, *a):
+            return False
+
+    drv = nw_engine.SshCliDriver.__new__(nw_engine.SshCliDriver)
+    drv.device = {"id": "d1", "address": "10.0.0.9", "object_type": "aos_switch"}
+    drv.address = "10.0.0.9"
+    drv.object_type = "aos_switch"
+    drv._shared = None
+    drv._session = lambda: _CM()
+
+    res = _run(drv.get_lldp_neighbors())
+    # The envelope, not the empty list, is what carries the distinction: _err
+    # legitimately returns data=[] too, so the hub must read `status`.
+    assert res["status"] == "ERROR", res
+    assert "session dropped" in res.get("message", ""), res
+
+
+def test_lldp_in_session_failure_matches_sibling_datums():
+    """LLDP was the ONLY datum that swallowed in-session errors; arp/mac/
+    interfaces already surfaced them. Pin the parity so it can't drift back."""
+    import nw_engine
+    from transports import cli_io
+
+    class _BrokenSession:
+        async def run(self, cmd):
+            raise cli_io.CliError("session dropped mid-command")
+
+    class _CM:
+        async def __aenter__(self):
+            return _BrokenSession()
+
+        async def __aexit__(self, *a):
+            return False
+
+    def _drv():
+        d = nw_engine.SshCliDriver.__new__(nw_engine.SshCliDriver)
+        d.device = {"id": "d1", "address": "10.0.0.9", "object_type": "aos_switch"}
+        d.address = "10.0.0.9"
+        d.object_type = "aos_switch"
+        d._shared = None
+        d._session = lambda: _CM()
+        return d
+
+    statuses = {name: _run(getattr(_drv(), name)())["status"]
+                for name in ("get_arp", "get_mac_table", "get_interfaces",
+                             "get_lldp_neighbors")}
+    assert set(statuses.values()) == {"ERROR"}, statuses
