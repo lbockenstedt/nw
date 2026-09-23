@@ -376,11 +376,70 @@ def test_nw_scan_requires_targets():
     assert "targets" in res["message"]
 
 
-def test_nw_scan_requires_credentials():
+def test_nw_scan_without_credentials_runs_discovery(monkeypatch):
+    # Credentials are OPTIONAL: a scan with none must still run as a
+    # discovery-only pass (reachability + open ports) instead of erroring, so
+    # "what is on this subnet?" is answerable without a device account.
+    import nw_scanner
+
+    seen = {}
+
+    class _FakeScanner:
+        def __init__(self, creds, **kw):
+            seen["creds"] = creds
+            seen["use_nmap"] = kw.get("use_nmap")
+        async def scan(self, targets, **kw):
+            return {"status": "SUCCESS", "scanned": len(targets), "identified": [],
+                    "reachable": [{"address": targets[0], "open_ports": [22, 443]}]}
+
+    monkeypatch.setattr(nw_scanner, "NwScanner", _FakeScanner)
     spoke = _spoke_with([])
     res = _run(spoke.handle_command("NW_SCAN", {"targets": ["10.0.0.1"]}))
-    assert res["status"] == "ERROR"
-    assert "credential" in res["message"]
+    assert res["status"] == "SUCCESS"
+    assert res["identified"] == []
+    assert res["reachable"][0]["open_ports"] == [22, 443]
+    assert seen["creds"] == []
+    # nmap is the only classifier left without credentials → on by default.
+    assert seen["use_nmap"] is True
+
+
+def test_nw_scan_explicit_use_nmap_false_wins_without_credentials(monkeypatch):
+    # The credential-free nmap default must never override an explicit opt-out.
+    import nw_scanner
+
+    seen = {}
+
+    class _FakeScanner:
+        def __init__(self, creds, **kw):
+            seen["use_nmap"] = kw.get("use_nmap")
+        async def scan(self, targets, **kw):
+            return {"status": "SUCCESS", "scanned": 1, "identified": [], "reachable": []}
+
+    monkeypatch.setattr(nw_scanner, "NwScanner", _FakeScanner)
+    spoke = _spoke_with([])
+    _run(spoke.handle_command("NW_SCAN", {"targets": ["10.0.0.1"],
+                                          "options": {"use_nmap": False}}))
+    assert seen["use_nmap"] is False
+
+
+def test_nw_scan_with_credentials_leaves_nmap_off_by_default(monkeypatch):
+    # Credentialed scans keep the cheap default: SSH/SNMP identify, no nmap.
+    import nw_scanner
+
+    seen = {}
+
+    class _FakeScanner:
+        def __init__(self, creds, **kw):
+            seen["use_nmap"] = kw.get("use_nmap")
+        async def scan(self, targets, **kw):
+            return {"status": "SUCCESS", "scanned": 1, "identified": [], "reachable": []}
+
+    monkeypatch.setattr(nw_scanner, "NwScanner", _FakeScanner)
+    spoke = _spoke_with([])
+    _run(spoke.handle_command("NW_SCAN", {
+        "targets": ["10.0.0.1"],
+        "credentials": [{"name": "c", "username": "u", "password": "p"}]}))
+    assert seen["use_nmap"] is False
 
 
 def test_nw_scan_masks_nested_credentials():
