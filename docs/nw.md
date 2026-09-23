@@ -28,7 +28,7 @@ In the WebUI this is the **Network Devices** view (Setup → Network Devices til
 No port served. Per-device transports (chosen by `object_type` + `transport`):
 - **SSH/CLI** (`SshCliDriver`, `transports/cli_io.py`, asyncssh + per-vendor text parsers): AOS-Switch (`aos_switch`, default ssh), Junos EX (`ex_switch`, ssh). `enable_secret` enters enable mode on AOS-S. Supports LLDP neighbor discovery parsing.
 - **REST** (`RestDriver`, `transports/rest_io.py`, httpx): AOS-CX RESTv1/v10 basic auth (`cx_switch`, default rest), Aruba/HPE gateway REST bearer (`gateway`, default rest). TLS verify controlled by `LM_NW_VERIFY_TLS` (default off).
-- **SNMP** (`SnmpDriver`, `transports/snmp_io.py`, pysnmp-lextudio, SNMPv2c): valid for any family.
+- **SNMP** (`SnmpDriver`, `transports/snmp_io.py`, pysnmp 7.x, SNMPv2c): valid for any family.
 - Vendor command map in `_VENDOR_COMMANDS` (`aos_switch`, `cx_switch`, `ex_switch`, `gateway`).
 
 ## Environment variables

@@ -88,7 +88,7 @@ All four object types also support SNMP (v2c) as an alternate/fallback
 transport (`transport=snmp`). `transport=auto` selects the per-type default.
 
 Drivers are real (not stubbed):
-- **SnmpDriver** — SNMPv2c via pysnmp-lextudio, standard MIBs only (IF-MIB,
+- **SnmpDriver** — SNMPv2c via pysnmp 7.x (v1arch asyncio), standard MIBs only (IF-MIB,
   IP-MIB, BRIDGE-MIB) so the same OIDs work across all four families. Requires
   `snmp_community` on the device. Blocking pysnmp calls run via
   `asyncio.to_thread`.
