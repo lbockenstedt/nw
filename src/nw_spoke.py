@@ -473,19 +473,32 @@ class NwSpoke(BaseSpoke):
         if not targets:
             return {"status": "ERROR", "message": "NW_SCAN requires a non-empty targets list"}
         if not credentials:
-            return {"status": "ERROR", "message": "NW_SCAN requires at least one credential set"}
+            # Discovery-only pass. Credentials are OPTIONAL: without them the
+            # scanner still TCP-probes every target for reachability + open
+            # management ports (and can still classify via nmap when enabled),
+            # it just cannot SSH/SNMP-identify. That makes "what is on this
+            # subnet?" answerable without first creating a device account.
+            logger.info("NW_SCAN with no credentials — discovery-only pass "
+                        "(reachability + open ports, no SSH/SNMP identify)")
         ports = opts.get("tcp_ports") or DEFAULT_TCP_PORTS
         try:
             ports = tuple(int(p) for p in ports)
         except (TypeError, ValueError):
             ports = DEFAULT_TCP_PORTS
         crawl = bool(opts.get("crawl", False))
+        # Without credentials, nmap service detection is the ONLY way left to
+        # classify a host, so opt into it by default for a discovery-only pass
+        # (an explicit use_nmap in the options always wins). _nmap_augment
+        # silently no-ops when nmap isn't installed, so this can't break a scan.
+        use_nmap = opts.get("use_nmap")
+        if use_nmap is None:
+            use_nmap = not credentials
         try:
             scanner = NwScanner(
                 credentials,
                 tcp_ports=ports,
                 try_snmp=bool(opts.get("try_snmp", True)),
-                use_nmap=bool(opts.get("use_nmap", False)),
+                use_nmap=bool(use_nmap),
                 concurrency=int(opts.get("concurrency") or 32),
                 tcp_timeout=float(opts.get("tcp_timeout") or 1.5),
                 target_timeout=float(opts.get("target_timeout") or 20.0),
