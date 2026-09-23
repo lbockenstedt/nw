@@ -1,6 +1,6 @@
 # nw — Network Devices Spoke (Lab Manager Module)
 
-The `nw` module is the authoritative network device management spoke for the Lab Manager (LM) ecosystem. It provides continuous polling, device discovery, topology mapping, port status monitoring, MAC/ARP extraction, VLAN provisioning, and certificate deployment across multi-vendor switches, access points, and network gateways.
+The `nw` module is the authoritative network device management spoke for the Lab Manager (LM) ecosystem. It provides continuous polling, device discovery, topology mapping, port status monitoring, MAC/ARP extraction, VLAN inspection, and certificate deployment across multi-vendor switches, access points, and network gateways.
 
 ---
 
@@ -49,16 +49,16 @@ The spoke operates as a lightweight, high-performance orchestration layer betwee
    - Manages asynchronous, non-blocking polling loops for fleet reachability (ICMP pings) and detailed device telemetry.
    - Implements anti-stampede jitter, per-tick concurrency throttling, and automatic backoff for unresponsive hardware.
 5. **Per-Vendor Transports (`transports/`):**
-   - Specialized drivers for **ArubaOS-CX** (HTTPS REST API v10), **HP ProCurve / AOS-S** (SSH CLI with VT terminal emulation), **Cisco IOS/IOS-XE** (CLI sessions), and **Generic SNMP** (SNMPv2c/v3).
+   - Specialized drivers for **ArubaOS-CX** (HTTPS REST API v10), **HP ProCurve / AOS-S** (SSH CLI with VT terminal emulation), **Juniper EX** (SSH CLI), and **Generic SNMP** (SNMPv2c).
 
 ---
 
 ## Features
 
-- **Multi-Vendor Device Polling:** Unified polling engine for ArubaOS-CX, HP ProCurve (AOS-S), Cisco IOS/XE, and SNMP-enabled appliances.
+- **Multi-Vendor Device Polling:** Unified polling engine for ArubaOS-CX, HP ProCurve (AOS-S), Juniper EX, and SNMP-enabled appliances.
 - **Auto-Discovery & Fingerprinting:** Rapid scanning of CIDR blocks, automatically detecting vendor models, firmware versions, serial numbers, and management endpoints.
-- **LLDP & CDP Topology Mapping:** Automated neighbor extraction across ports to map physical and logical datacenter topology.
-- **VLAN Provisioning:** Query and inspect configured 802.1Q VLANs and port memberships.
+- **LLDP Topology Mapping:** Automated neighbor extraction across ports to map physical and logical datacenter topology.
+- **VLAN Inspection:** Query and inspect configured 802.1Q VLANs and port memberships.
 - **Port Operational Status & Metrics:** Real-time port speeds, duplex modes, administrative status, PoE power delivery, and traffic statistics.
 - **Fused ARP & MAC Tables:** Fuses layer-2 MAC address tables with layer-3 ARP bindings into deduplicated endpoint records with standardized MAC formatting (`aa:bb:cc:dd:ee:ff`).
 - **Hub-Brokered SSL Certificate Installation:** Installs Let's Encrypt certificates directly into switch web interfaces (ArubaOS-CX REST API) via `INSTALL_CERT`.
@@ -83,8 +83,8 @@ The spoke receives commands from the Lab Manager hub over WebSocket and executes
 | `NW_GET_ENDPOINTS` | `device_id`, `tenant` *(optional)* | Returns fused ARP + MAC table of unique active IP/MAC endpoints seen on the device. |
 | `NW_GET_VLANS` | `device_id`, `tenant` *(optional)* | Lists 802.1Q VLAN IDs and names configured on the switch. |
 | `NW_POLL` | `device_id`, `tenant` *(optional)* | Comprehensive multi-metric poll (probe, info, interfaces, ARP, and MAC table) in one pass. |
-| `NW_RUN_CONFIG` | `device_id`, `commands` | Stages or executes configuration commands on the target switch transport. |
-| `NW_SCAN` / `NW_DISCOVER` | `subnets`, `credentials`, `options` | Probes candidate IP addresses, fingerprinting manageable devices without modifying fleet. |
+| `NW_RUN_CONFIG` | `device_id`, `commands` | Stub handler returning not-implemented envelope (config push planned for phase 3). |
+| `NW_SCAN` / `NW_DISCOVER` | `targets`, `credentials`, `options` | Probes candidate IP addresses, fingerprinting manageable devices without modifying fleet. |
 | `INSTALL_CERT` | `identifier`, `fullchain`, `privkey` | Installs delivered SSL/TLS certificates onto the target device management interface. |
 
 ---
