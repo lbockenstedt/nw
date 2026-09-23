@@ -203,3 +203,45 @@ def test_scan_lldp_crawl_enqueues_neighbors():
     addrs = {d["address"] for d in res["identified"]}
     assert addrs == {"10.0.0.1", "10.0.0.2"}
     assert res["scanned"] == 2
+
+
+# ── discovery_only: the result must say whether credentials were in play ─────
+# Scan credentials are optional. Without them nothing can SSH/SNMP-identify, so
+# every classification comes from nmap service detection and carries no
+# credential or vault reference behind it. The reply used to look identical to a
+# credentialed scan that simply failed everywhere, so the hub could not tell
+# "identified nothing because nothing was offered" from "the credentials failed
+# on every host" — and could not safely decide whether auto-add was allowed.
+def test_scan_without_credentials_reports_discovery_only():
+    scanner = NwScanner(
+        [],
+        tcp_probe=make_probe({"10.0.0.1": {22, 443}}),
+        ssh_identify=make_ssh({}),
+        snmp_identify=make_snmp({}),
+    )
+    res = run(scanner.scan(["10.0.0.1"]))
+    assert res["discovery_only"] is True
+    assert res["status"] == "SUCCESS"
+
+
+def test_scan_with_credentials_is_not_discovery_only():
+    scanner = NwScanner(
+        CREDS,
+        tcp_probe=make_probe({"10.0.0.1": {22, 443}}),
+        ssh_identify=make_ssh({"10.0.0.1": "ArubaOS-CX FL.10.09 6300M"}),
+        snmp_identify=make_snmp({}),
+    )
+    res = run(scanner.scan(["10.0.0.1"]))
+    assert res["discovery_only"] is False
+
+
+def test_discovery_only_is_reported_even_when_nothing_is_reachable():
+    scanner = NwScanner(
+        [],
+        tcp_probe=make_probe({}),
+        ssh_identify=make_ssh({}),
+        snmp_identify=make_snmp({}),
+    )
+    res = run(scanner.scan(["10.0.0.1"]))
+    assert res["identified"] == [] and res["reachable"] == []
+    assert res["discovery_only"] is True

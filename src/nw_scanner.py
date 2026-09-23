@@ -382,6 +382,13 @@ class NwScanner:
         return {
             "status": "SUCCESS",
             "scanned": scanned,
+            # Credentials are optional. Without them the pass is discovery-only:
+            # every identification came from nmap service detection, not an
+            # SSH/SNMP login, and carries no credential or vault reference. Say
+            # so explicitly — "identified nothing because nothing was offered"
+            # and "the credentials failed on every host" are different outcomes
+            # and the hub/UI could not previously tell them apart.
+            "discovery_only": not self.credentials,
             "identified": identified,
             "reachable": reachable,
         }
