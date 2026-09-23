@@ -111,6 +111,7 @@ def merge_endpoints(arp: Any, mac_table: Any,
     by_mac: Dict[str, Dict[str, Any]] = {}
 
     def _slot(mac: str) -> Dict[str, Any]:
+        """Return or initialize an endpoint dictionary slot for a MAC address."""
         return by_mac.setdefault(mac, {"mac": mac, "ip": "", "vlan": "",
                                        "os": "", "interface": ""})
 
@@ -148,6 +149,7 @@ def summarize_vlans(endpoints: Any, interfaces: Any = None) -> List[Dict[str, An
     vlans: Dict[str, Dict[str, Any]] = {}
 
     def _slot(vlan: str) -> Dict[str, Any]:
+        """Return or initialize a summary dictionary slot for a VLAN ID."""
         return vlans.setdefault(vlan, {"vlan": vlan, "endpoints": 0,
                                        "macs": 0, "ips": 0, "gateway_ip": ""})
 
@@ -197,6 +199,7 @@ def enrich_vlans(native_rows: Any, endpoints: Any,
 
 
 def _err(message: str, data: Any = None) -> Dict[str, Any]:
+    """Construct an error response envelope with message and optional data payload."""
     return {"status": "ERROR", "data": data if data is not None else [],
             "message": message}
 
@@ -263,11 +266,13 @@ class _SharedTransportSession:
     after that, failures degrade to per-datum ERROR envelopes."""
 
     def __init__(self, factory):
+        """Initialize SharedSession with a session factory callable."""
         self._factory = factory
         self.session = None
         self._reconnect_used = False
 
     async def open(self) -> None:
+        """Create and connect a new underlying transport session."""
         s = self._factory()
         try:
             await s.connect()
@@ -294,6 +299,7 @@ class _SharedTransportSession:
             return False
 
     async def close(self) -> None:
+        """Close the active underlying transport session safely."""
         s, self.session = self.session, None
         if s is not None:
             try:
@@ -324,6 +330,7 @@ class NwDriver:
     shares_session = False
 
     def __init__(self, device: Dict[str, Any]):
+        """Initialize driver instance with target device parameters and resolved transport."""
         self.device = device
         self.device_id = device.get("id", "")
         self.object_type = device.get("object_type", "")
@@ -370,6 +377,7 @@ class NwDriver:
 
     @staticmethod
     def _resolve_transport(device: Dict[str, Any]) -> str:
+        """Determine effective transport ('ssh', 'rest', 'snmp') for the device."""
         t = (device.get("transport") or "auto").strip().lower()
         if t not in _VALID_TRANSPORTS:
             t = "auto"
@@ -378,35 +386,44 @@ class NwDriver:
         return t
 
     def _log(self, method: str, extra: str = "") -> None:
+        """Log a standard formatted driver action message."""
         tag = f"[{self.object_type}/{self.transport}] {method} on {self.address}"
         logger.info(f"{tag} {extra}".rstrip())
 
     def _ok(self, data: Any, message: str = "") -> Dict[str, Any]:
+        """Construct a successful status envelope."""
         return {"status": "SUCCESS", "data": data, "message": message}
 
     # ── Datum methods (transport subclasses override) ────────────────────────
     async def probe(self) -> Dict[str, Any]:
+        """Probe device reachability and latency."""
         return _err("probe not implemented for this transport",
                     {"reachable": False, "latency_ms": 0})
 
     async def get_device_info(self) -> Dict[str, Any]:
+        """Fetch device hardware model, serial, version, and hostname."""
         return _err("device info not implemented for this transport")
 
     async def get_mac_table(self) -> Dict[str, Any]:
+        """Fetch forwarding database (MAC address table)."""
         return _err("mac table not implemented for this transport")
 
     async def get_arp(self) -> Dict[str, Any]:
+        """Fetch ARP table IP-to-MAC bindings."""
         return _err("arp not implemented for this transport")
 
     async def get_interfaces(self) -> Dict[str, Any]:
+        """Fetch interface operational status, counters, and properties."""
         return _err("interfaces not implemented for this transport")
 
     async def get_vlans(self) -> Dict[str, Any]:
+        """Fetch configured 802.1Q VLAN IDs and names."""
         # Native VLAN list (`show vlan`). Only the CLI driver implements it; other
         # transports degrade so the engine falls back to endpoint-derived VLANs.
         return _err("vlans not implemented for this transport")
 
     async def run_config(self, commands: List[str]) -> Dict[str, Any]:
+        """Execute configuration commands against the target device."""
         # TODO(phase3): push CLI/REST config changes. Out of scope for the
         # polling work — returns a clear not-implemented envelope so a caller
         # doesn't mistake silence for success.
@@ -708,6 +725,7 @@ class NwEngine:
 
     def set_devices(self, devices: List[Dict[str, Any]],
                     shared_tenant_id: str = "") -> None:
+        """Update active fleet device definitions and shared tenant ID."""
         self.devices = list(devices or [])
         self.shared_tenant_id = shared_tenant_id or ""
         types = {}
@@ -730,6 +748,7 @@ class NwEngine:
 
     def _get_device(self, device_id: str,
                     tenant: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Find a device dictionary by ID and tenant visibility filter."""
         for d in self.devices:
             if d.get("id") == device_id and self._tenant_matches(d, tenant):
                 return d
@@ -737,6 +756,7 @@ class NwEngine:
 
     def _driver_for(self, device_id: str,
                     tenant: Optional[str] = None) -> Optional[NwDriver]:
+        """Construct a resolved NwDriver instance for the specified device ID."""
         d = self._get_device(device_id, tenant)
         if not d:
             return None
@@ -871,6 +891,7 @@ class NwEngine:
         return (time.monotonic() - float(r.get("checked_at", 0.0))) <= ttl
 
     async def probe(self, device_id: str, tenant: Optional[str] = None) -> Dict[str, Any]:
+        """Probe reachability for a single device in the fleet."""
         drv = self._driver_for(device_id, tenant)
         if not drv:
             logger.warning("nw probe: device %s not in fleet", device_id)
@@ -883,6 +904,7 @@ class NwEngine:
         return res
 
     async def get_device_info(self, device_id: str, tenant: Optional[str] = None) -> Dict[str, Any]:
+        """Fetch hardware metadata and OS version for a single device."""
         drv = self._driver_for(device_id, tenant)
         if not drv:
             logger.warning("nw get_device_info: device %s not in fleet", device_id)
@@ -892,6 +914,7 @@ class NwEngine:
         return res
 
     async def get_mac_table(self, device_id: str, tenant: Optional[str] = None) -> Dict[str, Any]:
+        """Fetch forwarding MAC table entries for a single device."""
         drv = self._driver_for(device_id, tenant)
         if not drv:
             logger.warning("nw get_mac_table: device %s not in fleet", device_id)
@@ -913,6 +936,7 @@ class NwEngine:
         return res
 
     async def get_arp(self, device_id: str, tenant: Optional[str] = None) -> Dict[str, Any]:
+        """Fetch ARP table entries for a single device."""
         drv = self._driver_for(device_id, tenant)
         if not drv:
             logger.warning("nw get_arp: device %s not in fleet", device_id)
@@ -922,6 +946,7 @@ class NwEngine:
         return res
 
     async def get_interfaces(self, device_id: str, tenant: Optional[str] = None) -> Dict[str, Any]:
+        """Fetch interface operational status and metrics for a single device."""
         drv = self._driver_for(device_id, tenant)
         if not drv:
             logger.warning("nw get_interfaces: device %s not in fleet", device_id)
@@ -990,6 +1015,7 @@ class NwEngine:
         concurrently. A datum that raises is coerced to an ERROR envelope so
         the merge still runs on whatever succeeded."""
         async def _safe(coro):
+            """Safely await a coroutine, converting any exception to an ERROR envelope."""
             try:
                 return await coro
             except Exception as e:  # noqa: BLE001 - degrade to ERROR envelope
@@ -1016,6 +1042,7 @@ class NwEngine:
 
     async def run_config(self, device_id: str, commands: List[str],
                          tenant: Optional[str] = None) -> Dict[str, Any]:
+        """Apply configuration commands to a managed device via its transport driver."""
         drv = self._driver_for(device_id, tenant)
         if not drv:
             logger.warning("nw run_config: device %s not in fleet", device_id)
@@ -1184,6 +1211,7 @@ class NwEngine:
             }
 
         async def _safe(coro, label):
+            """Safely execute a poll datum coroutine, logging outcome and collecting errors."""
             r = await coro
             self._log_datum(label, drv, r)
             if r.get("status") == "SUCCESS":
