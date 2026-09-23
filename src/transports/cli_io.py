@@ -862,6 +862,227 @@ async def cli_get_lldp_neighbors(session: CliSession, object_type: str) -> List[
     return parse_lldp_neighbors(text)
 
 
+#: LLDP commands that return the DETAILED neighbour view, per family. The
+#: crawl-only ``cli_get_lldp_neighbors`` above deliberately asks for the same
+#: text but keeps only management IPs; topology needs the ports and chassis ids
+#: that view throws away, so it is parsed separately rather than widened (the
+#: scanner's crawl contract is "a list of IPs to enqueue").
+_LLDP_DETAIL_CMDS = {
+    "aos_switch": "show lldp info remote-device",
+    "cx_switch": "show lldp neighbor-info detail",
+    "ex_switch": "show lldp neighbors",
+    "gateway": "show ap lldp neighbors",
+}
+
+
+def _parse_lldp_detail_raw(text: str, object_type: str = "") -> List[dict]:
+    if not text or not text.strip():
+        return []
+
+    # MAC normalisation helper
+    def normalise_mac(mac_str):
+        import re
+        cleaned = re.sub(r'[^0-9a-fA-F]', '', mac_str)
+        if len(cleaned) == 12:
+            return ':'.join([cleaned[i:i+2].lower() for i in range(0, 12, 2)])
+        return mac_str.strip()
+
+    # Try FORMAT B (key/value blocks) first
+    try:
+        records = []
+        current_record = {}
+        lines = text.splitlines()
+        for line in lines:
+            if not line.strip():
+                if current_record:
+                    records.append(current_record)
+                    current_record = {}
+                continue
+            if ':' not in line:
+                continue
+            key, value = line.split(':', 1)
+            key = re.sub(r'[^a-zA-Z0-9]', '', key).lower()
+            value = value.strip()
+            if key == 'port':
+                if current_record:
+                    records.append(current_record)
+                current_record = {"local_port": value, "remote_chassis": "",
+                                  "remote_port": "", "remote_name": "",
+                                  "remote_mgmt_ip": "", "remote_descr": ""}
+            elif key == 'chassisid':
+                current_record["remote_chassis"] = normalise_mac(value)
+            elif key == 'portid':
+                current_record["remote_port"] = value
+            elif key == 'portdescription' and not current_record.get("remote_descr"):
+                current_record["remote_descr"] = value
+            elif key == 'systemname':
+                current_record["remote_name"] = value
+            elif key == 'systemdescription':
+                current_record["remote_descr"] = value
+            elif key == 'managementaddress':
+                current_record["remote_mgmt_ip"] = value
+        if current_record:
+            records.append(current_record)
+        if records:
+            return records
+    except Exception:
+        pass
+
+    # Try FORMAT A (AOS-S pipe-table)
+    try:
+        lines = text.splitlines()
+        header_found = False
+        records = []
+        for line in lines:
+            if not header_found and "LocalPort" in line and "ChassisId" in line:
+                header_found = True
+                continue
+            if not header_found or not line.strip() or line.startswith("-"):
+                continue
+            parts = line.split("|", 1)
+            if len(parts) < 2 or not parts[0].strip():
+                continue
+            local_port = parts[0].strip()
+            right_side = parts[1]
+            tokens = right_side.split()
+            if len(tokens) < 6:
+                continue
+            chassis_id = " ".join(tokens[:6])
+            remote_chassis = normalise_mac(chassis_id)
+            remote_port = tokens[6] if len(tokens) > 6 else ""
+            remote_name = tokens[-1] if len(tokens) > 7 else ""
+            remote_descr = " ".join(tokens[7:-1]) if len(tokens) > 8 else ""
+            records.append({
+                "local_port": local_port,
+                "remote_chassis": remote_chassis,
+                "remote_port": remote_port,
+                "remote_name": remote_name,
+                "remote_mgmt_ip": "",
+                "remote_descr": remote_descr
+            })
+        if records:
+            return records
+    except Exception:
+        pass
+
+    # Try generic column-table parser (FORMAT C and D)
+    try:
+        lines = text.splitlines()
+        header_line_index = -1
+        for i, line in enumerate(lines):
+            if "chassis" in line.lower():
+                header_line_index = i
+                break
+        if header_line_index == -1:
+            return []
+        header_tokens = lines[header_line_index].split()
+        records = []
+        seen = set()
+        for i in range(header_line_index + 1, len(lines)):
+            line = lines[i]
+            if not line.strip() or line.startswith("-"):
+                continue
+            tokens = line.split()
+            if not tokens:
+                continue
+            try:
+                chassis_idx = -1
+                for j, token in enumerate(tokens):
+                    normalized = normalise_mac(token)
+                    if normalized != token and len(re.sub(r'[^0-9a-fA-F]', '', token)) == 12:
+                        chassis_idx = j
+                        break
+                    elif len(re.sub(r'[^0-9a-fA-F]', '', token)) == 12:
+                        chassis_idx = j
+                        break
+                if chassis_idx == -1:
+                    continue
+                remote_chassis = normalise_mac(tokens[chassis_idx])
+                remote_port = tokens[chassis_idx + 1] if chassis_idx + 1 < len(tokens) else ""
+                remote_name = tokens[-1]
+                local_port = tokens[0]
+                if chassis_idx > 0 and tokens[chassis_idx - 1] not in ["-", "ae0"]:
+                    local_port = tokens[chassis_idx - 1]
+                record_key = (local_port, remote_chassis, remote_port)
+                if record_key in seen:
+                    continue
+                seen.add(record_key)
+                records.append({
+                    "local_port": local_port,
+                    "remote_chassis": remote_chassis,
+                    "remote_port": remote_port,
+                    "remote_name": remote_name,
+                    "remote_mgmt_ip": "",
+                    "remote_descr": ""
+                })
+            except Exception:
+                continue
+        if records:
+            return records
+    except Exception:
+        pass
+
+    return []
+
+
+
+def parse_lldp_detail(text: str, object_type: str = "") -> List[dict]:
+    """Structured LLDP neighbours, de-duplicated.
+
+    Dedup lives here rather than in each layout parser because there are three
+    return paths inside the worker and a new vendor layout would silently skip
+    it. A switch can legitimately report the same neighbour twice — once per
+    LLDP TLV refresh in a paged capture, or once per member of a LAG — and a
+    duplicated edge draws a duplicated link on the map.
+
+    Keeps the first occurrence and lets later duplicates fill in fields the
+    first one left blank, so a terse row followed by a detailed one yields one
+    complete edge rather than two partial ones.
+    """
+    try:
+        rows = _parse_lldp_detail_raw(text, object_type)
+    except Exception:
+        logger.debug("lldp detail parse failed", exc_info=True)
+        return []
+    out: List[dict] = []
+    index: Dict[tuple, dict] = {}
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        key = (row.get("local_port", ""), row.get("remote_chassis", ""),
+               row.get("remote_port", ""))
+        if key in index:
+            kept = index[key]
+            for field, value in row.items():
+                if value and not kept.get(field):
+                    kept[field] = value
+            continue
+        index[key] = row
+        out.append(row)
+    return out
+
+
+async def cli_get_lldp_detail(session: CliSession, object_type: str) -> List[dict]:
+    """Run the vendor LLDP-neighbour command and return structured link records.
+
+    Unlike ``cli_get_lldp_neighbors`` (which reduces the same output to a list
+    of management IPs for the scanner's crawl), this keeps the local port,
+    remote chassis id, remote port and remote system name — the four fields a
+    topology edge is made of.
+
+    Best-effort by design: a device with LLDP disabled, or one whose CLI
+    rejects the command, simply contributes no edges rather than failing the
+    whole topology build.
+    """
+    cmd = _LLDP_DETAIL_CMDS.get(object_type, "show lldp neighbors")
+    try:
+        text = await session.run(cmd)
+    except Exception:
+        logger.debug("cli lldp detail failed for %s", object_type, exc_info=True)
+        return []
+    return parse_lldp_detail(text, object_type)
+
+
 # object_type → (arp, mac, interfaces) parser triple
 PARSERS: Dict[str, Any] = {
     "aos_switch": (parse_arp_aos_s, parse_mac_aos_s, parse_interfaces_aos_s),
