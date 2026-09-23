@@ -412,6 +412,10 @@ class NwDriver:
         """Fetch ARP table IP-to-MAC bindings."""
         return _err("arp not implemented for this transport")
 
+    async def get_lldp_neighbors(self) -> Dict[str, Any]:
+        """Fetch structured LLDP neighbour records (topology edges)."""
+        return _err("lldp not implemented for this transport")
+
     async def get_interfaces(self) -> Dict[str, Any]:
         """Fetch interface operational status, counters, and properties."""
         return _err("interfaces not implemented for this transport")
@@ -560,6 +564,10 @@ class SshCliDriver(NwDriver):
     async def get_mac_table(self) -> Dict[str, Any]:
         from transports import cli_io
         return await self._with_session(cli_io.cli_get_mac_table)
+
+    async def get_lldp_neighbors(self) -> Dict[str, Any]:
+        from transports import cli_io
+        return await self._with_session(cli_io.cli_get_lldp_detail)
 
     async def get_interfaces(self) -> Dict[str, Any]:
         from transports import cli_io
@@ -933,6 +941,26 @@ class NwEngine:
             return self._ok_or_partial(merged, [arp, mac], "mac(s)")
         res = await drv.get_mac_table()
         self._log_datum("mac_table", drv, res)
+        return res
+
+    async def get_lldp_neighbors(self, device_id: str,
+                                 tenant: Optional[str] = None) -> Dict[str, Any]:
+        """Fetch structured LLDP neighbour records for a single device.
+
+        Each record is one topology edge as the device sees it: which local
+        port, and the chassis id / port / system name on the other end.
+
+        A device that does not speak LLDP (or has it disabled) is NOT an error
+        — it returns an empty list. Topology is assembled from whatever the
+        fleet can tell us, and the gaps are exactly what the hub then fills in
+        from MAC-table inference and operator-declared links.
+        """
+        drv = self._driver_for(device_id, tenant)
+        if not drv:
+            logger.warning("nw get_lldp_neighbors: device %s not in fleet", device_id)
+            return _err(f"Device {device_id} not found")
+        res = await drv.get_lldp_neighbors()
+        self._log_datum("lldp", drv, res)
         return res
 
     async def get_arp(self, device_id: str, tenant: Optional[str] = None) -> Dict[str, Any]:
