@@ -1,9 +1,21 @@
-"""SNMP v2c transport for the nw drivers (pysnmp-lextudio).
+"""SNMP v2c transport for the nw drivers (pysnmp 7.x).
 
-Lazy-imports pysnmp inside the session methods so the module imports cleanly
-without pysnmp installed (the spoke venv has it; the test env doesn't). All
-pysnmp hlapi calls are blocking, so the driver runs them via
-``asyncio.to_thread`` to keep the spoke's event loop free.
+Lazy-imports pysnmp inside ``SnmpSession._hlapi`` so the module imports cleanly
+without pysnmp installed (the spoke venv has it; the test env doesn't).
+
+pysnmp 7.x REMOVED the synchronous ``pysnmp.hlapi`` API this module was written
+against — ``pysnmp.hlapi`` is now an empty namespace, so the old import raised
+ImportError from outside the ``try`` in get()/walk() and SNMP was entirely
+non-functional (nw#103). It now targets ``pysnmp.hlapi.v1arch.asyncio``:
+``SnmpDispatcher`` (a context manager), an awaited
+``UdpTransportTarget.create()``, ``get_cmd``, and ``walk_cmd`` (an async
+generator). ``ContextData`` does not exist in v1arch and is gone.
+
+``SnmpSession.get``/``.walk`` deliberately remain BLOCKING despite the async
+library underneath: every caller reaches them via ``asyncio.to_thread`` (see
+``_to_thread``), so they run on a worker thread and drive a private event loop.
+Keeping the signatures blocking is what let this port stay confined to one
+class.
 
 Standard MIBs only (numeric OIDs, no MIB-file dependency) — these work across
 all four nw families (AOS-S, AOS-CX, Juniper EX, Aruba/HPE gateway) because
@@ -56,7 +68,9 @@ class SnmpError(Exception):
 # ── SnmpSession: blocking pysnmp get/walk (run via to_thread) ────────────────
 class SnmpSession:
     """SNMPv2c community session. Raises SnmpError if no community is configured
-    or the agent doesn't respond within the timeout."""
+    or the agent doesn't respond within the timeout.
+    
+    Targets pysnmp 7.x v1arch asyncio API; public methods stay blocking on purpose."""
 
     def __init__(self, device: Dict[str, Any], timeout: float = 2.0,
                  retries: int = 1):
@@ -72,62 +86,103 @@ class SnmpSession:
         self.retries = int(retries)
 
     def _hlapi(self):
-        from pysnmp.hlapi import (SnmpEngine, CommunityData, UdpTransportTarget,
-                                  ContextData, ObjectType, ObjectIdentity,
-                                  getCmd, nextCmd)
-        return (SnmpEngine, CommunityData, UdpTransportTarget, ContextData,
-                ObjectType, ObjectIdentity, getCmd, nextCmd)
+        from pysnmp.hlapi.v1arch.asyncio import (SnmpDispatcher, CommunityData,
+                                                 UdpTransportTarget, ObjectType,
+                                                 ObjectIdentity, get_cmd, walk_cmd)
+        return (SnmpDispatcher, CommunityData, UdpTransportTarget, ObjectType,
+                ObjectIdentity, get_cmd, walk_cmd)
 
-    def _target(self, UdpTransportTarget):
-        return UdpTransportTarget((self.host, self.port),
-                                  timeout=self.timeout, retries=self.retries)
+    async def _target(self, UdpTransportTarget):
+        try:
+            return await UdpTransportTarget.create((self.host, self.port),
+                                                   timeout=self.timeout,
+                                                   retries=self.retries)
+        except SnmpError:
+            raise
+        except Exception as e:
+            raise SnmpError(f"transport setup for {self.host}: {e}")
+
+    async def _aget(self, oid: str) -> Optional[Any]:
+        (SnmpDispatcher, CommunityData, UdpTransportTarget, ObjectType,
+         ObjectIdentity, get_cmd, walk_cmd) = self._hlapi()
+        with SnmpDispatcher() as dispatcher:
+            target = await self._target(UdpTransportTarget)
+            err, es, ei, var = await get_cmd(
+                dispatcher, CommunityData(self.community, mpModel=1),
+                target, ObjectType(ObjectIdentity(oid)))
+            if err:
+                raise SnmpError(f"get {oid} on {self.host}: {err}")
+            if es:
+                raise SnmpError(f"get {oid} on {self.host}: {es} at {ei}")
+            if not var:
+                return None
+            return _value_of(var[0])
+
+    async def _awalk(self, oid: str) -> List[Tuple[str, Any]]:
+        (SnmpDispatcher, CommunityData, UdpTransportTarget, ObjectType,
+         ObjectIdentity, get_cmd, walk_cmd) = self._hlapi()
+        with SnmpDispatcher() as dispatcher:
+            target = await self._target(UdpTransportTarget)
+            out: List[Tuple[str, Any]] = []
+            async for err, es, ei, var in walk_cmd(
+                    dispatcher, CommunityData(self.community, mpModel=1),
+                    target, ObjectType(ObjectIdentity(oid)),
+                    lexicographicMode=False):
+                if err:
+                    # "no SNMP response" → timeout; stop what we have.
+                    if "no" in str(err).lower() and "response" in str(err).lower():
+                        if not out:
+                            raise SnmpError(f"walk {oid} on {self.host}: {err}")
+                        break
+                    break
+                if es:
+                    break
+                for vb in (var or []):
+                    full = _oid_str(vb[0])
+                    out.append((full, _value_of(vb)))
+        return out
+
+    def _run(self, coro):
+        """Drive one coroutine to completion on a private event loop.
+
+        Both public methods stay blocking because every caller reaches them
+        through ``asyncio.to_thread`` (see ``_to_thread`` below) — i.e. from a
+        worker thread that has no running loop of its own. Creating, using and
+        closing a loop per call is correct there, and the loop is ALWAYS closed
+        so the thread pool doesn't accumulate them.
+        """
+        try:
+            prev = asyncio.get_event_loop_policy().get_event_loop()
+        except Exception:  # noqa: BLE001 — a worker thread has no loop yet
+            prev = None
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+            # Unconditional: leaving the CLOSED loop installed as this thread's
+            # loop would break the next call made on the same pooled thread.
+            try:
+                asyncio.set_event_loop(prev)
+            except Exception:  # noqa: BLE001
+                pass
 
     def get(self, oid: str) -> Optional[Any]:
-        (SnmpEngine, CommunityData, UdpTransportTarget, ContextData,
-         ObjectType, ObjectIdentity, getCmd, nextCmd) = self._hlapi()
-        try:
-            transport = self._target(UdpTransportTarget)
-        except Exception as e:
-            raise SnmpError(f"transport setup for {self.host}: {e}")
-        err, es, ei, var = next(getCmd(
-            SnmpEngine(), CommunityData(self.community, mpModel=1),
-            transport, ContextData(), ObjectType(ObjectIdentity(oid))))
-        if err:
-            raise SnmpError(f"get {oid} on {self.host}: {err}")
-        if es:
-            raise SnmpError(f"get {oid} on {self.host}: {es} at {ei}")
-        if not var:
-            return None
-        # var[0] is an ObjectType; .prettyPrint() yields the value.
-        return _value_of(var[0])
+        return self._run(self._aget(oid))
 
     def walk(self, oid: str) -> List[Tuple[str, Any]]:
-        """Walk the subtree under ``oid`` → list of (full_oid_str, value)."""
-        (SnmpEngine, CommunityData, UdpTransportTarget, ContextData,
-         ObjectType, ObjectIdentity, getCmd, nextCmd) = self._hlapi()
+        return self._run(self._awalk(oid))
+
+
+def _oid_str(name):
+    try:
+        return str(name.getOid()).lstrip(".")
+    except Exception:
         try:
-            transport = self._target(UdpTransportTarget)
-        except Exception as e:
-            raise SnmpError(f"transport setup for {self.host}: {e}")
-        out: List[Tuple[str, Any]] = []
-        it = nextCmd(
-            SnmpEngine(), CommunityData(self.community, mpModel=1),
-            transport, ContextData(), ObjectType(ObjectIdentity(oid)),
-            lexicographicMode=False)
-        for err, es, ei, var in it:
-            if err:
-                # "no SNMP response" → timeout; stop what we have.
-                if "no" in str(err).lower() and "response" in str(err).lower():
-                    if not out:
-                        raise SnmpError(f"walk {oid} on {self.host}: {err}")
-                    break
-                break
-            if es:
-                break
-            for vb in (var or []):
-                full = ".".join(str(x) for x in vb[0].asNumbers())
-                out.append((full, _value_of(vb)))
-        return out
+            return ".".join(str(x) for x in name.asNumbers()).lstrip(".")
+        except Exception:
+            return str(name).lstrip(".")
 
 
 def _value_of(var_bind) -> Any:
