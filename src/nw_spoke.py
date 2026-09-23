@@ -6,6 +6,7 @@ device telemetry, VLAN/port operations, and network discovery scans.
 
 import asyncio
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Dict, Any
@@ -27,6 +28,24 @@ logger = logging.getLogger("NwSpoke")
 _SENSITIVE = {"password", "enable_secret", "api_token", "snmp_community",
               "secret", "hub_secret"}
 
+
+
+def _norm_chassis(value: str) -> str:
+    """Canonicalize an LLDP chassis id ONLY when it is actually a MAC.
+
+    ``chassis subtype`` may be macAddress (4), but it may equally be
+    interfaceName, local or networkAddress — in which case the id is a
+    human-assigned string. Passing those through ``_norm_mac`` lower-cases
+    them, silently turning "OLKS-CORE" into a different identifier than every
+    other view of that device uses.
+    """
+    raw = "" if value is None else str(value).strip()
+    if not raw:
+        return ""
+    hex_only = re.sub(r"[^0-9A-Fa-f]", "", raw)
+    if len(hex_only) == 12:
+        return _norm_mac(raw)
+    return raw
 
 class NwSpoke(BaseSpoke):
     """Network Devices Management Spoke for Lab Manager.
@@ -279,6 +298,7 @@ class NwSpoke(BaseSpoke):
         credentials masked in logs), ``GET_VERSION``, ``NW_LIST_DEVICES`` (fleet
         summary + concurrent 3s reachability probe), ``NW_PROBE``,
         ``NW_GET_DEVICE_INFO``, ``NW_GET_MAC_TABLE``, ``NW_GET_ARP``,
+        ``NW_GET_LLDP_NEIGHBORS`` (structured topology edges),
         ``NW_GET_INTERFACES``, ``NW_GET_ENDPOINTS`` (fused ARP+MAC unique IP/MAC
         list), ``NW_GET_VLANS`` (each per-device via ``data["device_id"]``),
         ``NW_POLL`` (probe + all datums in one call, partial results on
@@ -361,6 +381,18 @@ class NwSpoke(BaseSpoke):
             # Canonicalize MACs on the way out so the hub/UI/NetBox see one form.
             if isinstance(res.get("data"), list):
                 res["data"] = [{**r, "mac": _norm_mac(r.get("mac", ""))}
+                               for r in res["data"] if isinstance(r, dict)]
+            return res
+
+        if normalized_cmd == "NW_GET_LLDP_NEIGHBORS":
+            res = await self.engine.get_lldp_neighbors(device_id, tenant)
+            # Canonicalize the remote chassis id the same way MAC/ARP rows are,
+            # so a chassis id and a MAC-table MAC compare equal when the hub
+            # stitches LLDP edges together with MAC-inferred ones. Guarded:
+            # LLDP chassis subtypes 4/5/7 carry a NAME, not a MAC, and
+            # _norm_mac would lower-case it into a different identifier.
+            if isinstance(res.get("data"), list):
+                res["data"] = [{**r, "remote_chassis": _norm_chassis(r.get("remote_chassis", ""))}
                                for r in res["data"] if isinstance(r, dict)]
             return res
 

@@ -120,7 +120,7 @@ def test_per_device_commands_error_against_fake_host():
          "address": "10.0.0.3", "transport": "snmp"},
     ])
     for cmd in ("NW_GET_MAC_TABLE", "NW_GET_ARP", "NW_GET_INTERFACES",
-                "NW_GET_DEVICE_INFO", "NW_PROBE"):
+                "NW_GET_DEVICE_INFO", "NW_PROBE", "NW_GET_LLDP_NEIGHBORS"):
         res = _run(spoke.handle_command(cmd, {"device_id": "d1"}))
         assert res["status"] == "ERROR", f"{cmd} -> {res}"
         assert "message" in res
@@ -491,3 +491,66 @@ def test_parse_lldp_neighbors():
     """
     ips = parse_lldp_neighbors(text)
     assert ips == ["10.0.0.2", "10.0.0.3"]
+
+
+# ── NW_GET_LLDP_NEIGHBORS: structured topology edges ────────────────────────
+# The chassis id is canonicalised so an LLDP edge and a MAC-table row describe
+# the SAME node when the hub stitches them together. It must be canonicalised
+# only when it really is a MAC: LLDP chassis subtypes also carry interface
+# names and locally-assigned strings, and lower-casing one of those invents a
+# second identity for the device.
+
+def _lldp_spoke(rows):
+    spoke = _spoke_with([{"id": "d1", "name": "sw", "object_type": "aos_switch",
+                          "address": "10.0.0.1", "transport": "ssh"}])
+
+    async def _fake(device_id, tenant=None):
+        return {"status": "SUCCESS", "data": list(rows), "message": ""}
+
+    spoke.engine.get_lldp_neighbors = _fake
+    return spoke
+
+
+def _edge(**kw):
+    base = {"local_port": "1", "remote_chassis": "", "remote_port": "2",
+            "remote_name": "", "remote_mgmt_ip": "", "remote_descr": ""}
+    base.update(kw)
+    return base
+
+
+def test_lldp_command_is_dispatched():
+    spoke = _lldp_spoke([_edge(remote_chassis="00:0b:86:bc:49:87",
+                               remote_name="OLKS-EDGE-1")])
+    res = _run(spoke.handle_command("NW_GET_LLDP_NEIGHBORS", {"device_id": "d1"}))
+    assert res["status"] == "SUCCESS"
+    assert res["data"][0]["remote_name"] == "OLKS-EDGE-1"
+
+
+def test_lldp_command_is_case_insensitive():
+    spoke = _lldp_spoke([_edge(remote_chassis="000b.86bc.4987")])
+    res = _run(spoke.handle_command("nw_get_lldp_neighbors", {"device_id": "d1"}))
+    assert res["status"] == "SUCCESS"
+
+
+def test_mac_chassis_id_is_canonicalised():
+    spoke = _lldp_spoke([_edge(remote_chassis="000b.86bc.4987"),
+                         _edge(local_port="2", remote_chassis="00 0b 86 bc 49 87"),
+                         _edge(local_port="3", remote_chassis="00-0B-86-BC-49-87")])
+    res = _run(spoke.handle_command("NW_GET_LLDP_NEIGHBORS", {"device_id": "d1"}))
+    assert {r["remote_chassis"] for r in res["data"]} == {"00:0b:86:bc:49:87"}
+
+
+def test_non_mac_chassis_id_is_left_alone():
+    """"OLKS-CORE" lower-cased is a DIFFERENT node key than every other view of
+    that switch uses — the bug this guard exists to prevent."""
+    spoke = _lldp_spoke([_edge(remote_chassis="OLKS-CORE"),
+                         _edge(local_port="2", remote_chassis="GigabitEthernet0/1")])
+    res = _run(spoke.handle_command("NW_GET_LLDP_NEIGHBORS", {"device_id": "d1"}))
+    assert [r["remote_chassis"] for r in res["data"]] == ["OLKS-CORE",
+                                                          "GigabitEthernet0/1"]
+
+
+def test_blank_chassis_id_survives():
+    spoke = _lldp_spoke([_edge(remote_chassis="", remote_name="no-chassis")])
+    res = _run(spoke.handle_command("NW_GET_LLDP_NEIGHBORS", {"device_id": "d1"}))
+    assert res["data"][0]["remote_chassis"] == ""
