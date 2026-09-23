@@ -4,15 +4,11 @@ uvicorn[standard]
 websockets
 httpx
 asyncssh
-pysnmp-lextudio
-# pysnmp-lextudio 6.3.0 requires pyasn1<0.6.1, but pyasn1-modules>=0.4.2
-# requires pyasn1>=0.6.1 — mutually exclusive. The agent installs each role in
-# a SEPARATE pip run, so the two thrash: one run lands pyasn1 0.6.4 and breaks
-# pysnmp (SNMP polling of switches/APs), the next lands 0.6.0 and breaks
-# pyasn1-modules. Pinning both makes every run converge on the single
-# compatible pair (pyasn1 0.6.0 + pyasn1-modules 0.4.1) that `pip check` passes.
-# Drop these once nw leaves the abandoned lextudio fork: pysnmp 7.x accepts
-# pyasn1 0.6.4, but it removed the sync pysnmp.hlapi API that
-# src/transports/snmp_io.py imports, so that is a code port, not a pin change.
-pyasn1>=0.4.8,<0.6.1
-pyasn1-modules<0.4.2
+# pysnmp 7.x (NOT the abandoned pysnmp-lextudio fork, which is a deprecation
+# stub whose pysnmp.hlapi holds only asyncio/). src/transports/snmp_io.py was
+# ported to the v1arch asyncio API in nw#103; 7.x accepts pyasn1 0.6.4, which
+# retires the pyasn1/pyasn1-modules pins that used to be required here. Those
+# pins existed only because lextudio 6.3.0 wanted pyasn1<0.6.1 while
+# pyasn1-modules>=0.4.2 wanted >=0.6.1 — mutually exclusive, and the agent's
+# per-role pip runs thrashed between them.
+pysnmp>=7.1.0
