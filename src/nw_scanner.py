@@ -373,7 +373,7 @@ class NwScanner:
                     for nip in await self._safe_neighbors(res["address"]):
                         nip = _norm_ip(nip)
                         if (nip and nip not in seen and _is_ipv4(nip)
-                                 and len(seen) < max_targets):
+                                and len(seen) < max_targets):
                             seen.add(nip)
                             queue.append((nip, depth + 1))
 
