@@ -1,3 +1,9 @@
+"""Network devices spoke implementation for Lab Manager.
+
+Connects to the Lab Manager hub over WebSocket and coordinates fleet polling,
+device telemetry, VLAN/port operations, and network discovery scans.
+"""
+
 import asyncio
 import logging
 import time
@@ -30,6 +36,7 @@ class NwSpoke(BaseSpoke):
     devices) pushed from ``global_config["nw_devices"]`` through UPDATE_CONFIG.
     """
     def __init__(self, spoke_id: str, config: Dict[str, Any]):
+        """Initialize the network devices spoke with ID, config, and engine."""
         # The engine needs the fleet before super().__init__ so any base-class
         # background worker sees it. The hub pushes devices via UPDATE_CONFIG
         # after approval; at cold start config may carry devices from a
@@ -125,6 +132,7 @@ class NwSpoke(BaseSpoke):
                     sem = asyncio.Semaphore(conc)
 
                     async def _one(device_id):
+                        """Poll a single device and push results to hub."""
                         async with sem:
                             await self._nw_poll_and_push(device_id)
                     await asyncio.gather(*(_one(x) for x in due))
@@ -218,6 +226,7 @@ class NwSpoke(BaseSpoke):
                     sem = asyncio.Semaphore(conc)
 
                     async def _one(device_id):
+                        """Ping a single device and push reachability status to hub."""
                         async with sem:
                             await self._nw_ping_and_push(device_id)
                     await asyncio.gather(*(_one(x) for x in due))
@@ -248,6 +257,7 @@ class NwSpoke(BaseSpoke):
     # ── Logging helper: mask sensitive fields in any command data ───────────
     @staticmethod
     def _mask(data: Any) -> Any:
+        """Recursively redact sensitive credential keys from dictionary data."""
         if not isinstance(data, dict):
             return data
         out = {}
@@ -311,6 +321,7 @@ class NwSpoke(BaseSpoke):
 
     async def _dispatch_command(self, normalized_cmd: str, command_type: str,
                                 data: Dict[str, Any]) -> Dict[str, Any]:
+        """Dispatch a normalized command string to the appropriate engine or scanner handler."""
         # ── Lifecycle / config ──────────────────────────────────────────────
         if normalized_cmd == "UPDATE_CONFIG":
             devices = (data or {}).get("devices", []) if isinstance(data, dict) else []
