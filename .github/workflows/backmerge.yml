@@ -38,7 +38,7 @@ name: backmerge
 #
 # NO LOOP, and this is the property to preserve when editing:
 #   * Nothing here ever writes to main, so a push to main cannot re-trigger the
-#     workflow (pinned by test_never_writes_to_main).
+#     workflow.
 #   * The back-merge graph is strictly DOWNWARD -- main -> {qa,dev}, qa -> dev.
 #     dev is never a source, so it is a terminal node. The longest possible
 #     chain is main -> qa -> dev and then it stops.
