@@ -119,6 +119,7 @@ jobs:
 
       - name: Build back-merge branch (code only, VERSION pinned to target)
         id: build
+        if: steps.filter.outputs.applies == 'true' && steps.exists.outputs.ok == 'true'
         env:
           SRC: ${{ matrix.source }}
           TGT: ${{ matrix.target }}
