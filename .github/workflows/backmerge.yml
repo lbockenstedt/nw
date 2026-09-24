@@ -96,13 +96,21 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Skip pairs that do not apply to this push, or a missing target
-        id: exists
+      - name: Filter pairs that do not apply to this push
+        id: filter
         run: |
           if [ "${{ matrix.source }}" != "${{ github.ref_name }}" ]; then
             echo "::notice::push was to '${{ github.ref_name }}'; the ${{ matrix.source }} -> ${{ matrix.target }} back-merge does not apply"
-            echo "ok=false" >> "$GITHUB_OUTPUT"
-          elif git rev-parse --verify "origin/${{ matrix.target }}" >/dev/null 2>&1; then
+            echo "applies=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "applies=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check target branch exists
+        id: exists
+        if: steps.filter.outputs.applies == 'true'
+        run: |
+          if git rev-parse --verify "origin/${{ matrix.target }}" >/dev/null 2>&1; then
             echo "ok=true" >> "$GITHUB_OUTPUT"
           else
             echo "::notice::no '${{ matrix.target }}' branch in this repo; nothing to back-merge"
@@ -111,7 +119,6 @@ jobs:
 
       - name: Build back-merge branch (code only, VERSION pinned to target)
         id: build
-        if: steps.exists.outputs.ok == 'true'
         env:
           SRC: ${{ matrix.source }}
           TGT: ${{ matrix.target }}
