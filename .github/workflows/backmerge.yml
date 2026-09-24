@@ -66,8 +66,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     # Job-level, not workflow-level: workflow `concurrency` is evaluated before
-    # the matrix expands, so `matrix.target` is empty there and both targets
-    # would collapse into one queue (the qa run cancelling the dev run).
+    # the matrix expands, so `matrix.source` and `matrix.target` are empty there
+    # and jobs would collapse into one queue (e.g. one run cancelling another).
     concurrency:
       group: backmerge-${{ matrix.source }}-to-${{ matrix.target }}
       cancel-in-progress: false
