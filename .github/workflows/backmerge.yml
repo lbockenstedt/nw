@@ -38,7 +38,7 @@ name: backmerge
 #
 # NO LOOP, and this is the property to preserve when editing:
 #   * Nothing here ever writes to main, so a push to main cannot re-trigger the
-#     workflow (pinned by test_never_writes_to_main).
+#     workflow.
 #   * The back-merge graph is strictly DOWNWARD -- main -> {qa,dev}, qa -> dev.
 #     dev is never a source, so it is a terminal node. The longest possible
 #     chain is main -> qa -> dev and then it stops.
@@ -66,8 +66,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     # Job-level, not workflow-level: workflow `concurrency` is evaluated before
-    # the matrix expands, so `matrix.target` is empty there and both targets
-    # would collapse into one queue (the qa run cancelling the dev run).
+    # the matrix expands, so `matrix.source` and `matrix.target` are empty there
+    # and jobs would collapse into one queue (e.g. one run cancelling another).
     concurrency:
       group: backmerge-${{ matrix.source }}-to-${{ matrix.target }}
       cancel-in-progress: false
