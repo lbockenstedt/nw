@@ -92,26 +92,41 @@ jobs:
           - source: qa
             target: dev
     steps:
+      - name: Filter pairs that do not apply to this push
+        id: filter
+        env:
+          SRC: ${{ matrix.source }}
+          REF: ${{ github.ref_name }}
+          TGT: ${{ matrix.target }}
+        run: |
+          if [ "$SRC" != "$REF" ]; then
+            echo "::notice::push was to '$REF'; the $SRC -> $TGT back-merge does not apply"
+            echo "applies=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "applies=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/checkout@v4
+        if: steps.filter.outputs.applies == 'true'
         with:
           fetch-depth: 0
 
-      - name: Skip pairs that do not apply to this push, or a missing target
+      - name: Check target branch exists
         id: exists
+        if: steps.filter.outputs.applies == 'true'
+        env:
+          TGT: ${{ matrix.target }}
         run: |
-          if [ "${{ matrix.source }}" != "${{ github.ref_name }}" ]; then
-            echo "::notice::push was to '${{ github.ref_name }}'; the ${{ matrix.source }} -> ${{ matrix.target }} back-merge does not apply"
-            echo "ok=false" >> "$GITHUB_OUTPUT"
-          elif git rev-parse --verify "origin/${{ matrix.target }}" >/dev/null 2>&1; then
+          if git rev-parse --verify "origin/$TGT" >/dev/null 2>&1; then
             echo "ok=true" >> "$GITHUB_OUTPUT"
           else
-            echo "::notice::no '${{ matrix.target }}' branch in this repo; nothing to back-merge"
+            echo "::notice::no '$TGT' branch in this repo; nothing to back-merge"
             echo "ok=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Build back-merge branch (code only, VERSION pinned to target)
         id: build
-        if: steps.exists.outputs.ok == 'true'
+        if: steps.filter.outputs.applies == 'true' && steps.exists.outputs.ok == 'true'
         env:
           SRC: ${{ matrix.source }}
           TGT: ${{ matrix.target }}
