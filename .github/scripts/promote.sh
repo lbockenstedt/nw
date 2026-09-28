@@ -87,7 +87,8 @@ fi
 # Build $BR as "$TGT plus everything up to <endpoint>", VERSION pinned.
 # Returns 0 when that produced a real change, 1 when it is a content no-op, and
 # 2 when the merge conflicts outside VERSION against $TGT. The caller decides:
-# the main loop fails the run, the unit-extension path keeps the smaller unit.
+# the main loop batches a conflicting unit with the next one and fails only if
+# the $SRC tip itself conflicts; the unit-extension path keeps the smaller unit.
 # Callers MUST capture the code -- `if stage_to ...` cannot tell 1 from 2.
 stage_to() {
   local endpoint="$1"
@@ -117,7 +118,12 @@ stage_to() {
   done < <(git diff --cached --name-only --diff-filter=A | grep -E '(^|/)VERSION$' || true)
 
   if git ls-files -u | grep -q .; then
-    echo "  merge conflict outside VERSION staging $endpoint onto $TGT:"
+    # Diagnose, but do NOT decide. A conflict on an intermediate unit is
+    # recoverable -- the caller batches it into the next endpoint -- while a
+    # conflict on the final endpoint is fatal. Exiting here denied the caller
+    # that choice, and annotating every conflict as ::error:: marked
+    # recoverable runs as failures, so severity belongs to the caller.
+    echo "  merge conflict outside VERSION staging $endpoint into $TGT:"
     git ls-files -u | awk '{print "  " $4}' | sort -u
     return 2
   fi
@@ -130,20 +136,47 @@ stage_to() {
 
 picked=""
 picked_idx=0
+last_rc=1
 for i in "${!units[@]}"; do
-  rc=0
-  stage_to "${units[$i]}" || rc=$?
-  if [ "$rc" -eq 0 ]; then
+  sel_rc=0
+  stage_to "${units[$i]}" || sel_rc=$?
+  last_rc="$sel_rc"
+  if [ "$sel_rc" -eq 0 ]; then
     picked="${units[$i]}"
     picked_idx="$i"
     break
   fi
-  if [ "$rc" -eq 2 ]; then
-    echo "::error::merge conflict outside VERSION -- resolve $SRC -> $TGT by hand"
-    exit 1
+  if [ "$sel_rc" -eq 2 ]; then
+    # A conflicting unit is SKIPPED, not fatal. Units come from
+    # `rev-list --reverse --first-parent $TGT..$SRC` and stage_to builds "$TGT
+    # plus everything UP TO <endpoint>", so they are cumulative prefixes:
+    # units[i+1] is a strict SUPERSET of units[i]. Advancing batches the two
+    # together -- it cannot reorder or drop anything -- and the last endpoint
+    # is the tip of $SRC, so the loop still makes progress whenever $SRC as a
+    # whole is mergeable.
+    #
+    # Treating this as fatal froze promotion for exactly the repos that needed
+    # it most: once AppBuilder committed a repair onto a promotion branch, $TGT
+    # held a change the OLD units predate, so the oldest outstanding unit
+    # conflicted against it forever -- even after a back-merge had made the
+    # full $SRC -> $TGT merge clean. tsa failed this way every run while
+    # `git merge origin/qa` into main succeeded by hand.
+    echo "::warning::unit ${units[$i]} conflicts against $TGT in isolation --" \
+         "batching it with the next unit"
+    continue
   fi
   [ "$SPLIT" = "1" ] && echo "  skipping ${units[$i]} -- no content change against $TGT (VERSION-only?)"
 done
+
+# The tip of $SRC (the last endpoint tried when nothing was picked) itself
+# conflicted. That is a real divergence a human must reconcile -- and it must
+# NOT fall through to the "Nothing to promote" branch below, which would
+# report success while promoting nothing. Earlier isolated conflicts followed
+# by a clean no-op tip are genuinely nothing to promote.
+if [ -z "$picked" ] && [ "$last_rc" -eq 2 ]; then
+  echo "::error::merge conflict outside VERSION -- resolve $SRC -> $TGT by hand"
+  exit 1
+fi
 
 if [ -z "$picked" ]; then
   # Phrase the no-op with $LABEL: "Nothing to promote" is the string every
