@@ -871,8 +871,83 @@ _LLDP_DETAIL_CMDS = {
     "aos_switch": "show lldp info remote-device",
     "cx_switch": "show lldp neighbor-info detail",
     "ex_switch": "show lldp neighbors",
-    "gateway": "show ap lldp neighbors",
+    "gateway": "show lldp neighbor",
 }
+
+
+_MAC_ANY = re.compile(r"^(?:[0-9a-fA-F]{2}[\s:.-]?){5}[0-9a-fA-F]{2}$|"
+                      r"^[0-9a-fA-F]{6}-[0-9a-fA-F]{6}$|"
+                      r"^[0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4}$")
+
+
+def _lldp_col_role(name: str) -> str:
+    n = re.sub(r"[^a-z]", "", name.lower())
+    if "local" in n or n in ("port", "interface", "localinterface"):
+        return "local_port"
+    if "chassis" in n:
+        return "remote_chassis"
+    if "portdesc" in n:
+        return "remote_descr"
+    if n in ("portid", "portinfo", "remoteport") or n.endswith("portid"):
+        return "remote_port"
+    if "sysname" in n or "systemname" in n or n == "remotename" or n == "name":
+        return "remote_name"
+    if "mgmt" in n or "management" in n:
+        return "remote_mgmt_ip"
+    return ""
+
+
+def _parse_lldp_fixed_width(text: str, normalise_mac) -> List[dict]:
+    lines = text.splitlines()
+    hdr = None
+    for i, line in enumerate(lines):
+        low = line.lower()
+        if "chassis" in low and ("port" in low) and not low.lstrip().startswith(("chassis", "port")) \
+                or ("chassis" in low and low.count("|") == 1 and "port" in low):
+            hdr = i
+            break
+    if hdr is None:
+        return []
+    header = lines[hdr].replace("|", " ")
+    dash = None
+    if hdr + 1 < len(lines) and set(lines[hdr + 1].strip()) <= set("-+| "):
+        dash = lines[hdr + 1].replace("+", " ").replace("|", " ")
+    if dash and dash.strip():
+        spans = [(m.start(), m.end()) for m in re.finditer(r"-+", dash)]
+        starts = [a for a, _ in spans]
+    else:
+        starts = [m.start() for m in re.finditer(r"\S+(?:\s\S+)*(?=\s{2,}|$)", header)]
+    if len(starts) < 3:
+        return []
+    bounds = starts + [10 ** 6]
+    roles = []
+    for k, st in enumerate(starts):
+        roles.append(_lldp_col_role(header[st:bounds[k + 1]].strip()))
+    if "remote_chassis" not in roles:
+        return []
+    records = []
+    for line in lines[hdr + 1:]:
+        if not line.strip() or set(line.strip()) <= set("-+| "):
+            continue
+        row = line.replace("|", " ", 1)
+        rec = {"local_port": "", "remote_chassis": "", "remote_port": "",
+               "remote_name": "", "remote_mgmt_ip": "", "remote_descr": ""}
+        for k, st in enumerate(starts):
+            if not roles[k]:
+                continue
+            val = row[st:bounds[k + 1]].strip()
+            if val and roles[k] not in ("remote_descr",) and val.endswith("..."):
+                pass
+            if val:
+                rec[roles[k]] = val
+        if not rec["remote_chassis"] and not rec["remote_port"]:
+            continue
+        if _MAC_ANY.match(rec["remote_chassis"]):
+            rec["remote_chassis"] = normalise_mac(rec["remote_chassis"])
+        if _MAC_ANY.match(rec["remote_port"]):
+            rec["remote_port"] = normalise_mac(rec["remote_port"])
+        records.append(rec)
+    return records
 
 
 def _parse_lldp_detail_raw(text: str, object_type: str = "") -> List[dict]:
@@ -957,6 +1032,18 @@ def _parse_lldp_detail_raw(text: str, object_type: str = "") -> List[dict]:
         logger.warning("lldp detail: FORMAT B parser raised on %d bytes of "
                        "output; falling through to the other layouts",
                        len(text), exc_info=True)
+
+    # Fixed-width tables (AOS-S, some CX/Junos layouts): slice by column
+    # offsets instead of whitespace tokens. Tokenising breaks as soon as a
+    # ChassisId or PortId is itself a spaced/dashed MAC ("c46237-05583c",
+    # "38 63 bb 44 f7 d8"), which shifted every later field one column over.
+    try:
+        records = _parse_lldp_fixed_width(text, normalise_mac)
+        if records:
+            return records
+    except Exception:
+        logger.warning("lldp detail: fixed-width parser raised on %d bytes; "
+                       "falling through", len(text), exc_info=True)
 
     # Try FORMAT A (AOS-S pipe-table)
     try:
@@ -1098,6 +1185,61 @@ def parse_lldp_detail(text: str, object_type: str = "") -> List[dict]:
     return out
 
 
+#: CDP detail commands. CDP is a fallback adjacency source for gear that
+#: speaks it instead of (or as well as) LLDP; failures are never fatal.
+_CDP_DETAIL_CMDS = {
+    "aos_switch": "show cdp neighbors detail",
+    "cx_switch": "show cdp neighbors detail",
+}
+
+
+def parse_cdp_detail(text: str) -> List[dict]:
+    """Parse ``show cdp neighbors detail`` (Cisco-style key/value blocks)."""
+    out: List[dict] = []
+    rec: Dict[str, str] = {}
+
+    def flush():
+        if rec.get("remote_name"):
+            out.append({"local_port": rec.get("local_port", ""),
+                        "remote_chassis": "",
+                        "remote_port": rec.get("remote_port", ""),
+                        "remote_name": rec.get("remote_name", ""),
+                        "remote_mgmt_ip": rec.get("remote_mgmt_ip", ""),
+                        "remote_descr": rec.get("remote_descr", ""),
+                        "source": "cdp"})
+        rec.clear()
+
+    for line in (text or "").splitlines():
+        st = line.strip()
+        low = st.lower()
+        if st.startswith("---") or not st:
+            continue
+        m = re.match(r"device[- ]id\s*:\s*(.+)", st, re.I)
+        if m:
+            flush()
+            rec["remote_name"] = m.group(1).strip().split(".")[0] if not re.match(r"^[0-9a-f:.-]+$", m.group(1).strip(), re.I) else m.group(1).strip()
+            continue
+        m = re.match(r"interface\s*:\s*([^,]+),?\s*(?:port id.*?:\s*(\S+))?", st, re.I)
+        if m:
+            rec["local_port"] = m.group(1).strip()
+            if m.group(2):
+                rec["remote_port"] = m.group(2).strip()
+            continue
+        m = re.match(r"port[- ]id.*?:\s*(.+)", st, re.I)
+        if m and "remote_port" not in rec:
+            rec["remote_port"] = m.group(1).strip()
+            continue
+        m = re.match(r"(?:ip(?:v4)? address|management address.*?|address)\s*:\s*(\d+\.\d+\.\d+\.\d+)", st, re.I)
+        if m and not rec.get("remote_mgmt_ip"):
+            rec["remote_mgmt_ip"] = m.group(1)
+            continue
+        m = re.match(r"platform\s*:\s*([^,]+)", st, re.I)
+        if m:
+            rec["remote_descr"] = m.group(1).strip()
+    flush()
+    return out
+
+
 #: Substrings that mean "the device refused the command", not "no neighbours".
 #: A device with LLDP disabled/unsupported answers this way, and that is a
 #: legitimate empty result — but it must be told apart from a parse that
@@ -1150,6 +1292,19 @@ async def cli_get_lldp_detail(session: CliSession, object_type: str) -> List[dic
         logger.warning("cli lldp detail: %s returned %d bytes for %r that no "
                        "parser understood — 0 edges (possible parser gap)",
                        object_type, len(text), cmd)
+    cdp_cmd = _CDP_DETAIL_CMDS.get(object_type)
+    if cdp_cmd:
+        try:
+            cdp_text = await session.run(cdp_cmd)
+            if not _lldp_cmd_rejected(cdp_text):
+                seen = {(r.get("local_port"), (r.get("remote_name") or "").lower())
+                        for r in rows}
+                for r in parse_cdp_detail(cdp_text):
+                    if (r["local_port"], r["remote_name"].lower()) not in seen:
+                        rows.append(r)
+        except Exception as e:
+            logger.info("cli cdp detail: %s %r failed (%s) — LLDP only",
+                        object_type, cdp_cmd, e)
     return rows
 
 
