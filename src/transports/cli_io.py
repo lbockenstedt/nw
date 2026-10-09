@@ -1185,6 +1185,16 @@ def parse_lldp_detail(text: str, object_type: str = "") -> List[dict]:
     return out
 
 
+def _neighbor_name_key(name: str) -> str:
+    """Canonicalise neighbour names for cross-protocol dedup keys only."""
+    raw = (name or "").strip().lower()
+    if not raw:
+        return ""
+    if re.match(r"^[0-9a-f:.-]+$", raw, re.I):
+        return raw
+    return raw.split(".", 1)[0]
+
+
 #: CDP detail commands. CDP is a fallback adjacency source for gear that
 #: speaks it instead of (or as well as) LLDP; failures are never fatal.
 _CDP_DETAIL_CMDS = {
@@ -1205,8 +1215,7 @@ def parse_cdp_detail(text: str) -> List[dict]:
                         "remote_port": rec.get("remote_port", ""),
                         "remote_name": rec.get("remote_name", ""),
                         "remote_mgmt_ip": rec.get("remote_mgmt_ip", ""),
-                        "remote_descr": rec.get("remote_descr", ""),
-                        "source": "cdp"})
+                        "remote_descr": rec.get("remote_descr", "")})
         rec.clear()
 
     for line in (text or "").splitlines():
@@ -1297,11 +1306,18 @@ async def cli_get_lldp_detail(session: CliSession, object_type: str) -> List[dic
         try:
             cdp_text = await session.run(cdp_cmd)
             if not _lldp_cmd_rejected(cdp_text):
-                seen = {(r.get("local_port"), (r.get("remote_name") or "").lower())
+                seen = {(r.get("local_port"), _neighbor_name_key(r.get("remote_name")))
                         for r in rows}
-                for r in parse_cdp_detail(cdp_text):
-                    if (r["local_port"], r["remote_name"].lower()) not in seen:
+                cdp_rows = parse_cdp_detail(cdp_text)
+                if not cdp_rows and cdp_text and cdp_text.strip():
+                    logger.warning("cli cdp detail: %s returned %d bytes for %r that no "
+                                   "parser understood — 0 edges (possible parser gap)",
+                                   object_type, len(cdp_text), cdp_cmd)
+                for r in cdp_rows:
+                    key = (r.get("local_port"), _neighbor_name_key(r.get("remote_name")))
+                    if key not in seen:
                         rows.append(r)
+                        seen.add(key)
         except Exception as e:
             logger.info("cli cdp detail: %s %r failed (%s) — LLDP only",
                         object_type, cdp_cmd, e)
