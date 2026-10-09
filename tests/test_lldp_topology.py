@@ -174,6 +174,19 @@ class _FakeSession:
         return self.text
 
 
+class _FakeSessionByCmd:
+    def __init__(self, replies=None, excs=None):
+        self.replies = replies or {}
+        self.excs = excs or {}
+        self.cmds = []
+
+    async def run(self, cmd):
+        self.cmds.append(cmd)
+        if cmd in self.excs:
+            raise self.excs[cmd]
+        return self.replies.get(cmd, "")
+
+
 def _run(coro):
     import asyncio
     return asyncio.get_event_loop().run_until_complete(coro)
@@ -248,6 +261,55 @@ def test_real_output_still_parses_through_the_new_path():
     sess = _FakeSession(text=CX)
     rows = _run(cli_io.cli_get_lldp_detail(sess, "cx_switch"))
     assert [r["remote_name"] for r in rows] == ["OLKS-EDGE-1", "OLKS-CORE"]
+
+
+def test_cdp_rows_match_the_canonical_lldp_edge_shape():
+    txt = """Device ID: core1.lab
+IP address: 10.0.0.1
+Platform: cisco WS-C3850, Capabilities: Switch
+Interface: GigabitEthernet1/0/1, Port ID (outgoing port): Te1/1/1
+"""
+    rows = cli_io.parse_cdp_detail(txt)
+    assert rows == [{"local_port": "GigabitEthernet1/0/1", "remote_chassis": "",
+                     "remote_port": "Te1/1/1", "remote_name": "core1",
+                     "remote_mgmt_ip": "10.0.0.1",
+                     "remote_descr": "cisco WS-C3850"}]
+    assert set(rows[0]) == _KEYS
+
+
+def test_cdp_short_name_dedupes_against_lldp_fqdn_on_same_port():
+    lldp = """Port                          : 1/1/1
+Neighbor Entries              : 1
+Chassis-id                    : 00:0b:86:bc:49:87
+Port-id                       : Te1/1/1
+System Name                   : core1.lab
+Management Address            : 10.0.0.1
+"""
+    cdp = """Device ID: core1
+IP address: 10.0.0.1
+Platform: cisco WS-C3850, Capabilities: Switch
+Interface: 1/1/1, Port ID (outgoing port): Te1/1/1
+"""
+    sess = _FakeSessionByCmd({
+        "show lldp neighbor-info detail": lldp,
+        "show cdp neighbors detail": cdp,
+    })
+    rows = _run(cli_io.cli_get_lldp_detail(sess, "cx_switch"))
+    assert len(rows) == 1
+    assert rows[0]["local_port"] == "1/1/1"
+    assert rows[0]["remote_name"] == "core1.lab"
+
+
+def test_unparseable_nonempty_cdp_output_warns(caplog):
+    sess = _FakeSessionByCmd({
+        "show lldp neighbor-info detail": "",
+        "show cdp neighbors detail": "CDP neighbours\nunexpected layout\n",
+    })
+    with caplog.at_level("WARNING"):
+        rows = _run(cli_io.cli_get_lldp_detail(sess, "cx_switch"))
+    assert rows == []
+    assert any("cli cdp detail" in r.getMessage() and "parser gap" in r.getMessage()
+               for r in caplog.records)
 
 
 # ── FORMAT B phantom edges (second panel finding) ───────────────────────────
@@ -326,4 +388,4 @@ Interface: GigabitEthernet1/0/1, Port ID (outgoing port): Te1/1/1
     assert rows == [{"local_port": "GigabitEthernet1/0/1", "remote_chassis": "",
                      "remote_port": "Te1/1/1", "remote_name": "core1",
                      "remote_mgmt_ip": "10.0.0.1",
-                     "remote_descr": "cisco WS-C3850", "source": "cdp"}]
+                     "remote_descr": "cisco WS-C3850"}]
