@@ -295,3 +295,35 @@ def test_a_port_with_no_neighbour_count_but_real_data_still_counts():
     rows = cli_io.parse_lldp_detail(CX, "cx_switch")
     assert len(rows) == 2
     assert rows[1]["local_port"] == "1/1/24"
+
+
+AOS_S_MAC_PORTID = """ LLDP Remote Devices Information
+
+  LocalPort | ChassisId                 PortId                    PortDescr SysName
+  --------- + ------------------------- ------------------------- --------- ------------------
+  2         | c46237-05583c             38 63 bb 44 f7 d8         eno1      PXMX.OLTH.LRBTE...
+  19        | 84 a9 3e 83 54 91         Trk1                      Uplink    OLKS-CORE
+"""
+
+
+def test_aos_s_fixed_width_columns_with_mac_style_ids():
+    rows = cli_io.parse_lldp_detail(AOS_S_MAC_PORTID, "aos_switch")
+    assert rows[0]["local_port"] == "2"
+    assert rows[0]["remote_chassis"] == "c4:62:37:05:58:3c"
+    assert rows[0]["remote_port"] == "38:63:bb:44:f7:d8"
+    assert rows[0]["remote_descr"] == "eno1"
+    assert rows[1]["remote_name"] == "OLKS-CORE"
+    assert rows[1]["remote_port"] == "Trk1"
+
+
+def test_cdp_detail_parse():
+    txt = """Device ID: core1.lab
+IP address: 10.0.0.1
+Platform: cisco WS-C3850, Capabilities: Switch
+Interface: GigabitEthernet1/0/1, Port ID (outgoing port): Te1/1/1
+"""
+    rows = cli_io.parse_cdp_detail(txt)
+    assert rows == [{"local_port": "GigabitEthernet1/0/1", "remote_chassis": "",
+                     "remote_port": "Te1/1/1", "remote_name": "core1",
+                     "remote_mgmt_ip": "10.0.0.1",
+                     "remote_descr": "cisco WS-C3850", "source": "cdp"}]
