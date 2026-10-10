@@ -880,6 +880,10 @@ _MAC_ANY = re.compile(r"^(?:[0-9a-fA-F]{2}[\s:.-]?){5}[0-9a-fA-F]{2}$|"
                       r"^[0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4}$")
 
 
+#: LLDP system-capability codes (B-Bridge, R-Router, ...), e.g. "B:R" / "B,W".
+_LLDP_CAPS = re.compile(r"^[BRWPCSTOAHDr](?:[:,][BRWPCSTOAHDr])*$")
+
+
 def _lldp_col_role(name: str) -> str:
     n = re.sub(r"[^a-z]", "", name.lower())
     if "local" in n or n in ("port", "interface", "localinterface"):
@@ -929,6 +933,8 @@ def _parse_lldp_fixed_width(text: str, normalise_mac) -> List[dict]:
     for line in lines[hdr + 1:]:
         if not line.strip() or set(line.strip()) <= set("-+| "):
             continue
+        if line.strip().lower().startswith(("number of", "total ")):
+            continue  # summary trailer, not a neighbour
         row = line.replace("|", " ", 1)
         rec = {"local_port": "", "remote_chassis": "", "remote_port": "",
                "remote_name": "", "remote_mgmt_ip": "", "remote_descr": ""}
@@ -1139,7 +1145,12 @@ def _parse_lldp_detail_raw(text: str, object_type: str = "") -> List[dict]:
                 if chassis_idx == -1:
                     continue
                 remote_chassis = normalise_mac(tokens[chassis_idx])
-                remote_port = tokens[chassis_idx + 1] if chassis_idx + 1 < len(tokens) else ""
+                port_idx = chassis_idx + 1
+                # AOS-8 gateways print a Capability column ("B:R") between
+                # Chassis-ID and Port-ID; it is not the remote port.
+                if port_idx < len(tokens) and _LLDP_CAPS.match(tokens[port_idx]):
+                    port_idx += 1
+                remote_port = tokens[port_idx] if port_idx < len(tokens) else ""
                 remote_name = tokens[-1]
                 local_port = tokens[0]
                 if chassis_idx > 0 and tokens[chassis_idx - 1] not in ["-", "ae0"]:

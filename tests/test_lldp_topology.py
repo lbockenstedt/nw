@@ -460,3 +460,28 @@ Neighbor Entries               : 0
 Neighbor Chassis-ID            : 84:16:0c:54:af:20
 """
     assert cli_io.parse_lldp_detail(text, "cx_switch") == []
+
+
+def test_gateway_capability_column_is_not_the_remote_port():
+    # Live AOS-8 gateways reported remote_port "B:R" for every neighbour, so
+    # both VPNCs looked like they faced the same switch ports.
+    text = """Interface  Chassis-ID         Capability  Remote-If  System Name
+GE0/0/2    18:7a:3b:d8:6e:00  B:R         1/1/3      MIPBE-SSPLM-N31-CRSW1
+GE0/0/3    ec:50:aa:f4:5b:00  B:R         1/1/4      MIPBE-SSPLM-N31-CRSW2
+"""
+    rows = cli_io.parse_lldp_detail(text, "gateway")
+    assert [(r["local_port"], r["remote_port"], r["remote_name"]) for r in rows] == [
+        ("GE0/0/2", "1/1/3", "MIPBE-SSPLM-N31-CRSW1"),
+        ("GE0/0/3", "1/1/4", "MIPBE-SSPLM-N31-CRSW2")]
+
+
+def test_fixed_width_summary_trailer_is_not_a_neighbour():
+    text = """Interface  Chassis-ID         Capability  Port-ID  System Name
+---------  ----------         ----------  -------  -----------
+GE0/0/2    18:7a:3b:d8:6e:00  B:R         1/1/3    MIPBE-SSPLM-N31-CRSW1
+
+Number of neighbors: 1
+"""
+    rows = cli_io.parse_lldp_detail(text, "gateway")
+    assert [r["local_port"] for r in rows] == ["GE0/0/2"]
+    assert rows[0]["remote_port"] == "1/1/3"
