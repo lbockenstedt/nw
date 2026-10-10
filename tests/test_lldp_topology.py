@@ -389,3 +389,74 @@ Interface: GigabitEthernet1/0/1, Port ID (outgoing port): Te1/1/1
                      "remote_port": "Te1/1/1", "remote_name": "core1",
                      "remote_mgmt_ip": "10.0.0.1",
                      "remote_descr": "cisco WS-C3850"}]
+
+
+# Real AOS-CX 10.x layout: every remote field carries a "Neighbor " prefix.
+# The old key/value parser knew none of these keys, so the text fell through to
+# the column parsers, which tokenised e.g. "Neighbor Chassis-ID : 84:16:..."
+# into local_port ":" / remote_name "<mac>" and Proxmox/NIC descriptions into
+# neighbours called "x86_64" and "fw_version:AFW_...": a full-mesh junk map.
+CX_REAL = """
+--------------------------------------------------------------------------------
+Port                           : 1/1/49
+Neighbor Entries               : 1
+Neighbor Entries Deleted       : 0
+Neighbor Entries Dropped       : 0
+Neighbor Entries Aged-Out      : 0
+Neighbor Chassis-Name          : MIPBE-SSPLM-N31-CRSW1
+Neighbor Chassis-Description   : Aruba JL636A  GL.10.13.1000
+Neighbor Chassis-ID            : ec:50:aa:f4:5a:00
+Neighbor Management-Address    : 172.21.0.1
+Chassis Capabilities Available : Bridge, Router
+Chassis Capabilities Enabled   : Bridge, Router
+Neighbor Port-ID               : 1/1/49
+Neighbor Port-Desc             : 1/1/49
+Neighbor Port VLAN ID          :
+TTL                            : 120
+
+--------------------------------------------------------------------------------
+Port                           : 1/1/5
+Neighbor Entries               : 2
+Neighbor Entries Deleted       : 0
+Neighbor Chassis-Name          : mipbe-ssplm-pxmx01
+Neighbor Chassis-Description   : Debian GNU/Linux 12 (bookworm) Linux 6.8.12-4-pve #1 SMP PREEMPT_DYNAMIC PMX 6.8.12-4 (2024-11-06T15:04Z) x86_64
+Neighbor Chassis-ID            : 84:16:0c:54:af:20
+Neighbor Management-Address    : 172.21.1.11
+Neighbor Port-ID               : b0:26:28:2d:52:90
+Neighbor Port-Desc             : eno1
+TTL                            : 120
+Neighbor Chassis-Name          :
+Neighbor Chassis-Description   : fw_version:AFW_214.0.192.0
+Neighbor Chassis-ID            : fe:af:21:40:19:20
+Neighbor Port-ID               : fe:af:21:40:19:20
+TTL                            : 120
+
+--------------------------------------------------------------------------------
+Port                           : 1/1/6
+Neighbor Entries               : 0
+"""
+
+
+def test_real_cx_neighbor_prefixed_layout():
+    rows = cli_io.parse_lldp_detail(CX_REAL, "cx_switch")
+    assert [(r["local_port"], r["remote_name"], r["remote_chassis"]) for r in rows] == [
+        ("1/1/49", "MIPBE-SSPLM-N31-CRSW1", "ec:50:aa:f4:5a:00"),
+        ("1/1/5", "mipbe-ssplm-pxmx01", "84:16:0c:54:af:20"),
+        ("1/1/5", "", "fe:af:21:40:19:20"),
+    ]
+    assert rows[0]["remote_mgmt_ip"] == "172.21.0.1"
+    assert rows[0]["remote_port"] == "1/1/49"
+    assert rows[1]["remote_mgmt_ip"] == "172.21.1.11"
+    assert rows[1]["remote_descr"].endswith("x86_64")
+    assert rows[2]["remote_mgmt_ip"] == ""
+    for r in rows:
+        assert r["local_port"] not in (":", "")
+        assert r["remote_name"] not in ("x86_64",) and not r["remote_name"].startswith("fw_version")
+
+
+def test_kv_layout_with_no_neighbours_does_not_fall_through_to_column_parsers():
+    text = """Port                           : 1/1/1
+Neighbor Entries               : 0
+Neighbor Chassis-ID            : 84:16:0c:54:af:20
+"""
+    assert cli_io.parse_lldp_detail(text, "cx_switch") == []
