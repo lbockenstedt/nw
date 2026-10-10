@@ -880,6 +880,10 @@ _MAC_ANY = re.compile(r"^(?:[0-9a-fA-F]{2}[\s:.-]?){5}[0-9a-fA-F]{2}$|"
                       r"^[0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4}$")
 
 
+#: LLDP system-capability codes (B-Bridge, R-Router, ...), e.g. "B:R" / "B,W".
+_LLDP_CAPS = re.compile(r"^[BRWPCSTOAHDr](?:[:,][BRWPCSTOAHDr])*$")
+
+
 def _lldp_col_role(name: str) -> str:
     n = re.sub(r"[^a-z]", "", name.lower())
     if "local" in n or n in ("port", "interface", "localinterface"):
@@ -929,6 +933,8 @@ def _parse_lldp_fixed_width(text: str, normalise_mac) -> List[dict]:
     for line in lines[hdr + 1:]:
         if not line.strip() or set(line.strip()) <= set("-+| "):
             continue
+        if line.strip().lower().startswith(("number of", "total ")):
+            continue  # summary trailer, not a neighbour
         row = line.replace("|", " ", 1)
         rec = {"local_port": "", "remote_chassis": "", "remote_port": "",
                "remote_name": "", "remote_mgmt_ip": "", "remote_descr": ""}
@@ -950,6 +956,86 @@ def _parse_lldp_fixed_width(text: str, normalise_mac) -> List[dict]:
     return records
 
 
+def _parse_lldp_kv(text: str, normalise_mac) -> tuple:
+    """Key/value LLDP neighbour detail (AOS-CX ``show lldp neighbor-info
+    detail``, AOS-S per-port detail). Returns ``(is_kv_layout, records)``.
+
+    Real AOS-CX prefixes every remote field with ``Neighbor`` (``Neighbor
+    Chassis-ID``, ``Neighbor Chassis-Name``, ``Neighbor Port-ID``,
+    ``Neighbor Management-Address``); the prefix is stripped so the older
+    ``Chassis-id`` / ``System Name`` spellings map to the same fields.
+
+    AOS-CX prints one block per PORT, including ports with ``Neighbor
+    Entries : 0``; those are dropped rather than becoming phantom edges.
+    A port with several neighbours repeats the Chassis fields, which starts
+    a new record on the same local port.
+    """
+    lines = text.splitlines()
+    is_kv_layout = any(re.match(r'^\s*(?:Local\s+)?Port\s*:', line, re.IGNORECASE) for line in lines)
+    if not is_kv_layout:
+        return (False, [])
+
+    records = []
+    rec = None
+
+    def flush(record):
+        if record.get("_none"):
+            return
+        if any(record.get(k) for k in ["remote_chassis", "remote_port", "remote_name", "remote_mgmt_ip"]):
+            record.pop("_none", None)
+            records.append(record)
+
+    for line in lines:
+        if not line.strip() or ':' not in line:
+            continue
+        key, value = line.split(':', 1)
+        value = value.strip()
+        k = re.sub(r'[^a-z0-9]', '', key.lower())
+        if k.startswith('neighbor') and k != 'neighborentries' and not k.startswith('neighborentries'):
+            k = k[len('neighbor'):]
+
+        if k == 'port' or k == 'localport':
+            if rec:
+                flush(rec)
+            rec = {"local_port": value, "remote_chassis": "", "remote_port": "", "remote_name": "", "remote_mgmt_ip": "", "remote_descr": ""}
+            continue
+
+        if not rec:
+            continue
+        if k == 'neighborentries':
+            try:
+                if int(value) == 0:
+                    rec["_none"] = True
+            except ValueError:
+                pass
+            continue
+        if k == 'chassisid':
+            if rec["remote_chassis"]:
+                flush(rec)
+                rec = {"local_port": rec["local_port"], "remote_chassis": "", "remote_port": "", "remote_name": "", "remote_mgmt_ip": "", "remote_descr": ""}
+            rec["remote_chassis"] = normalise_mac(value)
+        elif k == 'chassisname' or k == 'systemname':
+            if rec["remote_name"]:
+                flush(rec)
+                rec = {"local_port": rec["local_port"], "remote_chassis": "", "remote_port": "", "remote_name": "", "remote_mgmt_ip": "", "remote_descr": ""}
+            rec["remote_name"] = value
+        elif k == 'chassisdescription' or k == 'systemdescription':
+            rec["remote_descr"] = value
+        elif k == 'portdesc' or k == 'portdescription':
+            if not rec["remote_descr"]:
+                rec["remote_descr"] = value
+        elif k == 'portid':
+            rec["remote_port"] = value
+        elif k == 'managementaddress' or k == 'mgmtaddress' or k == 'managementaddressipv4':
+            if not rec["remote_mgmt_ip"] and value:
+                rec["remote_mgmt_ip"] = value
+
+    if rec:
+        flush(rec)
+
+    return (True, records)
+
+
 def _parse_lldp_detail_raw(text: str, object_type: str = "") -> List[dict]:
     if not text or not text.strip():
         return []
@@ -962,74 +1048,16 @@ def _parse_lldp_detail_raw(text: str, object_type: str = "") -> List[dict]:
             return ':'.join([cleaned[i:i+2].lower() for i in range(0, 12, 2)])
         return mac_str.strip()
 
-    # Try FORMAT B (key/value blocks) first
+    # Key/value blocks. Once the layout is recognised its answer is final,
+    # even when empty: falling through let the column parsers tokenise lines
+    # like "Neighbor Chassis-ID : 84:16:..." into edges with local_port ":"
+    # and a MAC (or "x86_64") as the neighbour name -- a full-mesh junk map.
     try:
-        records = []
-        current_record = {}
-
-        def _flush(rec):
-            """Append ``rec`` only if it actually names a neighbour.
-
-            AOS-CX prints one block per PORT, including ports with
-            ``Neighbor Entries : 0``. Appending those unconditionally turned
-            "port exists, nobody on the other end" into an edge to a node with
-            no identity — a phantom link on the topology map, which the dedup
-            key ``(local_port, '', '')`` cannot collapse away because each
-            empty record has a different local_port.
-            """
-            if not rec:
-                return
-            if rec.pop("_no_neighbour", False):
-                return
-            if not any(rec.get(f) for f in ("remote_chassis", "remote_port",
-                                            "remote_name", "remote_mgmt_ip")):
-                return
-            records.append(rec)
-
-        lines = text.splitlines()
-        for line in lines:
-            if not line.strip():
-                if current_record:
-                    _flush(current_record)
-                    current_record = {}
-                continue
-            if ':' not in line:
-                continue
-            key, value = line.split(':', 1)
-            key = re.sub(r'[^a-zA-Z0-9]', '', key).lower()
-            value = value.strip()
-            if key == 'port':
-                if current_record:
-                    _flush(current_record)
-                current_record = {"local_port": value, "remote_chassis": "",
-                                  "remote_port": "", "remote_name": "",
-                                  "remote_mgmt_ip": "", "remote_descr": ""}
-            elif key == 'neighborentries':
-                # Explicit "nobody here" marker — believe it even if a later
-                # stray field would otherwise make the record look populated.
-                try:
-                    if int(value) == 0:
-                        current_record["_no_neighbour"] = True
-                except ValueError:
-                    pass
-            elif key == 'chassisid':
-                current_record["remote_chassis"] = normalise_mac(value)
-            elif key == 'portid':
-                current_record["remote_port"] = value
-            elif key == 'portdescription' and not current_record.get("remote_descr"):
-                current_record["remote_descr"] = value
-            elif key == 'systemname':
-                current_record["remote_name"] = value
-            elif key == 'systemdescription':
-                current_record["remote_descr"] = value
-            elif key == 'managementaddress':
-                current_record["remote_mgmt_ip"] = value
-        if current_record:
-            _flush(current_record)
-        if records:
+        is_kv, records = _parse_lldp_kv(text, normalise_mac)
+        if is_kv:
             return records
     except Exception:
-        logger.warning("lldp detail: FORMAT B parser raised on %d bytes of "
+        logger.warning("lldp detail: key/value parser raised on %d bytes of "
                        "output; falling through to the other layouts",
                        len(text), exc_info=True)
 
@@ -1117,7 +1145,12 @@ def _parse_lldp_detail_raw(text: str, object_type: str = "") -> List[dict]:
                 if chassis_idx == -1:
                     continue
                 remote_chassis = normalise_mac(tokens[chassis_idx])
-                remote_port = tokens[chassis_idx + 1] if chassis_idx + 1 < len(tokens) else ""
+                port_idx = chassis_idx + 1
+                # AOS-8 gateways print a Capability column ("B:R") between
+                # Chassis-ID and Port-ID; it is not the remote port.
+                if port_idx < len(tokens) and _LLDP_CAPS.match(tokens[port_idx]):
+                    port_idx += 1
+                remote_port = tokens[port_idx] if port_idx < len(tokens) else ""
                 remote_name = tokens[-1]
                 local_port = tokens[0]
                 if chassis_idx > 0 and tokens[chassis_idx - 1] not in ["-", "ae0"]:
