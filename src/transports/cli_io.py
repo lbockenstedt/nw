@@ -573,6 +573,22 @@ def parse_mac_aos_s(text: str) -> List[dict]:
     return rows
 
 
+def parse_mac_aos_cx(text: str) -> List[dict]:
+    """Aruba AOS-CX ``show mac-address-table`` → ``[{mac, vlan, interface}]``.
+    Columns: ``MAC(xx:xx:..) | VLAN | Type | Port``. Type (dynamic/static/
+    port-access-security) sits between VLAN and Port, so the AOS-S parser read
+    ``dynamic`` as the port; here Port is the last token (1/1/51, lag1, ...)."""
+    result = []
+    pattern = r"^\s*([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})\s+(\d+)\s+(\S+)\s+(\S+)\s*$"
+    for line in (text or "").splitlines():
+        match = re.match(pattern, line)
+        if match:
+            mac, vlan, _, interface = match.groups()
+            if mac != "00:00:00:00:00:00":
+                result.append({"mac": mac.lower(), "vlan": vlan, "interface": interface})
+    return result
+
+
 def parse_port_access_clients_aos_s(text: str) -> List[dict]:
     """Aruba AOS-S ``show port-access clients`` → ``[{ip, mac, vlan, interface}]``.
     Columns: ``Port | Client Name | MAC(aabbcc-ddeeff) | IP | User Role | Type |
@@ -1364,7 +1380,7 @@ PARSERS: Dict[str, Any] = {
     "gateway":    (parse_arp_gateway, parse_mac_gateway, parse_port_status_gateway),
     # AOS-CX is REST-first; if CLI is forced, the AOS-S parsers are a close
     # enough fallback for Aruba's CLI family.
-    "cx_switch":  (parse_arp_aos_s, parse_mac_aos_s, parse_interfaces_aos_s),
+    "cx_switch":  (parse_arp_aos_s, parse_mac_aos_cx, parse_interfaces_aos_s),
 }
 
 # object_type → VLAN parser. The ``show vlan`` layout is close enough across the
@@ -1420,7 +1436,7 @@ async def cli_get_arp(session: CliSession, object_type: str) -> List[dict]:
 async def cli_get_mac_table(session: CliSession, object_type: str) -> List[dict]:
     """Run the vendor MAC-table show command and return ``[{mac, vlan, interface}]``."""
     mac_cmd = {"aos_switch": "show mac-address", "ex_switch": "show ethernet-switching table",
-               "cx_switch": "show mac-address",
+               "cx_switch": "show mac-address-table",
                # ArubaOS gateway: `show mac-address` is a switch command; the
                # bridge/MAC table lives in the datapath.
                "gateway": "show datapath bridge table"}.get(
