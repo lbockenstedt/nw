@@ -500,3 +500,23 @@ def test_read_renudge_stops_once_output_arrives():
         s._read_until_prompt(on_idle=_on_idle))
     assert calls["n"] == 0
 
+
+
+# ── AOS-CX `show mac-address-table` ──────────────────────────────────────────
+def test_parse_mac_aos_cx_reads_port_not_type():
+    text = """MAC age-time            : 300 seconds
+Number of MAC addresses : 5
+
+MAC Address          VLAN     Type                      Port
+--------------------------------------------------------------
+F4:03:43:6C:F5:40    100      dynamic                   1/1/51
+00:50:56:96:04:32    1        dynamic                   lag1
+b0:26:28:2d:52:91    100      port-access-security      1/1/2
+00:00:00:00:00:00    1        dynamic                   1/1/3
+SW1# """
+    assert cli_io.parse_mac_aos_cx(text) == [
+        {"mac": "f4:03:43:6c:f5:40", "vlan": "100", "interface": "1/1/51"},
+        {"mac": "00:50:56:96:04:32", "vlan": "1", "interface": "lag1"},
+        {"mac": "b0:26:28:2d:52:91", "vlan": "100", "interface": "1/1/2"},
+    ]
+    assert cli_io.PARSERS["cx_switch"][1] is cli_io.parse_mac_aos_cx
