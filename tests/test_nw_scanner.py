@@ -245,3 +245,27 @@ def test_discovery_only_is_reported_even_when_nothing_is_reachable():
     res = run(scanner.scan(["10.0.0.1"]))
     assert res["identified"] == [] and res["reachable"] == []
     assert res["discovery_only"] is True
+
+
+def test_ssh_identify_falls_back_to_prompt_hostname(monkeypatch):
+    # ArubaOS `show version` prints no 'System Name' line; the hostname only
+    # shows up in the "(host) #" prompt, so identify must read it from there.
+    from transports import cli_io
+
+    class _Sess:
+        def __init__(self, dev, command_timeout=None):
+            self._last_prompt = ""
+
+        async def connect(self):
+            self._last_prompt = "(MIPBE-SSPLM-N31-VPNC1) #"
+
+        async def run(self, cmd):
+            return "Aruba Operating System Software.\nArubaOS (MODEL: Aruba7210-US), Version 8.10"
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(cli_io, "CliSession", _Sess)
+    info = run(nw_scanner._ssh_identify("172.21.2.3", 22,
+                                        {"username": "u", "password": "p"}, 5.0))
+    assert info["hostname"] == "MIPBE-SSPLM-N31-VPNC1"
