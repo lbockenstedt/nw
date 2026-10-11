@@ -617,7 +617,7 @@ def parse_interfaces_aos_s(text: str) -> List[dict]:
     rows = []
     for line in (text or "").splitlines():
         s = line.strip()
-        if not s or s.startswith(("Status", "  Port", "---", "Admin")):
+        if not s or s.startswith(("Status", "  Port", "---", "Admin", "Invalid", "%")):
             continue
         toks = s.split()
         if len(toks) < 3 or not toks[0][0].isalnum():
@@ -639,6 +639,52 @@ def parse_interfaces_aos_s(text: str) -> List[dict]:
         rows.append({"name": name, "ip": "", "mac": "", "vlan": "",
                      "status": st, "speed": speed})
     return rows
+
+
+def parse_interfaces_aos_cx(text: str) -> List[dict]:
+    """Aruba AOS-CX ``show interface brief`` → [{name,ip,mac,vlan,status,speed}].
+    Columns: Port | Native VLAN | Mode | Type | Enabled | Status | Reason |
+    Speed | Description. Speed is the first number after Status (Reason is
+    free text); error lines (``Invalid input``) are ignored."""
+    result = []
+    data_lines = (text or "").splitlines()
+    for line in data_lines:
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split()
+        if not re.fullmatch(r'\d+/\d+/\d+|lag\d+|vlan\d+|loopback\d+|mgmt|tunnel\d+', parts[0]):
+            continue
+
+        name = parts[0]
+        vlan = ""
+        if len(parts) > 1 and re.match(r'^\d+$', parts[1]):
+            vlan = parts[1]
+        status = "down"
+        for part in parts:
+            if part in ["up", "down"]:
+                status = part
+                break
+        speed = 0
+        found_status = False
+        for part in parts:
+            if part == status:
+                found_status = True
+                continue
+            if found_status and re.match(r'^\d+$', part):
+                speed = int(part)
+                break
+
+        result.append({
+            "name": name,
+            "ip": "",
+            "mac": "",
+            "vlan": vlan,
+            "status": status,
+            "speed": speed
+        })
+
+    return result
 
 
 def parse_arp_junos(text: str) -> List[dict]:
@@ -1380,7 +1426,7 @@ PARSERS: Dict[str, Any] = {
     "gateway":    (parse_arp_gateway, parse_mac_gateway, parse_port_status_gateway),
     # AOS-CX is REST-first; if CLI is forced, the AOS-S parsers are a close
     # enough fallback for Aruba's CLI family.
-    "cx_switch":  (parse_arp_aos_s, parse_mac_aos_cx, parse_interfaces_aos_s),
+    "cx_switch":  (parse_arp_aos_s, parse_mac_aos_cx, parse_interfaces_aos_cx),
 }
 
 # object_type → VLAN parser. The ``show vlan`` layout is close enough across the
@@ -1531,7 +1577,7 @@ async def cli_get_interfaces(session: CliSession, object_type: str) -> List[dict
     """Run the vendor interface show command and return
     ``[{name, ip, mac, vlan, status, speed}]`` (IP/MAC/VLAN best-effort)."""
     if_cmd = {"aos_switch": "show interfaces brief", "ex_switch": "show interfaces descriptions",
-              "cx_switch": "show interfaces brief",
+              "cx_switch": "show interface brief",
               # ArubaOS gateway: physical-port status via `show port status`.
               "gateway": "show port status"}.get(
               object_type, "show interfaces")
