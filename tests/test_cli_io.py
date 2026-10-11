@@ -136,6 +136,15 @@ def test_hostname_from_prompt_token():
     assert cli_io._hostname_from_prompt("") == ""
 
 
+def test_hostname_from_prompt_arubaos_gateway():
+    # ArubaOS gateway/controller prompts wrap the hostname in parentheses.
+    h = "MIPBE-SSPLM-N31-VPNC1"
+    for p in (f"({h}) #", f"\r({h}) #", f"({h}) *#", f"({h}) (config) #",
+              f"({h}) [mynode] #", f"({h}) *[mynode] #", f"({h}) >"):
+        assert cli_io._hostname_from_prompt(p) == h, p
+    assert cli_io._hostname_from_prompt("(not a prompt) text") == ""
+
+
 # ── _read_until_prompt: linear tail-window reader (FIX B) ─────────────────────
 import asyncio  # noqa: E402
 import time  # noqa: E402
