@@ -1609,6 +1609,10 @@ def _hostname_from_text(text: str) -> str:
     return m.group(1).strip() if m else ""
 
 
+_ARUBAOS_PROMPT_RE = re.compile(
+    r"^\(([\w][\w.\-]{0,62})\)\s*(?:\([^)]*\)\s*)?\*?\s*(?:\[[^\]]*\]\s*)?\*?\s*[>#]\s*$")
+
+
 def _hostname_from_prompt(prompt: str) -> str:
     """Cross-vendor hostname fallback: the CLI prompt token (the switch renders
     ``<hostname>#`` / ``<hostname>(config)#``). Strips ANSI, the trailing
@@ -1618,6 +1622,11 @@ def _hostname_from_prompt(prompt: str) -> str:
     if not p:
         return ""
     p = p.splitlines()[-1].strip()
+    # ArubaOS gateway/controller: "(host) #", "(host) *#", "(host) (config) #",
+    # "(host) [mynode] #" — the hostname is the leading parenthesized token.
+    m = _ARUBAOS_PROMPT_RE.match(p)
+    if m:
+        return m.group(1)
     p = re.sub(r"[>#]\s*$", "", p).strip()   # drop the prompt char
     p = re.sub(r"\(.*\)$", "", p).strip()    # drop a (config…) mode suffix
     if not p or any(c.isspace() for c in p):
