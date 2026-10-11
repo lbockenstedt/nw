@@ -520,3 +520,40 @@ SW1# """
         {"mac": "b0:26:28:2d:52:91", "vlan": "100", "interface": "1/1/2"},
     ]
     assert cli_io.PARSERS["cx_switch"][1] is cli_io.parse_mac_aos_cx
+
+
+
+CX_IF_BRIEF = """--------------------------------------------------------------------------------------------------------
+Port       Native  Mode   Type           Enabled Status  Reason                  Speed   Description
+           VLAN                                                                  (Mb/s)
+--------------------------------------------------------------------------------------------------------
+1/1/1      100     trunk  25G-SFP28      yes     up                              25000   pxmx01
+1/1/2      1       access 10G-SFP+       no      down    Administratively down   --      --
+1/1/3      --      routed 10G-SFP+       yes     down    No XCVR installed       --      --
+lag251     100     trunk  --             yes     up                              200000  TOR-AGG
+vlan100    --      --     --             yes     up                              --      --
+loopback0  --      --     --             yes     up                              --      --
+mgmt       --      --     --             yes     up                              1000    --
+Invalid input: interfaces
+% Unknown command.
+
+"""
+
+
+def test_parse_interfaces_aos_cx_reads_the_cx_column_layout():
+    rows = cli_io.parse_interfaces_aos_cx(CX_IF_BRIEF)
+    assert [r["name"] for r in rows] == ["1/1/1", "1/1/2", "1/1/3", "lag251",
+                                          "vlan100", "loopback0", "mgmt"]
+    by = {r["name"]: r for r in rows}
+    assert by["1/1/1"] == {"name": "1/1/1", "ip": "", "mac": "", "vlan": "100",
+                           "status": "up", "speed": 25000}
+    assert by["1/1/2"]["status"] == "down" and by["1/1/2"]["speed"] == 0
+    assert by["lag251"]["speed"] == 200000 and by["mgmt"]["speed"] == 1000
+
+
+def test_cx_uses_the_singular_interface_command_and_its_parser():
+    # `show interfaces brief` is AOS-S syntax; CX answers "Invalid input" and
+    # that line used to become an interface literally named "Invalid".
+    assert cli_io.PARSERS["cx_switch"][2] is cli_io.parse_interfaces_aos_cx
+    assert cli_io.parse_interfaces_aos_cx("Invalid input: interfaces") == []
+    assert cli_io.parse_interfaces_aos_s("Invalid input: interfaces\n% Unknown command.") == []
