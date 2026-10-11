@@ -165,7 +165,8 @@ async def _ssh_identify(host: str, port: int, cred: Dict[str, Any],
             pass
     if not text.strip():
         return None
-    return {"text": text, "hostname": _hostname_from_banner(text)}
+    return {"text": text, "hostname": _hostname_from_banner(text)
+            or cli_io._hostname_from_prompt(getattr(session, "_last_prompt", ""))}
 
 
 async def _snmp_identify(host: str, community: str,
