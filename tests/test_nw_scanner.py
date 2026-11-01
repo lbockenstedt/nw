@@ -279,7 +279,7 @@ def test_ssh_identified_device_also_reports_snmp_result():
                                "10.0.0.2": "ArubaOS-CX FL.10.09 6300M"}),
         snmp_identify=make_snmp({"10.0.0.1": "ArubaOS-CX"}),
     )
-    res = asyncio.run(scanner.scan(["10.0.0.1", "10.0.0.2"]))
+    res = run(scanner.scan(["10.0.0.1", "10.0.0.2"]))
     by = {d["address"]: d for d in res["identified"]}
     assert by["10.0.0.1"]["method"] == "ssh" and by["10.0.0.1"]["snmp_ok"] is True
     assert by["10.0.0.2"]["snmp_ok"] is False
