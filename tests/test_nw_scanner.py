@@ -269,3 +269,17 @@ def test_ssh_identify_falls_back_to_prompt_hostname(monkeypatch):
     info = run(nw_scanner._ssh_identify("172.21.2.3", 22,
                                         {"username": "u", "password": "p"}, 5.0))
     assert info["hostname"] == "MIPBE-SSPLM-N31-VPNC1"
+
+
+def test_ssh_identified_device_also_reports_snmp_result():
+    scanner = NwScanner(
+        CREDS,
+        tcp_probe=make_probe({"10.0.0.1": {22}, "10.0.0.2": {22}}),
+        ssh_identify=make_ssh({"10.0.0.1": "ArubaOS-CX FL.10.09 6300M",
+                               "10.0.0.2": "ArubaOS-CX FL.10.09 6300M"}),
+        snmp_identify=make_snmp({"10.0.0.1": "ArubaOS-CX"}),
+    )
+    res = asyncio.run(scanner.scan(["10.0.0.1", "10.0.0.2"]))
+    by = {d["address"]: d for d in res["identified"]}
+    assert by["10.0.0.1"]["method"] == "ssh" and by["10.0.0.1"]["snmp_ok"] is True
+    assert by["10.0.0.2"]["snmp_ok"] is False
