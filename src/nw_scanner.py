@@ -318,6 +318,11 @@ class NwScanner:
                                   hostname=info.get("hostname") or result["hostname"],
                                   os=_os_from_banner(descr))
                     return result
+                # Answered SNMP but isn't a platform we auto-add: still monitorable.
+                result.update(snmp_ok=True, snmp_credential_id=cred.get("id"),
+                              hostname=info.get("hostname") or result["hostname"],
+                              os=result["os"] or _os_from_banner(descr))
+                break
 
         # Optional nmap augmentation for the still-unknown-but-reachable ones.
         if self.use_nmap and result["object_type"] is None and open_ports:
