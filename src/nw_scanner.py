@@ -295,8 +295,10 @@ class NwScanner:
                 result["hostname"] = info.get("hostname") or result["hostname"]
                 break
 
-        # SNMP identify — try each candidate community.
-        if self.try_snmp and result["object_type"] is None:
+        # SNMP identify — try each candidate community. Only on hosts that answered
+        # the TCP probe: UDP gives no cheap liveness signal, and timing out on every
+        # dead address of a large sweep would take far longer than the sweep itself.
+        if self.try_snmp and result["object_type"] is None and open_ports:
             for cred in self.credentials:
                 community = cred.get("snmp_community") or cred.get("community")
                 if not community:
