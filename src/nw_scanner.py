@@ -264,6 +264,7 @@ class NwScanner:
             "address": host, "object_type": None, "hostname": "", "os": "",
             "open_ports": [], "method": None, "credential": None,
             "credential_id": None, "reachable": False,
+            "snmp_ok": None, "snmp_credential_id": None,
         }
         try:
             open_ports = await self._probe_ports(host)
@@ -288,6 +289,7 @@ class NwScanner:
                                   credential_id=cred.get("id"),
                                   hostname=info.get("hostname") or result["hostname"],
                                   os=_os_from_banner(banner))
+                    await self._probe_snmp(host, result)
                     return result
                 # Logged in but couldn't classify — keep the banner + hostname.
                 result["hostname"] = info.get("hostname") or result["hostname"]
@@ -307,7 +309,8 @@ class NwScanner:
                 result["reachable"] = True
                 ot = classify_platform(descr)
                 if ot:
-                    result.update(object_type=ot, method="snmp",
+                    result.update(object_type=ot, method="snmp", snmp_ok=True,
+                                  snmp_credential_id=cred.get("id"),
                                   credential=cred.get("name") or cred.get("id"),
                                   credential_id=cred.get("id"),
                                   hostname=info.get("hostname") or result["hostname"],
@@ -322,6 +325,21 @@ class NwScanner:
                 result.update(object_type=ot, method="nmap",
                               os=_os_from_banner(svc))
         return result
+
+    async def _probe_snmp(self, host: str, result: Dict[str, Any]) -> None:
+        """Record which community (if any) answers, independently of SSH, so the
+        monitoring sync knows which credential to replicate. ``snmp_ok`` stays
+        None when no community was offered (nothing was tested)."""
+        if not self.try_snmp:
+            return
+        for cred in self.credentials:
+            community = cred.get("snmp_community") or cred.get("community")
+            if not community:
+                continue
+            result["snmp_ok"] = False
+            if await self._snmp_identify(host, community, self.target_timeout):
+                result.update(snmp_ok=True, snmp_credential_id=cred.get("id"))
+                return
 
     async def scan(self, targets: List[str], *, crawl: bool = False,
                    max_targets: int = MAX_TARGETS,
