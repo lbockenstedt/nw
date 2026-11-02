@@ -1511,8 +1511,16 @@ async def cli_get_device_info(session: CliSession, object_type: str) -> dict:
     # version banner because `show inventory` lists sensor parts (e.g. LM75).
     model = (_model_from(id_text, guess=False) or _model_from(text, guess=False)
              or _first_hw_token(text) or _first_hw_token(id_text))
+    explicit_model = bool(_model_from(id_text, guess=False) or _model_from(text, guess=False))
+    serial = _serial_from(id_text) or _serial_from(text)
+    if not (serial and mac and explicit_model):
+        # Unparsed identity: log the raw output so the format can be taught.
+        logger.info("cli_get_device_info: %s %s incomplete identity (serial=%r mac=%r "
+                    "model=%r%s) — info %r:\n%s\n--- id %r:\n%s", object_type, hostname_hint(session),
+                    serial, mac, model, "" if explicit_model else " guessed", info_cmd,
+                    (text or "")[:1500], id_cmd, (id_text or "")[:2500])
     return {"model": model,
-            "serial": _serial_from(id_text) or _serial_from(text),
+            "serial": serial,
             "firmware": _firmware_from(text), "os": os_name, "hostname": hostname,
             "mac": mac, "interfaces_count": 0}
 
@@ -1642,6 +1650,10 @@ async def cli_get_vlans(session: CliSession, object_type: str) -> List[dict]:
                 "gateway": "show vlan"}.get(object_type, "show vlan")
     text = await session.run(vlan_cmd)
     return VLAN_PARSERS.get(object_type, parse_vlans_gateway)(text)
+
+
+def hostname_hint(session) -> str:
+    return _hostname_from_prompt(getattr(session, "_last_prompt", "")) or "?"
 
 
 _INFO_ALTERNATES = {
