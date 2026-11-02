@@ -66,6 +66,13 @@ def classify_platform(text: str) -> Optional[str]:
     t = (text or "").lower()
     if not t:
         return None
+    # Aruba access points (Instant / AOS-10) run an ArubaOS CLI ("ArubaOS (MODEL:
+    # 515)", "AP uptime is …") but are managed by Central, not the NW fleet.
+    # Gateways report "(MODEL: Aruba7210-US)", so a bare numeric model is an AP.
+    if (re.search(r"\bap uptime\b", t)
+            or re.search(r"\(model:\s*(?:ap-)?\d{3}", t)
+            or "instant access point" in t):
+        return None
     # Aruba AOS-CX (REST-first switch) — check before generic "aruba".
     if ("aos-cx" in t or "arubaos-cx" in t
             or ("aruba" in t and re.search(r"\bcx\b", t))):
@@ -282,6 +289,8 @@ class NwScanner:
                     continue
                 banner = info.get("text") or ""
                 ot = classify_platform(banner)
+                logger.info("nw scan %s: ssh banner classified %s — %r", host, ot,
+                            " ".join(banner.split())[:400])
                 result["reachable"] = True
                 if ot:
                     result.update(object_type=ot, method="ssh",
