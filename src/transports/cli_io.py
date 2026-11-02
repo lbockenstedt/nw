@@ -1487,6 +1487,16 @@ async def cli_get_device_info(session: CliSession, object_type: str) -> dict:
         if _cli_rejected(id_text):
             id_text = ""
     full = f"{text or ''}\n{id_text}"
+    mac = _base_mac_from(full)
+    if not mac and object_type == "gateway":
+        # Older ArubaOS inventories may omit 'HW MAC Addr'; the VLAN 1 SVI
+        # carries the burned-in base MAC ("Interface address is …").
+        try:
+            vtext = await session.run("show interface vlan 1") or ""
+            if not _cli_rejected(vtext):
+                mac = _base_mac_from(vtext)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("cli_get_device_info: vlan 1 mac fallback failed: %s", e)
     # OS name for NetBox (platform). Detect the family from the version banner;
     # fall back to a sensible default per object_type.
     _os_m = re.search(r"\b(ArubaOS-CX|ArubaOS|AOS-CX|AOS-S|JUNOS|Junos)\b", text or "", re.IGNORECASE)
@@ -1497,10 +1507,14 @@ async def cli_get_device_info(session: CliSession, object_type: str) -> dict:
     # command's 'System Name' field, fall back to the live CLI prompt token.
     hostname = _hostname_from_text(full) or _hostname_from_prompt(
         getattr(session, "_last_prompt", ""))
-    return {"model": _model_from(id_text) or _model_from(text),
+    # Explicit model fields win over the SKU-token guess; the guess prefers the
+    # version banner because `show inventory` lists sensor parts (e.g. LM75).
+    model = (_model_from(id_text, guess=False) or _model_from(text, guess=False)
+             or _first_hw_token(text) or _first_hw_token(id_text))
+    return {"model": model,
             "serial": _serial_from(id_text) or _serial_from(text),
             "firmware": _firmware_from(text), "os": os_name, "hostname": hostname,
-            "mac": _base_mac_from(full), "interfaces_count": 0}
+            "mac": mac, "interfaces_count": 0}
 
 
 async def cli_get_arp(session: CliSession, object_type: str) -> List[dict]:
@@ -1704,20 +1718,24 @@ def _serial_from(text: str) -> str:
     return ""
 
 
-def _model_from(text: str) -> str:
+def _model_from(text: str, guess: bool = True) -> str:
     """Product/model: AOS-CX 'Product Name : JL627A 8325…', ArubaOS
-    '(MODEL: 7005-US)', else the first SKU-looking token."""
+    '(MODEL: 7005-US)' / inventory 'SC Model# : Aruba7024-US', else (when
+    ``guess``) the first SKU-looking token."""
     m = re.search(r"(?im)^\s*product\s+name\s*:\s*(\S+)", text or "")
     if m:
         return m.group(1)
     m = re.search(r"\(MODEL:\s*([^)\s]+)\)", text or "", re.IGNORECASE)
     if m:
         return m.group(1)
+    m = re.search(r"(?im)^\s*(?:sc\s+)?model\s*#\s*:\s*(\S+)", text or "")
+    if m:
+        return m.group(1)
     # AOS-S `show modules`: "Chassis: 2530-24G-PoEP J9773A   Serial Number: …"
     m = re.search(r"(?im)^\s*chassis\s*:.*?\b(J[A-Z]?\d{3,4}[A-Z])\b", text or "")
     if m:
         return m.group(1)
-    return _first_hw_token(text)
+    return _first_hw_token(text) if guess else ""
 
 
 def _base_mac_from(text: str) -> str:
@@ -1728,9 +1746,12 @@ def _base_mac_from(text: str) -> str:
     ``38:63:bb:a1:b2:c3``. Empty when absent — helps operators positively ID
     the physical box alongside the serial number."""
     m = re.search(
-        r"(?im)(?:^|\s{2,})(?:base\s*mac(?:\s*addr(?:ess)?)?|system\s*mac|mac\s*address)"
+        r"(?im)(?:^|\s{2,})(?:(?:base|hw)\s*mac(?:\s*addr(?:ess)?)?|system\s*mac|mac\s*address)"
         r"\s*[:=]\s*([0-9A-Fa-f][0-9A-Fa-f:.\-]{10,})",
         text or "")
+    if not m:
+        m = re.search(r"(?i)interface\s+address\s+is\s+([0-9A-Fa-f][0-9A-Fa-f:.\-]{10,})",
+                      text or "")
     if not m:
         return ""
     hexes = re.sub(r"[^0-9a-f]", "", m.group(1).lower())
