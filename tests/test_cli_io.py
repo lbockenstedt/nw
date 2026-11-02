@@ -597,3 +597,36 @@ def test_gateway_show_inventory_identity():
 def test_serial_from_never_returns_separator():
     assert cli_io._serial_from("Serial Number : SG123ABCD") == "SG123ABCD"
     assert cli_io._serial_from("no serial here") == ""
+
+
+_AOSS_SHOW_SYSTEM = (
+    "\n Status and Counters - General System Information\n\n"
+    "  System Name        : OLKS-MGMTSW\n"
+    "  Software revision  : YC.16.11.0030        Base MAC Addr      : 3821c7-fc8ee0\n"
+    "  ROM Version        : YC.16.01.0003        Serial Number      : TW98JYH02M\n")
+
+
+def test_aoss_two_column_show_system_identity():
+    assert cli_io._serial_from(_AOSS_SHOW_SYSTEM) == "TW98JYH02M"
+    assert cli_io._base_mac_from(_AOSS_SHOW_SYSTEM) == "38:21:c7:fc:8e:e0"
+    mods = "  Chassis: 2530-24G-PoEP J9773A          Serial Number:   TW98JYH02M\n"
+    assert cli_io._model_from(mods) == "J9773A"
+
+
+def test_aoss_info_falls_back_when_command_rejected():
+    class _S:
+        _last_prompt = "OLKS-MGMTSW# "
+
+        def __init__(self, replies):
+            self.replies, self.ran = replies, []
+
+        async def run(self, cmd):
+            self.ran.append(cmd)
+            return self.replies.get(cmd, "Invalid input: " + cmd.split()[-1])
+
+    s = _S({"show system-information": _AOSS_SHOW_SYSTEM})
+    info = asyncio.get_event_loop().run_until_complete(
+        cli_io.cli_get_device_info(s, "aos_switch"))
+    assert s.ran[:2] == ["show system", "show system-information"]
+    assert info["serial"] == "TW98JYH02M" and info["mac"] == "38:21:c7:fc:8e:e0"
+    assert info["hostname"] == "OLKS-MGMTSW"
