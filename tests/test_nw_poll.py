@@ -205,10 +205,10 @@ def test_poll_ssh_opens_single_session():
     calls = {"connect": 0, "close": 0, "runs": []}
     eng = _ssh_engine(calls)
     res = _run(eng.poll("d1"))
-    # probe + device_info + interfaces + arp + mac all ran over ONE session.
+    # probe + device_info (+ identity) + interfaces + arp + mac over ONE session.
     assert calls["connect"] == 1
     assert calls["close"] == 1
-    assert len(calls["runs"]) == 5
+    assert len(calls["runs"]) == 6
     assert res["status"] == "SUCCESS"
     assert res["data"]["reachable"] is True
 
