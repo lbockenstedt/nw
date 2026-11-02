@@ -43,6 +43,11 @@ SYS_DESCR = "1.3.6.1.2.1.1.1.0"
 SYS_NAME = "1.3.6.1.2.1.1.5.0"
 SYS_UPTIME = "1.3.6.1.2.1.1.3.0"
 IF_NUMBER = "1.3.6.1.2.1.2.1.0"
+# BRIDGE-MIB dot1dBaseBridgeAddress (chassis base MAC).
+BRIDGE_BASE_MAC = "1.3.6.1.2.1.17.1.1.0"
+# ENTITY-MIB entPhysicalSerialNum / entPhysicalModelName columns.
+ENT_SERIAL_PREFIX = "1.3.6.1.2.1.47.1.1.1.1.11"
+ENT_MODEL_PREFIX = "1.3.6.1.2.1.47.1.1.1.1.13"
 # ifTable columns: 1 ifIndex, 2 ifDescr, 3 ifType, 5 ifSpeed, 6 ifPhysAddress,
 # 7 ifAdminStatus, 8 ifOperStatus. Full OID = <prefix><col>.<ifIndex>.
 IF_PREFIX = "1.3.6.1.2.1.2.2.1."
@@ -383,9 +388,9 @@ async def snmp_probe(session: SnmpSession) -> dict:
 
 
 async def snmp_get_device_info(session: SnmpSession) -> dict:
-    """GET sysDescr/sysName/ifNumber and return
-    ``{model, serial, firmware, interfaces_count}`` (serial empty — ENTITY-MIB
-    not walked)."""
+    """GET sysDescr/sysName/ifNumber, plus best-effort chassis identity
+    (ENTITY-MIB serial/model, BRIDGE-MIB base MAC), and return
+    ``{model, serial, firmware, hostname, mac, interfaces_count}``."""
     sysdescr = await _to_thread(session.get, SYS_DESCR)
     sysname = await _to_thread(session.get, SYS_NAME)
     ifnum = await _to_thread(session.get, IF_NUMBER)
@@ -394,15 +399,53 @@ async def snmp_get_device_info(session: SnmpSession) -> dict:
     except (TypeError, ValueError):
         ifnum_i = 0
     descr = str(sysdescr or "").strip()
-    model = str(sysname or "").strip() or _guess_model(descr)
+    serial = await _first_entity_value(session, ENT_SERIAL_PREFIX)
+    model = _sku_from_descr(descr) or await _first_entity_value(
+        session, ENT_MODEL_PREFIX) or _guess_model(descr)
+    mac = ""
+    try:
+        mac = _mac_from_octets(await _to_thread(session.get, BRIDGE_BASE_MAC))
+    except Exception:  # noqa: BLE001 — identity extras are best-effort
+        pass
+    m = re.search(r"\brevision\s+([A-Z]{0,3}\.?\d+(?:\.\w+)+)", descr, re.IGNORECASE)
     return {
         "model": model,
-        "serial": "",  # serial via ENTITY-MIB entPhysicalSerialNum — not walked
-        "firmware": descr,
+        "serial": serial,
+        "firmware": m.group(1) if m else descr,
         "hostname": str(sysname or "").strip(),  # sysName IS the configured hostname
-        "mac": "",  # base MAC via BRIDGE-MIB dot1dBaseBridgeAddress — not walked
+        "mac": mac,
         "interfaces_count": ifnum_i,
     }
+
+
+async def _first_entity_value(session: SnmpSession, prefix: str) -> str:
+    """First non-empty value in an ENTITY-MIB column, lowest entPhysicalIndex
+    first (the chassis / stack member 1). Empty when the MIB isn't served."""
+    try:
+        rows = await _to_thread(session.walk, prefix)
+    except Exception:  # noqa: BLE001
+        return ""
+    def _idx(oid):
+        try:
+            return int(str(oid).rsplit(".", 1)[-1])
+        except ValueError:
+            return 1 << 30
+    for oid, val in sorted(rows or [], key=lambda r: _idx(r[0])):
+        if isinstance(val, bytes):
+            try:
+                val = val.decode("ascii")
+            except UnicodeDecodeError:
+                continue
+        txt = str(val or "").strip()
+        if txt:
+            return txt
+    return ""
+
+
+def _sku_from_descr(descr: str) -> str:
+    """HPE/Aruba product SKU in sysDescr ("Aruba JL253A 2930F-24G…"), else ''."""
+    m = re.search(r"\b(J[A-Z]?\d{3,4}[A-Z])\b", descr or "")
+    return m.group(1) if m else ""
 
 
 async def snmp_get_interfaces(session: SnmpSession) -> List[dict]:
