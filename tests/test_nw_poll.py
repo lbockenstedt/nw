@@ -311,3 +311,12 @@ def test_nwspoke_exposes_background_loop_hook_and_backref():
         for t in sp._bg_tasks:
             t.cancel()
     _run(_run_())
+
+
+def test_poll_schedule_survives_restart(tmp_path, monkeypatch):
+    monkeypatch.setenv("NW_POLL_STATE_FILE", str(tmp_path / "due.json"))
+    sp = NwSpoke("nw-1", {"devices": []})
+    sp._save_poll_due({"dev-1": 1234.5})
+    assert NwSpoke("nw-1", {"devices": []})._load_poll_due() == {"dev-1": 1234.5}
+    (tmp_path / "due.json").write_text("not json")
+    assert sp._load_poll_due() == {}
