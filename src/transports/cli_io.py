@@ -1453,6 +1453,17 @@ async def cli_get_device_info(session: CliSession, object_type: str) -> dict:
         text = await session.run(info_cmd)
     except Exception as e:
         raise CliError(f"info command failed: {e}")
+    # The hardware identity (serial / base MAC / product) isn't in `show version`
+    # on AOS-CX (`show system` has it) or ArubaOS gateways (`show inventory`).
+    # Best-effort: a failure here only costs the identity datums.
+    id_cmd = {"cx_switch": "show system", "gateway": "show inventory"}.get(object_type)
+    id_text = ""
+    if id_cmd:
+        try:
+            id_text = await session.run(id_cmd) or ""
+        except Exception as e:  # noqa: BLE001
+            logger.debug("cli_get_device_info: %r failed: %s", id_cmd, e)
+    full = f"{text or ''}\n{id_text}"
     # OS name for NetBox (platform). Detect the family from the version banner;
     # fall back to a sensible default per object_type.
     _os_m = re.search(r"\b(ArubaOS-CX|ArubaOS|AOS-CX|AOS-S|JUNOS|Junos)\b", text or "", re.IGNORECASE)
@@ -1461,11 +1472,12 @@ async def cli_get_device_info(session: CliSession, object_type: str) -> dict:
     # Configured hostname (system name) so the hub can reconcile the stored NW
     # Devices display name to what's actually set on the box: prefer the info
     # command's 'System Name' field, fall back to the live CLI prompt token.
-    hostname = _hostname_from_text(text) or _hostname_from_prompt(
+    hostname = _hostname_from_text(full) or _hostname_from_prompt(
         getattr(session, "_last_prompt", ""))
-    return {"model": _first_hw_token(text), "serial": _serial_from(text),
+    return {"model": _model_from(id_text) or _model_from(text),
+            "serial": _serial_from(id_text) or _serial_from(text),
             "firmware": _firmware_from(text), "os": os_name, "hostname": hostname,
-            "mac": _base_mac_from(text), "interfaces_count": 0}
+            "mac": _base_mac_from(full), "interfaces_count": 0}
 
 
 async def cli_get_arp(session: CliSession, object_type: str) -> List[dict]:
@@ -1634,10 +1646,37 @@ def _hostname_from_prompt(prompt: str) -> str:
     return p
 
 
+_SERIAL_VAL = r"([A-Za-z0-9][A-Za-z0-9\-]{3,})"
+_SERIAL_RES = (
+    # AOS-CX `show system`: "Chassis Serial Nbr : SG9ZKMR0F4"
+    re.compile(r"(?i)chassis\s+serial(?:\s*(?:nbr|number|no\.?))?\s*[:=]\s*" + _SERIAL_VAL),
+    # ArubaOS `show inventory`: "System Serial#  : CW0012345 (Date:...)"
+    re.compile(r"(?i)system\s+serial\s*(?:#|nbr|number|no\.?)?\s*[:=]\s*" + _SERIAL_VAL),
+    # AOS-S "Serial Number : SG..." and generic "Serial: X" / "S/N: X"
+    re.compile(r"(?i)(?:\bserial(?:\s*(?:nbr|number|no\.?|#))?|\bs/n)\s*[:=#]\s*" + _SERIAL_VAL),
+)
+
+
 def _serial_from(text: str) -> str:
-    m = re.search(r"(?:Serial|S/N|Serial Number)\s*[:#]\s*(\S+)", text or "",
-                  re.IGNORECASE)
-    return m.group(1) if m else ""
+    """Chassis serial from an info/identity show command. Chassis/system serial
+    lines win over per-module ones; never returns the ':' separator."""
+    for rx in _SERIAL_RES:
+        m = rx.search(text or "")
+        if m:
+            return m.group(1)
+    return ""
+
+
+def _model_from(text: str) -> str:
+    """Product/model: AOS-CX 'Product Name : JL627A 8325…', ArubaOS
+    '(MODEL: 7005-US)', else the first SKU-looking token."""
+    m = re.search(r"(?im)^\s*product\s+name\s*:\s*(\S+)", text or "")
+    if m:
+        return m.group(1)
+    m = re.search(r"\(MODEL:\s*([^)\s]+)\)", text or "", re.IGNORECASE)
+    if m:
+        return m.group(1)
+    return _first_hw_token(text)
 
 
 def _base_mac_from(text: str) -> str:
