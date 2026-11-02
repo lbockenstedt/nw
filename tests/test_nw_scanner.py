@@ -43,6 +43,10 @@ def test_classify_access_point_is_not_manageable():
     assert classify_platform(ap) is None
     assert classify_platform("ArubaOS (MODEL: 535), Version 8.10.0.6") is None
     assert classify_platform("T36-AP-01# AP uptime is 4 days") is None
+    assert classify_platform(
+        "HPE Aruba Networking Wireless Operating System. AOS-10 (MODEL: 725), "
+        "Version 10.9.0.0 LSR (c) Copyright 2026 Hewlett Packard Enterprise "
+        "Development LP. AP uptime is 15 hours") is None
     assert classify_platform("ArubaOS (MODEL: Aruba7210-US), Version 8.10") == "gateway"
 
 
