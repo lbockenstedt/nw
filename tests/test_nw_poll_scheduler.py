@@ -149,3 +149,11 @@ def test_module_default_constants_sane():
     assert S.POLL_MAX_PER_TICK >= 1
     assert 0.0 < S.POLL_JITTER_FRAC < 1.0
     assert S.POLL_FLOOR_S >= 1
+
+
+def test_first_max_caps_first_sight_after_restart():
+    nd = {}
+    plan_poll_tick([{"id": "a"}], nd, 1000.0, 21600, rng=lambda: 0.99,
+                   first_max=600)
+    # [0.5, 1.5] × 600 — minutes, not the 3–9h a 6h interval would give.
+    assert 1000.0 + 300 <= nd["a"] <= 1000.0 + 900

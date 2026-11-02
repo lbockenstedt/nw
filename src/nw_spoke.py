@@ -5,7 +5,9 @@ device telemetry, VLAN/port operations, and network discovery scans.
 """
 
 import asyncio
+import json
 import logging
+import os
 import re
 import time
 from pathlib import Path
@@ -99,6 +101,47 @@ class NwSpoke(BaseSpoke):
         ]
         logger.info("nw background loops started (poll + reachability sweep)")
 
+    _NW_POLL_FIRST_MAX = 600   # first poll after a (re)start: 5–15 min, not 3–9h
+
+    @staticmethod
+    def _poll_state_path() -> str:
+        """Where the poll schedule survives restarts: /var/lib/lm/nw, else a
+        repo-local .lm-state/nw (dev / unprivileged boxes)."""
+        env = os.environ.get("NW_POLL_STATE_FILE")
+        if env:
+            return env
+        for base in ("/var/lib/lm/nw",
+                     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                  ".lm-state", "nw")):
+            try:
+                os.makedirs(base, exist_ok=True)
+                if os.access(base, os.W_OK):
+                    return os.path.join(base, "poll_due.json")
+            except OSError:
+                continue
+        return ""
+
+    def _load_poll_due(self) -> Dict[str, float]:
+        path = self._poll_state_path()
+        try:
+            with open(path) as f:
+                raw = json.load(f)
+            return {str(k): float(v) for k, v in (raw or {}).items()}
+        except (OSError, ValueError, TypeError, AttributeError):
+            return {}
+
+    def _save_poll_due(self, next_due: Dict[str, float]) -> None:
+        path = self._poll_state_path()
+        if not path:
+            return
+        try:
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(next_due, f)
+            os.replace(tmp, path)
+        except OSError as e:
+            logger.debug("nw poll schedule save failed: %s", e)
+
     def _hub_ready(self):
         """The control-plane back-ref, iff it's live-connected to the hub; else
         None (loops idle until connected)."""
@@ -113,7 +156,13 @@ class NwSpoke(BaseSpoke):
         interval elapsed, pushing ``NW_POLL_RESULT`` so the hub warms its cache.
         Anti-stampede via ``plan_poll_tick`` (jitter + per-tick cap) plus a
         concurrency semaphore."""
-        next_due: Dict[str, float] = {}
+        # Deadlines are wall-clock and persisted, so the frequent self-update
+        # restarts resume the schedule instead of pushing every device's first
+        # poll out again (with a 6h default, a box restarting every few hours
+        # never polled at all).
+        next_due: Dict[str, float] = self._load_poll_due()
+        if next_due:
+            logger.info("nw poll schedule restored for %d device(s)", len(next_due))
         while True:
             await asyncio.sleep(self._NW_POLL_TICK)
             try:
@@ -128,7 +177,8 @@ class NwSpoke(BaseSpoke):
                                       if mod_raw in (None, "") else int(mod_raw))
                 except (TypeError, ValueError):
                     module_default = self._NW_POLL_DEFAULT
-                now = time.monotonic()
+                now = time.time()
+                before = dict(next_due)
                 try:
                     jf = float(mod_cfg.get("poll_jitter_frac"))
                 except (TypeError, ValueError):
@@ -141,7 +191,10 @@ class NwSpoke(BaseSpoke):
                 mpt = max(1, min(mpt, 100))
                 due = plan_poll_tick(list(engine.devices), next_due, now,
                                      module_default,
-                                     max_per_tick=mpt, jitter_frac=jf)
+                                     max_per_tick=mpt, jitter_frac=jf,
+                                     first_max=self._NW_POLL_FIRST_MAX)
+                if next_due != before:
+                    self._save_poll_due(next_due)
                 if due:
                     try:
                         conc = int(mod_cfg.get("max_poll_concurrency"))
