@@ -566,3 +566,34 @@ def test_cx_uses_the_singular_interface_command_and_its_parser():
     assert cli_io.PARSERS["cx_switch"][2] is cli_io.parse_interfaces_aos_cx
     assert cli_io.parse_interfaces_aos_cx("Invalid input: interfaces") == []
     assert cli_io.parse_interfaces_aos_s("Invalid input: interfaces\n% Unknown command.") == []
+
+
+def test_cx_show_system_identity():
+    text = (
+        "Hostname                        : MIPBE-SSPLM-N31-CRSW1\n"
+        "System Description              : GL.10.13.1000\n"
+        "Vendor                          : Aruba\n"
+        "Product Name                    : JL627A 8325-32C 32p 100G Switch\n"
+        "Chassis Serial Nbr              : SG9ZKMR0F4\n"
+        "Base MAC Address                : 9020c2-c1d200\n"
+        "ArubaOS-CX Version              : GL.10.13.1000\n")
+    assert cli_io._serial_from(text) == "SG9ZKMR0F4"
+    assert cli_io._model_from(text) == "JL627A"
+    assert cli_io._base_mac_from(text) == "90:20:c2:c1:d2:00"
+
+
+def test_gateway_show_inventory_identity():
+    text = (
+        "Supervisor Card slot        : 0\n"
+        "System Serial#              : CW0012345 (Date:05/29/18)\n"
+        "SC Assembly#                : 2010174A (Rev:02.00)\n"
+        "SC Serial#                  : AE11111 (Date:05/29/18)\n")
+    # The system serial wins over the per-module (SC) serial.
+    assert cli_io._serial_from(text) == "CW0012345"
+    ver = "ArubaOS (MODEL: Aruba7005-US), Version 8.10.0.6"
+    assert cli_io._model_from(ver) == "Aruba7005-US"
+
+
+def test_serial_from_never_returns_separator():
+    assert cli_io._serial_from("Serial Number : SG123ABCD") == "SG123ABCD"
+    assert cli_io._serial_from("no serial here") == ""
