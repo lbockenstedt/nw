@@ -50,3 +50,4 @@ certs/
 .env.lock
 *.crt
 secrets.json
+.lm-state/

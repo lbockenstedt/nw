@@ -47,7 +47,8 @@ def plan_poll_tick(devices: List[Dict[str, Any]], next_due: Dict[str, float],
                    floor: int = POLL_FLOOR_S,
                    max_per_tick: int = POLL_MAX_PER_TICK,
                    jitter_frac: float = POLL_JITTER_FRAC,
-                   rng=random.random) -> List[str]:
+                   rng=random.random,
+                   first_max: int = 0) -> List[str]:
     """Decide which device ids to poll this tick and update ``next_due`` in
     place. Returns the (capped) list of device ids to poll now.
 
@@ -64,6 +65,9 @@ def plan_poll_tick(devices: List[Dict[str, Any]], next_due: Dict[str, float],
     - Devices no longer present are pruned from ``next_due``.
 
     ``rng`` returns a float in ``[0, 1)`` (injected for deterministic tests).
+    ``first_max`` (> 0) caps the first-sight spread to ``[0.5, 1.5] × min(
+    interval, first_max)`` so a freshly (re)started spoke polls within minutes
+    instead of waiting up to 1.5 × a multi-hour interval.
     """
     seen = set()
     interval_by: Dict[str, int] = {}
@@ -81,7 +85,8 @@ def plan_poll_tick(devices: List[Dict[str, Any]], next_due: Dict[str, float],
         interval_by[did] = interval
         deadline = next_due.get(did)
         if deadline is None:                    # first sight → jittered spread
-            next_due[did] = now + interval * (0.5 + rng())
+            span = min(interval, first_max) if first_max and first_max > 0 else interval
+            next_due[did] = now + span * (0.5 + rng())
         elif now >= deadline:
             ready.append((deadline, did))
     for gone in set(next_due) - seen:           # prune removed devices
