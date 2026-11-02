@@ -630,3 +630,46 @@ def test_aoss_info_falls_back_when_command_rejected():
     assert s.ran[:2] == ["show system", "show system-information"]
     assert info["serial"] == "TW98JYH02M" and info["mac"] == "38:21:c7:fc:8e:e0"
     assert info["hostname"] == "OLKS-MGMTSW"
+
+
+_GW_INVENTORY = (
+    "Supervisor Card slot          : 0\n"
+    "System Serial#                : CZ0001505 (Date:06/22/15)\n"
+    "SC Model#                     : Aruba7024-US\n"
+    "HW MAC Addr                   : 00:0b:86:bc:49:87 to 00:0b:86:bc:49:a6\n"
+    "Main Board Temperatures       :\n"
+    "                : U88 - LM75 Near Exhaust    45 C (near exhaust)\n")
+
+
+def _gw_session(replies):
+    class _S:
+        _last_prompt = "(GATEWAY) [mynode] #"
+
+        def __init__(self):
+            self.ran = []
+
+        async def run(self, cmd):
+            self.ran.append(cmd)
+            return replies.get(cmd, "")
+    return _S()
+
+
+def test_gateway_inventory_mac_and_model_not_sensor_part():
+    s = _gw_session({"show version": "ArubaOS Version 8.10.0.7",
+                     "show inventory": _GW_INVENTORY})
+    info = asyncio.get_event_loop().run_until_complete(
+        cli_io.cli_get_device_info(s, "gateway"))
+    assert info["mac"] == "00:0b:86:bc:49:87"
+    assert info["model"] == "Aruba7024-US"
+    assert info["serial"] == "CZ0001505"
+    assert "show interface vlan 1" not in s.ran
+
+
+def test_gateway_mac_falls_back_to_vlan1_svi():
+    inv = _GW_INVENTORY.replace("HW MAC Addr", "Other")
+    s = _gw_session({"show inventory": inv, "show interface vlan 1":
+                     "VLAN1 is up\nHardware is CPU Interface, Interface address is "
+                     "00:0B:86:BC:49:87 (bia 00:0B:86:BC:49:87)\n"})
+    info = asyncio.get_event_loop().run_until_complete(
+        cli_io.cli_get_device_info(s, "gateway"))
+    assert info["mac"] == "00:0b:86:bc:49:87"
