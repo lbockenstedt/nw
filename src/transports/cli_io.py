@@ -1443,7 +1443,7 @@ async def cli_get_device_info(session: CliSession, object_type: str) -> dict:
     its text (best-effort). Raises :class:`CliError` on command failure."""
     # Reuse the vendor "info" command via run(); model/firmware parsed from the
     # raw text best-effort.
-    info_cmd = {"aos_switch": "show system-information",
+    info_cmd = {"aos_switch": "show system",
                 "ex_switch": "show version",
                 "cx_switch": "show version",
                 # ArubaOS gateway: `show version` carries the OS name + version
@@ -1453,16 +1453,39 @@ async def cli_get_device_info(session: CliSession, object_type: str) -> dict:
         text = await session.run(info_cmd)
     except Exception as e:
         raise CliError(f"info command failed: {e}")
+    # Firmware trains differ in which spelling they accept (`show system` vs
+    # `show system-information` / `show system information` on AOS-S). A
+    # rejected command still "succeeds" with an error banner, which left every
+    # identity datum blank — try the alternates before giving up.
+    if _cli_rejected(text):
+        for alt in _INFO_ALTERNATES.get(object_type, ()):
+            if alt == info_cmd:
+                continue
+            try:
+                alt_text = await session.run(alt)
+            except Exception:  # noqa: BLE001
+                continue
+            if not _cli_rejected(alt_text):
+                logger.info("cli_get_device_info: %r rejected, using %r", info_cmd, alt)
+                text = alt_text
+                break
+        else:
+            logger.warning("cli_get_device_info: %s info command rejected: %s",
+                           object_type, (text or "").strip()[:120])
     # The hardware identity (serial / base MAC / product) isn't in `show version`
     # on AOS-CX (`show system` has it) or ArubaOS gateways (`show inventory`).
     # Best-effort: a failure here only costs the identity datums.
-    id_cmd = {"cx_switch": "show system", "gateway": "show inventory"}.get(object_type)
+    id_cmd = {"cx_switch": "show system", "gateway": "show inventory",
+              # AOS-S `show system` has serial + base MAC but no model.
+              "aos_switch": "show modules"}.get(object_type)
     id_text = ""
     if id_cmd:
         try:
             id_text = await session.run(id_cmd) or ""
         except Exception as e:  # noqa: BLE001
             logger.debug("cli_get_device_info: %r failed: %s", id_cmd, e)
+        if _cli_rejected(id_text):
+            id_text = ""
     full = f"{text or ''}\n{id_text}"
     # OS name for NetBox (platform). Detect the family from the version banner;
     # fall back to a sensible default per object_type.
@@ -1607,6 +1630,20 @@ async def cli_get_vlans(session: CliSession, object_type: str) -> List[dict]:
     return VLAN_PARSERS.get(object_type, parse_vlans_gateway)(text)
 
 
+_INFO_ALTERNATES = {
+    "aos_switch": ("show system", "show system-information", "show system information"),
+}
+
+_CLI_REJECT_RE = re.compile(
+    r"(?im)^\s*(?:%\s*)?(?:invalid input|unknown command|incomplete command|"
+    r"command not found|syntax error|parse error)")
+
+
+def _cli_rejected(text: str) -> bool:
+    """True when a show command came back as the CLI's error banner."""
+    return bool(_CLI_REJECT_RE.search(text or ""))
+
+
 def _first_hw_token(text: str) -> str:
     m = re.search(r"\b([A-Z]{2,4}[-\s]?\d{2,4}[A-Z]*)\b", text or "")
     return m.group(1) if m else ""
@@ -1676,6 +1713,10 @@ def _model_from(text: str) -> str:
     m = re.search(r"\(MODEL:\s*([^)\s]+)\)", text or "", re.IGNORECASE)
     if m:
         return m.group(1)
+    # AOS-S `show modules`: "Chassis: 2530-24G-PoEP J9773A   Serial Number: …"
+    m = re.search(r"(?im)^\s*chassis\s*:.*?\b(J[A-Z]?\d{3,4}[A-Z])\b", text or "")
+    if m:
+        return m.group(1)
     return _first_hw_token(text)
 
 
@@ -1687,7 +1728,7 @@ def _base_mac_from(text: str) -> str:
     ``38:63:bb:a1:b2:c3``. Empty when absent — helps operators positively ID
     the physical box alongside the serial number."""
     m = re.search(
-        r"(?im)^\s*(?:base\s*mac(?:\s*addr(?:ess)?)?|system\s*mac|mac\s*address)"
+        r"(?im)(?:^|\s{2,})(?:base\s*mac(?:\s*addr(?:ess)?)?|system\s*mac|mac\s*address)"
         r"\s*[:=]\s*([0-9A-Fa-f][0-9A-Fa-f:.\-]{10,})",
         text or "")
     if not m:
