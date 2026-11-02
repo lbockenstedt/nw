@@ -39,7 +39,7 @@ _VENDOR_COMMANDS: Dict[str, Dict[str, str]] = {
     "aos_switch": {  # Aruba AOS-Switch (ProCurve/Aruba)
         "mac":  "show mac-address",
         "arp":  "show arp",
-        "info": "show system-information",
+        "info": "show system",
         "if":   "show interfaces brief",
     },
     "cx_switch": {   # Aruba AOS-CX (RESTv1)
