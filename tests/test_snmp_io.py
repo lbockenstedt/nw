@@ -143,9 +143,24 @@ def test_snmp_get_device_info():
                         snmp_io.SYS_NAME: "core-sw",
                         snmp_io.IF_NUMBER: 52})
     info = _run(snmp_io.snmp_get_device_info(s))
-    assert info["model"] == "core-sw"
+    assert info["model"] == "JL658A"  # SKU, not the sysName
+    assert info["hostname"] == "core-sw"
     assert info["interfaces_count"] == 52
     assert "Aruba" in info["firmware"]
+
+
+def test_snmp_get_device_info_chassis_identity():
+    S, M = snmp_io.ENT_SERIAL_PREFIX, snmp_io.ENT_MODEL_PREFIX
+    s = _FakeSnmp(gets={snmp_io.SYS_DESCR: "Aruba 3810M Switch Stack, revision KB.16.11.0031, ROM KB.16.01.0008",
+                        snmp_io.SYS_NAME: "TOR-AGG",
+                        snmp_io.BRIDGE_BASE_MAC: b"\x38\x21\xc7\xfc\x8e\xe0"},
+                  walks={S: [(S + ".1", ""), (S + ".2", b"SG81JFX0AB")],
+                         M: [(M + ".2", "JL075A")]})
+    info = _run(snmp_io.snmp_get_device_info(s))
+    assert info["serial"] == "SG81JFX0AB"
+    assert info["model"] == "JL075A"
+    assert info["firmware"] == "KB.16.11.0031"
+    assert info["mac"] == "38:21:c7:fc:8e:e0"
 
 
 def test_snmp_get_interfaces():
