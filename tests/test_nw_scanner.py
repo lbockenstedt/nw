@@ -36,6 +36,16 @@ def test_classify_gateway():
     assert classify_platform("Aruba Mobility Controller") == "gateway"
 
 
+def test_classify_access_point_is_not_manageable():
+    ap = ("Aruba Operating System Software. ArubaOS (MODEL: 515), Version 10.4.0.0 "
+          "(c) Copyright 2023 Hewlett Packard Enterprise Development LP. "
+          "AP uptime is 13 days 1 hours")
+    assert classify_platform(ap) is None
+    assert classify_platform("ArubaOS (MODEL: 535), Version 8.10.0.6") is None
+    assert classify_platform("T36-AP-01# AP uptime is 4 days") is None
+    assert classify_platform("ArubaOS (MODEL: Aruba7210-US), Version 8.10") == "gateway"
+
+
 def test_classify_ex_switch():
     assert classify_platform("JUNOS 21.4R1 Juniper EX4300") == "ex_switch"
 
