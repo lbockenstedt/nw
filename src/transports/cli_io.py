@@ -10,17 +10,26 @@ unit-tested directly with canned CLI text. The session mechanics are
 best-effort real IO — a parse failure on a line skips that line, never the
 whole poll.
 """
+# asyncio for timeouts and the async SSH session.
 import asyncio
+# Standard-library logging for transport messages.
 import logging
+# os reads the SSH debug env knob.
 import os
+# re for prompt/pager detection and output parsing.
 import re
+# Type hints.
 from typing import Any, Dict, List
 
+# heartbeat signals progress to the fleet idle-guard during long sessions.
 import heartbeat
 
+# Small VT100 emulator that answers terminal queries from the device.
 from .vtscreen import TerminalScreen
+# Records a per-device connection profile after a good connect.
 from . import device_profile
 
+# Named logger for CLI transport messages.
 logger = logging.getLogger("NwCli")
 
 
@@ -89,7 +98,10 @@ class CliSession:
     manager, or call connect()/close() directly."""
 
     def __init__(self, device: Dict[str, Any], command_timeout: float = 15.0):
+        """Read connection details from the device dict; no network I/O yet."""
+        # Tolerate a missing device dict.
         d = device or {}
+        # Address, SSH port, credentials, enable secret, device family and id.
         self.host = str(d.get("address") or "").strip()
         self.port = int(d.get("port") or 22)
         self.username = str(d.get("username") or "").strip()
@@ -97,8 +109,10 @@ class CliSession:
         self.enable_secret = str(d.get("enable_secret") or "")
         self.object_type = str(d.get("object_type") or "").strip()
         self.device_id = str(d.get("id") or "")
+        # Without an address and username there is nothing to log in with.
         if not self.host or not self.username:
             raise CliError("device address/username not configured")
+        # Per-command timeout; connection objects are created in connect().
         self.command_timeout = command_timeout
         self._conn = None
         self._proc = None
@@ -108,12 +122,15 @@ class CliSession:
         self._banner = ""      # login banner / first output (captured for debug)
 
     async def __aenter__(self):
+        """Connect when entering ``async with``."""
         await self.connect()
         return self
 
     async def __aexit__(self, *exc):
+        """Close the session when leaving ``async with``."""
         await self.close()
 
+    # Default explanation when the device drops the session right after login.
     _SESSION_CLOSED_HINT = (
         "device closed the SSH session right after login — the account may "
         "lack CLI/exec privilege, the device may require different "
@@ -123,35 +140,48 @@ class CliSession:
         """True if the device has already torn the interactive channel down
         (e.g. an exit status arrived during the banner read). Best-effort:
         any attribute error means we can't tell, so assume still open."""
+        # No process: treat as closed.
         proc = self._proc
         if proc is None:
             return True
+        # An exit status or signal means the remote side has finished.
         try:
             if proc.exit_status is not None or proc.exit_signal is not None:
                 return True
         except Exception:
+            # Attribute missing: cannot tell.
             pass
+        # A channel that is closing is also closed for our purposes.
         try:
             chan = proc.channel
             if chan is not None and chan.is_closing():
                 return True
         except Exception:
+            # Attribute missing: cannot tell.
             pass
+        # No sign of closure: assume open.
         return False
 
     async def connect(self) -> None:
+        """Open SSH, get an 80x24 PTY, pass the login banner, disable paging, enable if needed.
+
+        Raises CliError on any failure and always closes a half-open session."""
+        # asyncssh imported lazily so the module loads without it installed.
         import asyncssh
         # Opt-in wire-level debug: set LM_NW_SSH_DEBUG=1 (or 2 for packet dumps)
         # on the spoke to turn on asyncssh's own protocol logging, so an auth /
         # channel-open / channel-close failure is visible in the spoke log.
         _dbg = os.environ.get("LM_NW_SSH_DEBUG", "").strip()
+        # Debug logging is best-effort.
         if _dbg:
             try:
                 logging.getLogger("asyncssh").setLevel(logging.DEBUG)
                 asyncssh.set_log_level(logging.DEBUG)
                 asyncssh.set_debug_level(2 if _dbg == "2" else 1)
             except Exception:  # noqa: BLE001 — best-effort debug toggle
+                # Unsupported asyncssh version: ignore.
                 pass
+        # TCP connect plus authentication, capped at 15 seconds overall.
         try:
             self._conn = await asyncio.wait_for(
                 asyncssh.connect(self.host, port=self.port, username=self.username,
@@ -159,6 +189,7 @@ class CliSession:
                                  login_timeout=10),
                 timeout=15.0)
         except Exception as e:
+            # Any connect/auth failure becomes a CliError with the host.
             raise CliError(f"SSH connect to {self.host}: {e}")
         heartbeat.beat()  # progress: TCP+auth done
         # Request a REAL terminal size (80x24), not asyncssh's default 0x0 PTY.
@@ -170,6 +201,7 @@ class CliSession:
                                                       term_size=(80, 24),
                                                       encoding="utf-8")
         heartbeat.beat()  # progress: interactive PTY open
+        # Reset per-connect profile data.
         self._gates = set()      # fresh gate observations for this connect
         self._last_prompt = ""
         try:
@@ -185,9 +217,11 @@ class CliSession:
             # that already show a prompt (it just reprints it) and answers any
             # "Press any key to continue" gate. Best-effort: a closed channel is
             # caught below.
+            # Send the first CR; ignore a closed channel.
             try:
                 self._proc.stdin.write("\r")
             except Exception:  # noqa: BLE001 — channel may already be closed
+                # Channel already gone: the check below reports it.
                 pass
             # Bounded re-nudge: some AOS-S switches only emit the banner/prompt
             # after an Enter, and the pre-read CR above can be lost if it lands
@@ -197,20 +231,26 @@ class CliSession:
             self._nudges_left = 6
 
             def _renudge():
+                """Idle callback: send another CR while the banner is still silent (max 6 times)."""
+                # Out of nudges: let the read timeout decide.
                 if self._nudges_left <= 0:
                     return
+                # Use up one nudge.
                 self._nudges_left -= 1
                 # DEBUG-only re-nudge trace: the CR-nudge banner handshake is
                 # locked in for AOS-S, so this is no longer worth an INFO line on
                 # every connect — kept at debug for opt-in troubleshooting.
                 logger.debug("cli %s: banner still silent, re-nudge #%d (CR)",
                              self.host, 6 - self._nudges_left)
+                # A closed channel just logs at debug.
                 try:
                     self._proc.stdin.write("\r")
                 except Exception as e:  # noqa: BLE001 — channel may already be closed
                     logger.debug("cli %s: re-nudge write failed: %r", self.host, e)
 
+            # Read the banner/first output, re-nudging when idle.
             self._banner = await self._read_until_prompt(on_idle=_renudge)  # banner / first output
+            # Log a banner tail only at debug level.
             if self._banner.strip():
                 # The raw login banner / VT100 session content is only useful
                 # while bringing up a new device transport; now that the AOS-S
@@ -226,10 +266,12 @@ class CliSession:
             # actionable error instead of the opaque asyncssh text.
             if self._channel_closed():
                 raise CliError(self._session_closed_error())
+            # Turn off paging so long show output arrives in one piece.
             paging = _PAGING_CMD.get(self.object_type)
             if paging:
                 await self._send(paging)
                 await self._read_until_prompt()
+            # AOS-S with an enable secret: enter enable mode before running commands.
             if self.enable_secret and self.object_type == "aos_switch":
                 await self._send("enable")
                 await self._read_until_prompt()
@@ -264,7 +306,9 @@ class CliSession:
         login, enriched with a tail of the banner/first output it sent (so the
         poll error — cached + shown in the UI — carries a debuggable clue).
         Special-cases the AOS-S session-pool-exhausted disconnect."""
+        # Banner text gives the clue to why the session closed.
         banner = (self._banner or "").strip()
+        # AOS-S session pool full: say so and how to fix it.
         if re.search(r"maximum number of sessions", banner, re.IGNORECASE):
             msg = ('device refused the login: its SSH/console session pool is '
                    'full ("maximum number of sessions are active") — free stale '
@@ -272,11 +316,15 @@ class CliSession:
                    '"show ip ssh" to list, "ip ssh" / "console" session limits '
                    'to raise)')
         else:
+            # Generic explanation.
             msg = self._SESSION_CLOSED_HINT
+        # Append a banner tail when we have one.
         if banner:
             msg += f"; device sent before closing: {banner[-300:]!r}"
+        # Append the underlying exception text when given.
         if exc is not None:
             msg += f" ({exc})"
+        # Full message.
         return msg
 
     async def close(self) -> None:
@@ -284,41 +332,55 @@ class CliSession:
         # IMMEDIATELY rather than holding it until idle-timeout. On small-cap
         # switches (AOS-S) a TCP-drop-only close lingers and, across repeated
         # polls, exhausts the session pool. Guarded: a closed channel skips.
+        # Send "exit" so the device releases the session slot right away.
         try:
             if self._proc is not None and not self._channel_closed():
                 self._proc.stdin.write("exit\n")
         except Exception:
+            # Channel already gone: nothing to do.
             pass
+        # Close the interactive process.
         try:
             if self._proc:
                 self._proc.close()
         except Exception:
+            # Already closed: ignore.
             pass
+        # Close the SSH connection and wait until it is down.
         try:
             if self._conn:
                 self._conn.close()
                 await self._conn.wait_closed()
         except Exception:
+            # Already closed: ignore.
             pass
 
     def _flush_term_replies(self) -> bool:
         """Write any host-bound replies the shadow emulator queued in answer to
         a device terminal query (DSR cursor-position report, DA). Returns True if
         anything was written. Best-effort: a closed channel is ignored."""
+        # No emulator yet: nothing queued.
         term = getattr(self, "_term", None)
         if term is None:
             return False
+        # Collect any queued replies.
         data = term.pending_replies()
         if not data:
             return False
+        # Send them back to the device.
         try:
             self._proc.stdin.write(data)
         except Exception:  # noqa: BLE001 — channel may already be closed
+            # Channel closed: ignore.
             pass
+        # Something was sent.
         return True
 
     async def _send(self, line: str) -> None:
+        """Write one command line to the device; raise CliError if the channel is closed."""
+        # Send the command and signal progress.
         try:
+            # Translate a closed-channel error into an actionable CliError.
             self._proc.stdin.write(line + "\n")
             heartbeat.beat()  # progress: command sent
         except (BrokenPipeError, ConnectionError, OSError) as e:
@@ -347,6 +409,7 @@ class CliSession:
         only at the newest chunk plus a ``_PAGER_OVERLAP`` overlap for a
         marker split across the boundary. A multi-thousand-line MAC/user
         table is never rescanned whole per 4KB read."""
+        # Completed output segments.
         out: List[str] = []
         # Invariant: between iterations buf holds only the trailing partial
         # line (no newline) — complete lines are drained below.
@@ -358,13 +421,18 @@ class CliSession:
         # bytes (below); the emulator is used only for its query replies.
         term = TerminalScreen(cols=80, rows=24)
         self._term = term
+        # Any read error ends the read with what we have.
         try:
+            # Overall deadline for this read.
             loop = asyncio.get_event_loop()
             deadline = loop.time() + timeout
+            # Read in up to 1-second slices so idle handling can run.
             while loop.time() < deadline:
+                # Out of time.
                 remaining = deadline - loop.time()
                 if remaining <= 0:
                     break
+                # Read the next chunk, waiting at most one second.
                 try:
                     chunk = await asyncio.wait_for(
                         self._proc.stdout.read(4096), timeout=min(remaining, 1.0))
@@ -390,16 +458,19 @@ class CliSession:
                     if on_idle is not None and not out and not buf:
                         on_idle()
                     continue
+                # EOF: the channel closed.
                 if not chunk:
                     break
                 heartbeat.beat()  # progress: bytes arrived from the device
                 # Feed the shadow emulator so it can answer any terminal query
                 # this chunk carried (DSR/DA) generically — see below.
+                # Update the emulator's screen state with the new bytes.
                 term.feed(chunk)
                 # If paging is still on despite `no page`, advance the pager (send
                 # a space) and strip the marker so output isn't truncated/polluted.
                 # Scan only the newest chunk + a small overlap — older text was
                 # already scanned (and scrubbed) when its own chunk arrived.
+                # Look at the new chunk plus a short overlap from the previous text.
                 keep = max(0, len(buf) - _PAGER_OVERLAP)
                 window = buf[keep:] + chunk
                 # Two stream-blocking gates need a key sent before more output
@@ -430,28 +501,36 @@ class CliSession:
                     buf = buf[:keep] + _QUERY_RE.sub("", window)
                     deadline = loop.time() + timeout  # keep reading toward the prompt
                 elif _PAGER_RE.search(window) or _CONTINUE_RE.search(window):
+                    # Press space to continue past the pager or the banner gate.
                     try:
                         self._proc.stdin.write(" ")
                     except Exception:
+                        # Channel gone: the read will end on its own.
                         pass
+                    # Record which gate was seen, for the connection profile.
                     if _CONTINUE_RE.search(window):
                         self._gates.add("press_any_key")
                     if _PAGER_RE.search(window):
                         self._gates.add("pager")
+                    # Strip both markers and keep reading.
                     buf = buf[:keep] + _CONTINUE_RE.sub("", _PAGER_RE.sub("", window))
                     deadline = loop.time() + timeout  # keep reading further pages
                 else:
+                    # Ordinary output: append it.
                     buf += chunk
                 # Prompt check on the LAST line only (same semantics as the old
                 # splitlines()[-1].rstrip() over the whole buffer, but bounded).
                 # ANSI-strip the candidate line so a cursor-positioned prompt
                 # (ESC[24;1HDIST-SW# ) still matches the end-anchored regex.
+                # Drop one trailing newline (and CR) to find the last line.
                 tail = buf[-_PROMPT_TAIL:]
                 if tail.endswith("\n"):
                     tail = tail[:-1]
                     if tail.endswith("\r"):
                         tail = tail[:-1]
+                # The last line, without escape sequences.
                 last_line = _ANSI_RE.sub("", tail[tail.rfind("\n") + 1:])
+                # Prompt found: remember it and return all output.
                 if last_line and _PROMPT_RE.search(last_line.rstrip()):
                     self._last_prompt = last_line.rstrip()
                     out.append(buf)
@@ -459,17 +538,21 @@ class CliSession:
                 # Drain complete lines; keep only the trailing partial line so
                 # the next iteration's scans stay O(chunk). Any newline is at
                 # index >= keep (the pre-chunk buf held none).
+                # Find the last newline added by this chunk.
                 nl = buf.rfind("\n", keep)
                 if nl != -1:
                     out.append(buf[:nl + 1])
                     buf = buf[nl + 1:]
         except Exception as e:
+            # Read errors are logged at debug; return what was collected.
             logger.debug("cli read %s: %s", self.host, e)
+        # Timeout or EOF: return what we have.
         return "".join(out)
 
     async def run(self, command: str) -> str:
         """Run one show command, return its text output (echoed command line
         stripped)."""
+        # Send the command and read up to the next prompt.
         await self._send(command)
         raw = await self._read_until_prompt(timeout=self.command_timeout)
         # Strip ANSI/VT100 control sequences first: a full-screen AOS-S CLI
@@ -477,10 +560,12 @@ class CliSession:
         # otherwise pollute the parsed serial/MAC/hostname datums.
         raw = _ANSI_RE.sub("", raw)
         # Strip the echoed command line (first line) if present.
+        # Keep the text after the command echo.
         text = raw
         if command in text:
             _, _, text = text.partition(command)
             text = text.lstrip("\n")
+        # Command output.
         return text
 
     async def config(self, commands: List[str], timeout: float = 20.0) -> str:
@@ -488,38 +573,51 @@ class CliSession:
         concatenated output. Used for the ArubaOS cert bind (crypto-local pki +
         web-server profile). ``web-server profile`` etc. enter sub-contexts;
         ``end`` at the finish pops all the way out regardless of nesting."""
+        # Output from each step, joined at the end.
         out = []
+        # Enter config mode.
         await self._send("configure terminal")
         out.append(await self._read_until_prompt(timeout=timeout))
+        # Run each config command and collect its output.
         for c in commands:
             await self._send(c)
             out.append(await self._read_until_prompt(timeout=timeout))
+        # Leave config mode completely.
         await self._send("end")
         out.append(await self._read_until_prompt(timeout=timeout))
+        # All output.
         return "".join(out)
 
     async def scp_put_bytes(self, data: bytes, remote_path: str) -> None:
         """SCP-upload ``data`` to ``remote_path`` on the device over the SAME SSH
         connection (ArubaOS accepts a file into flash: via SCP). Writes a 0600
         temp file locally and streams it with asyncssh.scp."""
+        # Imported lazily; only needed for the upload.
         import asyncssh, os, tempfile
+        # Requires an open connection.
         if self._conn is None:
             raise CliError("not connected")
+        # Temp file holding the data for asyncssh.scp.
         fd, tmp = tempfile.mkstemp(suffix=".pfx")
         try:
+            # Write the bytes and restrict the file to the owner.
             with os.fdopen(fd, "wb") as f:
                 f.write(data)
             os.chmod(tmp, 0o600)
+            # Upload over the existing SSH connection, capped at 60 seconds.
             await asyncio.wait_for(asyncssh.scp(tmp, (self._conn, remote_path)),
                                    timeout=60.0)
         finally:
+            # Always delete the local temp file.
             try:
                 os.unlink(tmp)
             except OSError:
+                # Already gone: ignore.
                 pass
 
 
 # ── Pure parsers (testable) ──────────────────────────────────────────────────
+# Any of the MAC formats switches print: Aruba, Cisco dotted, colon/dash, or bare hex.
 _MAC_TOKEN = re.compile(
     r"[0-9a-fA-F]{6}-[0-9a-fA-F]{6}|"                          # Aruba aabbcc-ddeeff
     r"[0-9a-fA-F]{4}[-.:][0-9a-fA-F]{4}[-.:][0-9a-fA-F]{4}|"   # Cisco aabb.ccdd.eeff
@@ -530,7 +628,9 @@ _MAC_TOKEN = re.compile(
 def _is_null_mac(mac: str) -> bool:
     """True for an all-zero / incomplete MAC (e.g. ``000000-000000`` in an ARP
     table with no resolved hardware address)."""
+    # Remove separators; only zeros (or nothing) left means a null MAC.
     return set(re.sub(r"[^0-9a-fA-F]", "", mac or "")) <= {"0"}
+# Dotted-quad IPv4 address token.
 _IP_TOKEN = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
 
 
@@ -539,7 +639,9 @@ def parse_arp_aos_s(text: str) -> List[dict]:
     ``IP | MAC(aabbcc-ddeeff) | Type(dynamic) | Port``. The Port is optional
     (an unresolved ``000000-000000`` entry has none); such null-MAC rows are
     dropped. Port is taken only when it's a real port token (not the Type word)."""
+    # One row per ARP line.
     rows = []
+    # Need an IP and a real MAC on the line.
     for line in (text or "").splitlines():
         ip = _IP_TOKEN.search(line)
         mac = _MAC_TOKEN.search(line)
@@ -548,28 +650,36 @@ def parse_arp_aos_s(text: str) -> List[dict]:
         # tail = [Type, Port?]. Port present only when the last token is port-like
         # (digit, module/slash form like A1 or 1/2, or a named trunk like Trk2)
         # — never the Type word ("dynamic").
+        # Tokens after the MAC.
         tail = line[mac.end():].split()
         port = ""
         if len(tail) >= 2 and re.match(r"^[A-Za-z]*\d+(?:/\d+)*$", tail[-1]):
             port = tail[-1]
+        # Add the ARP row with a lower-case MAC.
         rows.append({"ip": ip.group(0), "mac": mac.group(0).lower(),
                      "interface": str(port)})
+    # All ARP rows.
     return rows
 
 
 def parse_mac_aos_s(text: str) -> List[dict]:
     """Aruba AOS-S ``show mac-address`` → ``[{mac, vlan, interface}]``. Columns:
     ``MAC(aabbcc-ddeeff) | VLAN | Port`` — VLAN precedes Port."""
+    # One row per MAC line.
     rows = []
+    # Need a real MAC on the line.
     for line in (text or "").splitlines():
         mac = _MAC_TOKEN.search(line)
         if not mac or _is_null_mac(mac.group(0)):
             continue
+        # After the MAC come VLAN then port.
         rest = line[mac.end():].split()
         vlan = rest[0] if rest else ""
         port = rest[1] if len(rest) > 1 else ""
+        # Add the MAC-table row.
         rows.append({"mac": mac.group(0).lower(), "vlan": str(vlan),
                      "interface": str(port)})
+    # All MAC rows.
     return rows
 
 
@@ -578,14 +688,18 @@ def parse_mac_aos_cx(text: str) -> List[dict]:
     Columns: ``MAC(xx:xx:..) | VLAN | Type | Port``. Type (dynamic/static/
     port-access-security) sits between VLAN and Port, so the AOS-S parser read
     ``dynamic`` as the port; here Port is the last token (1/1/51, lag1, ...)."""
+    # MAC, VLAN, type, port columns.
     result = []
     pattern = r"^\s*([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})\s+(\d+)\s+(\S+)\s+(\S+)\s*$"
+    # Match each line against the column layout.
     for line in (text or "").splitlines():
         match = re.match(pattern, line)
+        # Skip the all-zero MAC.
         if match:
             mac, vlan, _, interface = match.groups()
             if mac != "00:00:00:00:00:00":
                 result.append({"mac": mac.lower(), "vlan": vlan, "interface": interface})
+    # All MAC rows.
     return result
 
 
@@ -595,18 +709,25 @@ def parse_port_access_clients_aos_s(text: str) -> List[dict]:
     VLAN(list)``. IP may be ``n/a``; VLAN may be a comma-separated list or empty.
     Anchored on the hyphenated MAC (col 3); the port is column 1; the trailing
     comma-separated integers are the VLAN list."""
+    # One row per client line.
     rows = []
+    # Port, then a name, then the MAC and the IP.
     for line in (text or "").splitlines():
         m = re.match(r"^\s*(\d+(?:/\d+)*)\s+\S+\s+"
                      r"([0-9a-fA-F]{6}-[0-9a-fA-F]{6})\s+(\S+)", line)
+        # Skip lines that do not match or have a null MAC.
         if not m or _is_null_mac(m.group(2)):
             continue
+        # Pull out the columns; "n/a"-style IPs become empty.
         port, mac, ip = m.group(1), m.group(2), m.group(3)
         ip = "" if ip.lower() in ("n/a", "na", "-", "") else ip
+        # VLAN list at the end of the line, with spaces removed.
         vm = re.search(r"((?:\d{1,4})(?:\s*,\s*\d{1,4})*)\s*$", line)
         vlan = re.sub(r"\s+", "", vm.group(1)) if vm else ""
+        # Add the client row.
         rows.append({"ip": ip, "mac": mac.lower(), "vlan": vlan,
                      "interface": str(port)})
+    # All client rows.
     return rows
 
 
@@ -614,14 +735,18 @@ def parse_interfaces_aos_s(text: str) -> List[dict]:
     """Aruba AOS-S `show interfaces brief` → [{name,ip,mac,vlan,status,speed}].
     Best-effort: name=port, status from Physical Status, speed from speed token;
     IP/MAC/VLAN not in this output (SNMP path gives the full interface detail)."""
+    # One row per port line.
     rows = []
     for line in (text or "").splitlines():
+        # Skip blanks and header/separator/error lines.
         s = line.strip()
         if not s or s.startswith(("Status", "  Port", "---", "Admin", "Invalid", "%")):
             continue
+        # Need a port name plus at least two more columns.
         toks = s.split()
         if len(toks) < 3 or not toks[0][0].isalnum():
             continue
+        # First token is the port name.
         name = toks[0]
         # Admin Status | Physical Status | Speed/Type ... columns vary; find
         # an explicit up/down token for status and a speed token.
@@ -630,14 +755,17 @@ def parse_interfaces_aos_s(text: str) -> List[dict]:
             if t.lower() in ("up", "down"):
                 st = t.lower()
                 break
+        # First number-like token is the speed.
         speed = 0
         for t in toks[1:]:
             m = re.match(r"^(\d+)([GMK]?)", t)
             if m:
                 speed = int(m.group(1))
                 break
+        # Add the interface row (no IP/MAC/VLAN in this output).
         rows.append({"name": name, "ip": "", "mac": "", "vlan": "",
                      "status": st, "speed": speed})
+    # All interface rows.
     return rows
 
 
@@ -647,24 +775,29 @@ def parse_interfaces_aos_cx(text: str) -> List[dict]:
     Speed | Description. Speed is the first number after Status (Reason is
     free text); error lines (``Invalid input``) are ignored."""
     result = []
+    # Look at each non-blank line.
     data_lines = (text or "").splitlines()
     for line in data_lines:
         line = line.strip()
         if not line:
             continue
+        # Only rows whose first token is a known port/interface name.
         parts = line.split()
         if not re.fullmatch(r'\d+/\d+/\d+|lag\d+|vlan\d+|loopback\d+|mgmt|tunnel\d+', parts[0]):
             continue
 
+        # Port name, then an optional numeric native VLAN.
         name = parts[0]
         vlan = ""
         if len(parts) > 1 and re.match(r'^\d+$', parts[1]):
             vlan = parts[1]
+        # First up/down token is the status.
         status = "down"
         for part in parts:
             if part in ["up", "down"]:
                 status = part
                 break
+        # Speed is the first plain number after the status token.
         speed = 0
         found_status = False
         for part in parts:
@@ -675,6 +808,7 @@ def parse_interfaces_aos_cx(text: str) -> List[dict]:
                 speed = int(part)
                 break
 
+        # Add the interface row.
         result.append({
             "name": name,
             "ip": "",
@@ -684,6 +818,7 @@ def parse_interfaces_aos_cx(text: str) -> List[dict]:
             "speed": speed
         })
 
+    # All interface rows.
     return result
 
 
@@ -693,51 +828,64 @@ def parse_arp_junos(text: str) -> List[dict]:
     Junos output order is ``MAC  IP  interface`` (not IP-then-MAC like AOS-S),
     so the interface is the trailing token after the MAC that isn't the IP."""
     rows = []
+    # Need an IP and a MAC on the line.
     for line in (text or "").splitlines():
         ip = _IP_TOKEN.search(line)
         mac = _MAC_TOKEN.search(line)
         if not ip or not mac:
             continue
+        # Interface: the last token after the MAC that is not the IP.
         iface = ""
         for tok in reversed(line[mac.end():].split()):
             if tok != ip.group(0):
                 iface = tok
                 break
+        # Add the ARP row.
         rows.append({"ip": ip.group(0), "mac": mac.group(0),
                      "interface": str(iface)})
+    # All ARP rows.
     return rows
 
 
 def parse_mac_junos(text: str) -> List[dict]:
     """Junos `show ethernet-switching table` → [{mac, vlan, interface}]."""
     rows = []
+    # Need a MAC on the line.
     for line in (text or "").splitlines():
         mac = _MAC_TOKEN.search(line)
         if not mac:
             continue
+        # After the MAC come VLAN then interface.
         rest = line[mac.end():].split()
         vlan = rest[0] if rest else ""
         iface = rest[1] if len(rest) > 1 else ""
+        # Add the MAC-table row.
         rows.append({"mac": mac.group(0), "vlan": str(vlan),
                      "interface": str(iface)})
+    # All MAC rows.
     return rows
 
 
 def parse_interfaces_junos(text: str) -> List[dict]:
     """Junos `show interfaces descriptions` → [{name,ip,mac,vlan,status,speed}]."""
     rows = []
+    # Skip blanks, headers and dashed separators.
     for line in (text or "").splitlines():
         s = line.strip()
         if not s or s.startswith(("Interface", "Admin")) or set(s) <= {"-"}:
             continue
+        # Need at least a name and an admin status.
         toks = s.split()
         if len(toks) < 2:
             continue
+        # Name, admin status and link status; the link status decides up/down.
         name = toks[0]
         admin, link = toks[1], (toks[2] if len(toks) > 2 else "")
         status = "up" if link.lower() == "up" else "down"
+        # Add the interface row.
         rows.append({"name": name, "ip": "", "mac": "", "vlan": "",
                      "status": status, "speed": 0})
+    # All interface rows.
     return rows
 
 
@@ -760,8 +908,10 @@ _OS_TYPES = ["Windows Mobile", "Windows Phone", "Windows", "macOS", "OS X",
              "Chromebook", "Apple TV", "AppleTV", "tvOS", "watchOS", "Ubuntu",
              "Debian", "Fedora", "Linux", "Roku", "PlayStation", "Xbox",
              "Nintendo", "Kindle", "BlackBerry", "Symbian"]
+# Whole-word, case-insensitive match against the OS list.
 _OS_RE = re.compile(r"(?<![\w-])(" + "|".join(re.escape(t) for t in _OS_TYPES)
                     + r")(?![\w-])", re.IGNORECASE)
+# Forward-mode token that precedes the Type column.
 _FWD_MODE_RE = re.compile(r"\b(?:tunnel|bridge|decrypt-tunnel|split-tunnel)\b")
 
 
@@ -773,9 +923,11 @@ def parse_user_table_gateway(text: str) -> List[dict]:
     read from the row tail after the forward-mode token so an SSID/name can't
     false-match. ``interface`` carries the AP name / wired port when present."""
     rows = []
+    # Rows start with the IP then the MAC.
     for line in (text or "").splitlines():
         m = re.match(r"^\s*(\d{1,3}(?:\.\d{1,3}){3})\s+"
                      r"([0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5})\b", line)
+        # Not a client row: skip.
         if not m:
             continue
         # OS from the "Type" column: search only the tail after forward-mode
@@ -783,12 +935,15 @@ def parse_user_table_gateway(text: str) -> List[dict]:
         fwd = _FWD_MODE_RE.search(line, m.end())
         tail = line[fwd.end():] if fwd else line[m.end():]
         om = _OS_RE.search(tail)
+        # Use the canonical spelling from _OS_TYPES for the matched OS.
         os_val = ""
         if om:
             hit = om.group(1)
             os_val = next((t for t in _OS_TYPES if t.lower() == hit.lower()), hit)
+        # Add the client row.
         rows.append({"ip": m.group(1), "mac": m.group(2).lower(),
                      "os": os_val, "interface": ""})
+    # All client rows.
     return rows
 
 
@@ -803,14 +958,18 @@ def parse_datapath_bridge_gateway(text: str) -> List[dict]:
     parse tolerantly: MAC token + first VLAN-like integer + a destination token
     (tunnel/local/port)."""
     rows = []
+    # Need a MAC on the line.
     for line in (text or "").splitlines():
         mac = _MAC_TOKEN.search(line)
         if not mac:
             continue
+        # VLAN: first number in 1-4094; destination: a port path or tunnel/local.
         rest = line[mac.end():].split()
         vlan = next((t for t in rest if t.isdigit() and 1 <= int(t) <= 4094), "")
         dest = next((t for t in rest if ("/" in t or t.lower() in ("tunnel", "local"))), "")
+        # Add the bridge-table row.
         rows.append({"mac": mac.group(0).lower(), "vlan": str(vlan), "interface": str(dest)})
+    # All bridge rows.
     return rows
 
 
@@ -823,16 +982,20 @@ def parse_interfaces_gateway(text: str) -> List[dict]:
     speed}]``. Ported from ntc-templates ``aruba_os_show_ip_interface_brief``:
     ``<iface (two tokens)>  <ip> / <netmask>  <admin>  <protocol>``."""
     rows = []
+    # Two-token interface name, IP / netmask, admin, protocol.
     for line in (text or "").splitlines():
         m = re.match(r"^\s*(\S+\s\S+)\s+(\S+)\s+/\s+(\S+)\s+(\S+)\s+(\S+)\s*$", line)
         if not m:
             continue
+        # Skip header and separator rows.
         name, ip, _netmask, _admin, proto = m.groups()
         if name.lower().startswith(("interface", "----")):  # header/separator
             continue
+        # Add the interface row; "unassigned" means no IP.
         rows.append({"name": name.strip(),
                      "ip": "" if ip.lower() in ("unassigned", "n/a") else ip,
                      "mac": "", "vlan": "", "status": proto.lower(), "speed": 0})
+    # All interface rows.
     return rows
 
 
@@ -846,18 +1009,24 @@ def parse_port_status_gateway(text: str) -> List[dict]:
     (Access/Trunk). No IP/MAC/VLAN in this output (those come from the user-table
     / bridge). Header/separator lines have no slot-port token so they drop."""
     rows = []
+    # Only rows starting with a slot/port token.
     for line in (text or "").splitlines():
         toks = line.split()
         if len(toks) < 4 or not re.match(r"^\d+/\d+(?:/\d+)?$", toks[0]):
             continue
+        # Operational state column becomes the status.
         oper = toks[3].lower()
         status = "up" if oper == "up" else ("down" if oper == "down" else oper)
+        # Speed in Mbps from "<n> Gbps" or "<n> Mbps".
         sm = re.search(r"\b(\d+)\s*(Gbps|Mbps)\b", line, re.IGNORECASE)
         speed = (int(sm.group(1)) * (1000 if sm.group(2).lower().startswith("g")
                  else 1)) if sm else 0
+        # Port mode (Access/Trunk) when present.
         mode = toks[7] if len(toks) > 7 else ""
+        # Add the port row.
         rows.append({"name": toks[0], "ip": "", "mac": "", "vlan": "",
                      "status": status, "speed": speed, "mode": mode})
+    # All port rows.
     return rows
 
 
@@ -868,17 +1037,22 @@ def parse_vlans_gateway(text: str) -> List[dict]:
     id 1-4094, take the next token as the name, and keep the remainder as ports/
     description. Header/separator lines have no leading integer so they drop."""
     rows = []
+    # Rows start with a VLAN id followed by text.
     for line in (text or "").splitlines():
         m = re.match(r"^\s*(\d{1,4})\s+(\S.*?)\s*$", line)
         if not m:
             continue
+        # Only valid VLAN ids.
         vid = int(m.group(1))
         if not (1 <= vid <= 4094):
             continue
+        # First word is the name; the rest is ports/description.
         rest = m.group(2).split()
         name = rest[0] if rest else ""
         ports = " ".join(rest[1:]) if len(rest) > 1 else ""
+        # Add the VLAN row.
         rows.append({"vlan": str(vid), "name": name, "ports": ports})
+    # All VLAN rows.
     return rows
 
 
@@ -889,23 +1063,31 @@ def parse_lldp_neighbors(text: str) -> List[str]:
     'management address' / 'mgmt' line carrying an IPv4, plus a fallback of any
     dotted-quad on a line mentioning 'address'. Deduped, order-preserving.
     Used by the scanner's optional LLDP crawl to enqueue neighbors."""
+    # Unique IPs in first-seen order.
     ips: List[str] = []
     seen = set()
+    # Dotted-quad IPv4 pattern.
     ipv4 = re.compile(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b")
+    # Only lines that mention an address or management.
     for line in (text or "").splitlines():
         low = line.lower()
         if not ("address" in low or "mgmt" in low or "management" in low):
             continue
+        # Every IPv4 on those lines.
         for m in ipv4.finditer(line):
             ip = m.group(1)
+            # Reject out-of-range octets.
             octs = ip.split(".")
             if any(int(o) > 255 for o in octs):
                 continue
+            # Skip unspecified, broadcast and loopback addresses.
             if ip in ("0.0.0.0", "255.255.255.255") or ip.startswith("127."):
                 continue
+            # Keep the first occurrence only.
             if ip not in seen:
                 seen.add(ip)
                 ips.append(ip)
+    # Neighbor management IPs.
     return ips
 
 
@@ -913,14 +1095,17 @@ async def cli_get_lldp_neighbors(session: CliSession, object_type: str) -> List[
     """Run the vendor LLDP-neighbor command and return neighbor management IPs.
     Best-effort — returns ``[]`` on any failure (a device without LLDP simply
     doesn't extend the crawl)."""
+    # Pick the family's LLDP command.
     cmd = {"aos_switch": "show lldp info remote-device",
            "cx_switch": "show lldp neighbor-info detail",
            "ex_switch": "show lldp neighbors",
            "gateway": "show ap lldp neighbors"}.get(object_type, "show lldp neighbors")
+    # Run it; any failure means no neighbors.
     try:
         text = await session.run(cmd)
     except Exception:
         return []
+    # Extract the management IPs.
     return parse_lldp_neighbors(text)
 
 
@@ -937,6 +1122,7 @@ _LLDP_DETAIL_CMDS = {
 }
 
 
+# A whole token that is a MAC in colon/dash/space, Aruba or Cisco-dotted form.
 _MAC_ANY = re.compile(r"^(?:[0-9a-fA-F]{2}[\s:.-]?){5}[0-9a-fA-F]{2}$|"
                       r"^[0-9a-fA-F]{6}-[0-9a-fA-F]{6}$|"
                       r"^[0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4}$")
@@ -947,23 +1133,34 @@ _LLDP_CAPS = re.compile(r"^[BRWPCSTOAHDr](?:[:,][BRWPCSTOAHDr])*$")
 
 
 def _lldp_col_role(name: str) -> str:
+    """Map an LLDP table column header to the record field it holds ('' if unused)."""
+    # Compare letters only, lower-case.
     n = re.sub(r"[^a-z]", "", name.lower())
+    # Local port column.
     if "local" in n or n in ("port", "interface", "localinterface"):
         return "local_port"
+    # Remote chassis id.
     if "chassis" in n:
         return "remote_chassis"
+    # Remote port description.
     if "portdesc" in n:
         return "remote_descr"
+    # Remote port id.
     if n in ("portid", "portinfo", "remoteport") or n.endswith("portid"):
         return "remote_port"
+    # Remote system name.
     if "sysname" in n or "systemname" in n or n == "remotename" or n == "name":
         return "remote_name"
+    # Remote management address.
     if "mgmt" in n or "management" in n:
         return "remote_mgmt_ip"
+    # Column not used.
     return ""
 
 
 def _parse_lldp_fixed_width(text: str, normalise_mac) -> List[dict]:
+    """Parse a fixed-width LLDP table by column offsets; return [] if it does not fit."""
+    # Find the header row: it mentions both chassis and port.
     lines = text.splitlines()
     hdr = None
     for i, line in enumerate(lines):
@@ -972,49 +1169,66 @@ def _parse_lldp_fixed_width(text: str, normalise_mac) -> List[dict]:
                 or ("chassis" in low and low.count("|") == 1 and "port" in low):
             hdr = i
             break
+    # No header: not this layout.
     if hdr is None:
         return []
+    # Header text with pipes turned into spaces.
     header = lines[hdr].replace("|", " ")
+    # A dashed underline row, if present, gives exact column positions.
     dash = None
     if hdr + 1 < len(lines) and set(lines[hdr + 1].strip()) <= set("-+| "):
         dash = lines[hdr + 1].replace("+", " ").replace("|", " ")
+    # Column starts from the dash runs, else from header words.
     if dash and dash.strip():
         spans = [(m.start(), m.end()) for m in re.finditer(r"-+", dash)]
         starts = [a for a, _ in spans]
     else:
         starts = [m.start() for m in re.finditer(r"\S+(?:\s\S+)*(?=\s{2,}|$)", header)]
+    # Too few columns for an LLDP table.
     if len(starts) < 3:
         return []
+    # Column end positions (last column runs to end of line) and their roles.
     bounds = starts + [10 ** 6]
     roles = []
     for k, st in enumerate(starts):
         roles.append(_lldp_col_role(header[st:bounds[k + 1]].strip()))
+    # Without a chassis column this is not an LLDP table.
     if "remote_chassis" not in roles:
         return []
+    # One record per data row.
     records = []
     for line in lines[hdr + 1:]:
+        # Skip blank and separator rows.
         if not line.strip() or set(line.strip()) <= set("-+| "):
             continue
         if line.strip().lower().startswith(("number of", "total ")):
             continue  # summary trailer, not a neighbour
+        # Treat the first pipe as a space so columns line up with the header.
         row = line.replace("|", " ", 1)
         rec = {"local_port": "", "remote_chassis": "", "remote_port": "",
                "remote_name": "", "remote_mgmt_ip": "", "remote_descr": ""}
+        # Slice each known column by its offsets.
         for k, st in enumerate(starts):
             if not roles[k]:
                 continue
             val = row[st:bounds[k + 1]].strip()
+            # Truncated values ("...") are kept as they are (no-op branch).
             if val and roles[k] not in ("remote_descr",) and val.endswith("..."):
                 pass
+            # Store non-empty values.
             if val:
                 rec[roles[k]] = val
+        # Rows without a remote chassis or port are not neighbours.
         if not rec["remote_chassis"] and not rec["remote_port"]:
             continue
+        # Normalise MAC-looking ids to colon form.
         if _MAC_ANY.match(rec["remote_chassis"]):
             rec["remote_chassis"] = normalise_mac(rec["remote_chassis"])
         if _MAC_ANY.match(rec["remote_port"]):
             rec["remote_port"] = normalise_mac(rec["remote_port"])
+        # Keep the neighbour record.
         records.append(rec)
+    # All neighbour records.
     return records
 
 
@@ -1032,82 +1246,108 @@ def _parse_lldp_kv(text: str, normalise_mac) -> tuple:
     A port with several neighbours repeats the Chassis fields, which starts
     a new record on the same local port.
     """
+    # The layout is key/value if any line starts with "Port:" or "Local Port:".
     lines = text.splitlines()
     is_kv_layout = any(re.match(r'^\s*(?:Local\s+)?Port\s*:', line, re.IGNORECASE) for line in lines)
+    # Not this layout.
     if not is_kv_layout:
         return (False, [])
 
+    # Finished records and the record being built.
     records = []
     rec = None
 
     def flush(record):
+        """Keep a record unless it was marked empty or has no remote data."""
+        # Port reported zero neighbours: drop.
         if record.get("_none"):
             return
+        # Keep only records with some remote data.
         if any(record.get(k) for k in ["remote_chassis", "remote_port", "remote_name", "remote_mgmt_ip"]):
             record.pop("_none", None)
             records.append(record)
 
+    # Read each "key : value" line.
     for line in lines:
         if not line.strip() or ':' not in line:
             continue
+        # Split key and value; reduce the key to lower-case letters and digits.
         key, value = line.split(':', 1)
         value = value.strip()
         k = re.sub(r'[^a-z0-9]', '', key.lower())
+        # Drop the "Neighbor" prefix so old and new spellings match.
         if k.startswith('neighbor') and k != 'neighborentries' and not k.startswith('neighborentries'):
             k = k[len('neighbor'):]
 
+        # A new port block: finish the previous record and start a new one.
         if k == 'port' or k == 'localport':
             if rec:
                 flush(rec)
             rec = {"local_port": value, "remote_chassis": "", "remote_port": "", "remote_name": "", "remote_mgmt_ip": "", "remote_descr": ""}
             continue
 
+        # Ignore fields before the first port line.
         if not rec:
             continue
+        # "Neighbor Entries: 0" marks the port as having no neighbour.
         if k == 'neighborentries':
             try:
                 if int(value) == 0:
                     rec["_none"] = True
             except ValueError:
+                # Not a number: ignore.
                 pass
             continue
+        # Chassis id: a repeat on the same port starts another neighbour record.
         if k == 'chassisid':
             if rec["remote_chassis"]:
                 flush(rec)
                 rec = {"local_port": rec["local_port"], "remote_chassis": "", "remote_port": "", "remote_name": "", "remote_mgmt_ip": "", "remote_descr": ""}
             rec["remote_chassis"] = normalise_mac(value)
         elif k == 'chassisname' or k == 'systemname':
+            # System name: a repeat also starts another neighbour record.
             if rec["remote_name"]:
                 flush(rec)
                 rec = {"local_port": rec["local_port"], "remote_chassis": "", "remote_port": "", "remote_name": "", "remote_mgmt_ip": "", "remote_descr": ""}
             rec["remote_name"] = value
         elif k == 'chassisdescription' or k == 'systemdescription':
+            # System description.
             rec["remote_descr"] = value
         elif k == 'portdesc' or k == 'portdescription':
+            # Port description, used only if no system description was seen.
             if not rec["remote_descr"]:
                 rec["remote_descr"] = value
         elif k == 'portid':
+            # Remote port id.
             rec["remote_port"] = value
         elif k == 'managementaddress' or k == 'mgmtaddress' or k == 'managementaddressipv4':
+            # First management address wins.
             if not rec["remote_mgmt_ip"] and value:
                 rec["remote_mgmt_ip"] = value
 
+    # Finish the last record.
     if rec:
         flush(rec)
 
+    # Layout recognised, with its records.
     return (True, records)
 
 
 def _parse_lldp_detail_raw(text: str, object_type: str = "") -> List[dict]:
+    """Parse LLDP neighbour detail text in any supported layout into neighbour records."""
+    # Nothing to parse.
     if not text or not text.strip():
         return []
 
     # MAC normalisation helper
     def normalise_mac(mac_str):
+        """Colon-form lower-case MAC when the text holds 12 hex digits, else the trimmed text."""
         import re
+        # Keep hex digits only.
         cleaned = re.sub(r'[^0-9a-fA-F]', '', mac_str)
         if len(cleaned) == 12:
             return ':'.join([cleaned[i:i+2].lower() for i in range(0, 12, 2)])
+        # Not a MAC: return as given.
         return mac_str.strip()
 
     # Key/value blocks. Once the layout is recognised its answer is final,
@@ -1137,6 +1377,7 @@ def _parse_lldp_detail_raw(text: str, object_type: str = "") -> List[dict]:
 
     # Try FORMAT A (AOS-S pipe-table)
     try:
+        # Look for the "LocalPort ... ChassisId" header, then parse rows after it.
         lines = text.splitlines()
         header_found = False
         records = []
@@ -1144,21 +1385,26 @@ def _parse_lldp_detail_raw(text: str, object_type: str = "") -> List[dict]:
             if not header_found and "LocalPort" in line and "ChassisId" in line:
                 header_found = True
                 continue
+            # Skip rows before the header, blanks and separators.
             if not header_found or not line.strip() or line.startswith("-"):
                 continue
+            # Local port on the left of the pipe, neighbour data on the right.
             parts = line.split("|", 1)
             if len(parts) < 2 or not parts[0].strip():
                 continue
             local_port = parts[0].strip()
             right_side = parts[1]
             tokens = right_side.split()
+            # Need at least the six chassis-id octets.
             if len(tokens) < 6:
                 continue
+            # Chassis id is six space-separated octets; then port, description, name.
             chassis_id = " ".join(tokens[:6])
             remote_chassis = normalise_mac(chassis_id)
             remote_port = tokens[6] if len(tokens) > 6 else ""
             remote_name = tokens[-1] if len(tokens) > 7 else ""
             remote_descr = " ".join(tokens[7:-1]) if len(tokens) > 8 else ""
+            # Add the neighbour record.
             records.append({
                 "local_port": local_port,
                 "remote_chassis": remote_chassis,
@@ -1167,6 +1413,7 @@ def _parse_lldp_detail_raw(text: str, object_type: str = "") -> List[dict]:
                 "remote_mgmt_ip": "",
                 "remote_descr": remote_descr
             })
+        # Use this layout only if it produced records.
         if records:
             return records
     except Exception:
@@ -1176,25 +1423,33 @@ def _parse_lldp_detail_raw(text: str, object_type: str = "") -> List[dict]:
 
     # Try generic column-table parser (FORMAT C and D)
     try:
+        # Find the header row that mentions "chassis".
         lines = text.splitlines()
         header_line_index = -1
         for i, line in enumerate(lines):
             if "chassis" in line.lower():
                 header_line_index = i
                 break
+        # No header: nothing to parse.
         if header_line_index == -1:
             return []
+        # One record per row; seen avoids duplicate neighbours.
         header_tokens = lines[header_line_index].split()
         records = []
         seen = set()
+        # Walk the rows after the header.
         for i in range(header_line_index + 1, len(lines)):
             line = lines[i]
+            # Skip blanks and separators.
             if not line.strip() or line.startswith("-"):
                 continue
+            # Split into tokens.
             tokens = line.split()
             if not tokens:
                 continue
+            # A bad row is skipped, not fatal.
             try:
+                # The chassis id is the first token with 12 hex digits.
                 chassis_idx = -1
                 for j, token in enumerate(tokens):
                     normalized = normalise_mac(token)
@@ -1204,22 +1459,28 @@ def _parse_lldp_detail_raw(text: str, object_type: str = "") -> List[dict]:
                     elif len(re.sub(r'[^0-9a-fA-F]', '', token)) == 12:
                         chassis_idx = j
                         break
+                # No chassis id: not a neighbour row.
                 if chassis_idx == -1:
                     continue
+                # Port id normally follows the chassis id.
                 remote_chassis = normalise_mac(tokens[chassis_idx])
                 port_idx = chassis_idx + 1
                 # AOS-8 gateways print a Capability column ("B:R") between
                 # Chassis-ID and Port-ID; it is not the remote port.
                 if port_idx < len(tokens) and _LLDP_CAPS.match(tokens[port_idx]):
                     port_idx += 1
+                # Remote port, remote name (last token) and local port (first token).
                 remote_port = tokens[port_idx] if port_idx < len(tokens) else ""
                 remote_name = tokens[-1]
                 local_port = tokens[0]
+                # Prefer the token just before the chassis id as the local port.
                 if chassis_idx > 0 and tokens[chassis_idx - 1] not in ["-", "ae0"]:
                     local_port = tokens[chassis_idx - 1]
+                # Skip duplicates.
                 record_key = (local_port, remote_chassis, remote_port)
                 if record_key in seen:
                     continue
+                # Record and keep this neighbour.
                 seen.add(record_key)
                 records.append({
                     "local_port": local_port,
@@ -1230,13 +1491,16 @@ def _parse_lldp_detail_raw(text: str, object_type: str = "") -> List[dict]:
                     "remote_descr": ""
                 })
             except Exception:
+                # Unparseable row: skip.
                 continue
+        # Return what this layout found.
         if records:
             return records
     except Exception:
         logger.warning("lldp detail: generic column parser raised on %d bytes "
                        "of output", len(text), exc_info=True)
 
+    # No layout matched.
     return []
 
 
@@ -1261,32 +1525,44 @@ def parse_lldp_detail(text: str, object_type: str = "") -> List[dict]:
     format became "zero edges, forever, silently". An empty list now means
     exactly one thing: the parse ran and found no neighbours.
     """
+    # Parse with whichever layout matches.
     rows = _parse_lldp_detail_raw(text, object_type)
+    # Unique records in order, plus an index by (local port, chassis, remote port).
     out: List[dict] = []
     index: Dict[tuple, dict] = {}
+    # Merge each row into the result.
     for row in rows or []:
+        # Ignore anything that is not a record.
         if not isinstance(row, dict):
             continue
+        # Identity of one edge.
         key = (row.get("local_port", ""), row.get("remote_chassis", ""),
                row.get("remote_port", ""))
+        # Duplicate: fill in blanks on the first copy and drop this one.
         if key in index:
             kept = index[key]
             for field, value in row.items():
                 if value and not kept.get(field):
                     kept[field] = value
             continue
+        # First time seen: keep it.
         index[key] = row
         out.append(row)
+    # De-duplicated neighbours.
     return out
 
 
 def _neighbor_name_key(name: str) -> str:
     """Canonicalise neighbour names for cross-protocol dedup keys only."""
+    # Lower-cased, trimmed name.
     raw = (name or "").strip().lower()
+    # Empty stays empty.
     if not raw:
         return ""
+    # MAC/number-looking names are kept whole.
     if re.match(r"^[0-9a-f:.-]+$", raw, re.I):
         return raw
+    # Hostnames: drop the domain part.
     return raw.split(".", 1)[0]
 
 
@@ -1300,10 +1576,12 @@ _CDP_DETAIL_CMDS = {
 
 def parse_cdp_detail(text: str) -> List[dict]:
     """Parse ``show cdp neighbors detail`` (Cisco-style key/value blocks)."""
+    # Finished records and the block being read.
     out: List[dict] = []
     rec: Dict[str, str] = {}
 
     def flush():
+        """Save the current block as a record if it has a device name, then reset it."""
         if rec.get("remote_name"):
             out.append({"local_port": rec.get("local_port", ""),
                         "remote_chassis": "",
@@ -1311,35 +1589,44 @@ def parse_cdp_detail(text: str) -> List[dict]:
                         "remote_name": rec.get("remote_name", ""),
                         "remote_mgmt_ip": rec.get("remote_mgmt_ip", ""),
                         "remote_descr": rec.get("remote_descr", "")})
+        # Start the next block empty.
         rec.clear()
 
+    # Read each line of the detail output.
     for line in (text or "").splitlines():
         st = line.strip()
         low = st.lower()
+        # Skip separators and blanks.
         if st.startswith("---") or not st:
             continue
+        # "Device ID:" starts a new neighbour block; short hostname unless it looks like a MAC.
         m = re.match(r"device[- ]id\s*:\s*(.+)", st, re.I)
         if m:
             flush()
             rec["remote_name"] = m.group(1).strip().split(".")[0] if not re.match(r"^[0-9a-f:.-]+$", m.group(1).strip(), re.I) else m.group(1).strip()
             continue
+        # "Interface: X, Port ID: Y" gives local and remote ports.
         m = re.match(r"interface\s*:\s*([^,]+),?\s*(?:port id.*?:\s*(\S+))?", st, re.I)
         if m:
             rec["local_port"] = m.group(1).strip()
             if m.group(2):
                 rec["remote_port"] = m.group(2).strip()
             continue
+        # Separate "Port ID:" line, if not already set.
         m = re.match(r"port[- ]id.*?:\s*(.+)", st, re.I)
         if m and "remote_port" not in rec:
             rec["remote_port"] = m.group(1).strip()
             continue
+        # First IPv4 management address.
         m = re.match(r"(?:ip(?:v4)? address|management address.*?|address)\s*:\s*(\d+\.\d+\.\d+\.\d+)", st, re.I)
         if m and not rec.get("remote_mgmt_ip"):
             rec["remote_mgmt_ip"] = m.group(1)
             continue
+        # Platform line describes the neighbour.
         m = re.match(r"platform\s*:\s*([^,]+)", st, re.I)
         if m:
             rec["remote_descr"] = m.group(1).strip()
+    # Save the last block.
     flush()
     return out
 
@@ -1357,6 +1644,7 @@ _LLDP_REJECT_MARKERS = (
 
 def _lldp_cmd_rejected(text: str) -> bool:
     """True when the CLI answered with a rejection rather than LLDP output."""
+    # Case-insensitive search for any rejection marker.
     low = (text or "").lower()
     return any(m in low for m in _LLDP_REJECT_MARKERS)
 
@@ -1382,12 +1670,15 @@ async def cli_get_lldp_detail(session: CliSession, object_type: str) -> List[dic
     could not tell "this node genuinely has no edges, fill it in from MAC
     inference" from "we failed to ask".
     """
+    # Family's LLDP detail command (generic fallback).
     cmd = _LLDP_DETAIL_CMDS.get(object_type, "show lldp neighbors")
     text = await session.run(cmd)
+    # Command rejected: LLDP not available here, so no edges.
     if _lldp_cmd_rejected(text):
         logger.warning("cli lldp detail: %s rejected %r — treating as no LLDP "
                        "on this device (no edges contributed)", object_type, cmd)
         return []
+    # Parse the output into neighbour records.
     rows = parse_lldp_detail(text, object_type)
     if not rows and text and text.strip():
         # Non-empty output that matched no layout: a parser gap, not an answer.
@@ -1396,26 +1687,32 @@ async def cli_get_lldp_detail(session: CliSession, object_type: str) -> List[dic
         logger.warning("cli lldp detail: %s returned %d bytes for %r that no "
                        "parser understood — 0 edges (possible parser gap)",
                        object_type, len(text), cmd)
+    # Also ask CDP on families that support it, adding neighbours LLDP missed.
     cdp_cmd = _CDP_DETAIL_CMDS.get(object_type)
     if cdp_cmd:
         try:
             cdp_text = await session.run(cdp_cmd)
+            # (local port, neighbour name) pairs already known from LLDP.
             if not _lldp_cmd_rejected(cdp_text):
                 seen = {(r.get("local_port"), _neighbor_name_key(r.get("remote_name")))
                         for r in rows}
+                # Parse CDP output; warn when non-empty output parsed to nothing.
                 cdp_rows = parse_cdp_detail(cdp_text)
                 if not cdp_rows and cdp_text and cdp_text.strip():
                     logger.warning("cli cdp detail: %s returned %d bytes for %r that no "
                                    "parser understood — 0 edges (possible parser gap)",
                                    object_type, len(cdp_text), cdp_cmd)
+                # Add only new neighbours.
                 for r in cdp_rows:
                     key = (r.get("local_port"), _neighbor_name_key(r.get("remote_name")))
                     if key not in seen:
                         rows.append(r)
                         seen.add(key)
         except Exception as e:
+            # CDP is optional: log and continue with LLDP results.
             logger.info("cli cdp detail: %s %r failed (%s) — LLDP only",
                         object_type, cdp_cmd, e)
+    # All neighbour records.
     return rows
 
 
@@ -1450,6 +1747,7 @@ async def cli_get_device_info(session: CliSession, object_type: str) -> dict:
                 # (wanted for NetBox platform / software_version).
                 "gateway": "show version"}.get(object_type, "show version")
     try:
+        # Run the info command; a failure is fatal for this gather.
         text = await session.run(info_cmd)
     except Exception as e:
         raise CliError(f"info command failed: {e}")
@@ -1458,18 +1756,23 @@ async def cli_get_device_info(session: CliSession, object_type: str) -> dict:
     # rejected command still "succeeds" with an error banner, which left every
     # identity datum blank — try the alternates before giving up.
     if _cli_rejected(text):
+        # Try the alternate spellings until one is accepted.
         for alt in _INFO_ALTERNATES.get(object_type, ()):
+            # Skip the one we already tried.
             if alt == info_cmd:
                 continue
+            # A failing alternate is just skipped.
             try:
                 alt_text = await session.run(alt)
             except Exception:  # noqa: BLE001
                 continue
+            # Accepted: use its output.
             if not _cli_rejected(alt_text):
                 logger.info("cli_get_device_info: %r rejected, using %r", info_cmd, alt)
                 text = alt_text
                 break
         else:
+            # None accepted: log and continue with the error text.
             logger.warning("cli_get_device_info: %s info command rejected: %s",
                            object_type, (text or "").strip()[:120])
     # The hardware identity (serial / base MAC / product) isn't in `show version`
@@ -1478,6 +1781,7 @@ async def cli_get_device_info(session: CliSession, object_type: str) -> dict:
     id_cmd = {"cx_switch": "show system", "gateway": "show inventory",
               # AOS-S `show system` has serial + base MAC but no model.
               "aos_switch": "show modules"}.get(object_type)
+    # Run the identity command; discard rejected output.
     id_text = ""
     if id_cmd:
         try:
@@ -1486,6 +1790,7 @@ async def cli_get_device_info(session: CliSession, object_type: str) -> dict:
             logger.debug("cli_get_device_info: %r failed: %s", id_cmd, e)
         if _cli_rejected(id_text):
             id_text = ""
+    # Search both outputs together for the base MAC.
     full = f"{text or ''}\n{id_text}"
     mac = _base_mac_from(full)
     if not mac and object_type == "gateway":
@@ -1519,6 +1824,7 @@ async def cli_get_device_info(session: CliSession, object_type: str) -> dict:
                     "model=%r%s) — info %r:\n%s\n--- id %r:\n%s", object_type, hostname_hint(session),
                     serial, mac, model, "" if explicit_model else " guessed", info_cmd,
                     (text or "")[:1500], id_cmd, (id_text or "")[:2500])
+    # Identity datums for the driver.
     return {"model": model,
             "serial": serial,
             "firmware": _firmware_from(text), "os": os_name, "hostname": hostname,
@@ -1532,6 +1838,7 @@ async def cli_get_arp(session: CliSession, object_type: str) -> List[dict]:
                # ArubaOS gateway: the user-table holds the client IP↔MAC bindings
                # (there is no useful `show arp` for wireless clients).
                "gateway": "show user-table"}.get(object_type, "show arp")
+    # Run the command and parse with the family's ARP parser (AOS-S fallback).
     text = await session.run(arp_cmd)
     return PARSERS.get(object_type, PARSERS["aos_switch"])[0](text)
 
@@ -1544,6 +1851,7 @@ async def cli_get_mac_table(session: CliSession, object_type: str) -> List[dict]
                # bridge/MAC table lives in the datapath.
                "gateway": "show datapath bridge table"}.get(
                object_type, "show mac-address")
+    # Run the command and parse with the family's MAC parser (AOS-S fallback).
     text = await session.run(mac_cmd)
     return PARSERS.get(object_type, PARSERS["aos_switch"])[1](text)
 
@@ -1551,6 +1859,7 @@ async def cli_get_mac_table(session: CliSession, object_type: str) -> List[dict]
 def _err(message: str, data: Any = None) -> dict:
     """Standard ERROR envelope (mirrors nw_engine._err) for the cert-install
     helpers, which return an envelope rather than a parsed list."""
+    # Error envelope, with optional data.
     out = {"status": "ERROR", "message": message}
     if data is not None:
         out["data"] = data
@@ -1561,16 +1870,20 @@ def _build_pkcs12(fullchain: str, privkey: str, name: str, password: str) -> byt
     """Bundle the LE fullchain + private key into a PKCS#12 (.pfx) — the format
     ArubaOS imports for a server cert (cert + key in one file). Uses the
     ``cryptography`` lib (an asyncssh dependency, so always present)."""
+    # Imported lazily; only needed for the cert install.
     import re as _re
     from cryptography.hazmat.primitives.serialization import pkcs12, BestAvailableEncryption
     from cryptography.hazmat.primitives.serialization import load_pem_private_key
     from cryptography.x509 import load_pem_x509_certificate
+    # Load the private key and every certificate block in the chain.
     key = load_pem_private_key(privkey.encode(), password=None)
     blocks = _re.findall(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
                          fullchain, _re.DOTALL)
     certs = [load_pem_x509_certificate(b.encode()) for b in blocks]
+    # A chain with no certificates cannot be installed.
     if not certs:
         raise CliError("no certificate found in fullchain")
+    # First cert is the leaf; the rest are CA certs.
     leaf, cas = certs[0], (certs[1:] or None)
     return pkcs12.serialize_key_and_certificates(
         name=name.encode(), key=key, cert=leaf, cas=cas,
@@ -1587,15 +1900,18 @@ async def cli_install_cert_gateway(session: CliSession, fullchain: str, privkey:
     the standard ``{status, message}`` envelope."""
     import re as _re
     import secrets as _secrets
+    # Safe file/cert name derived from the domain.
     name = _re.sub(r"[^A-Za-z0-9._-]", "_", domain) or "lm-cert"
     fname = f"{name}.pfx"
     # ArubaOS pfx passphrase must avoid ' $ & ( ) | \ " ; < > ? — hex is safe.
     passphrase = _secrets.token_hex(12)
+    # Build the PKCS#12 bundle; fail early if that does not work.
     try:
         pfx = _build_pkcs12(fullchain, privkey, name, passphrase)
     except Exception as e:  # noqa: BLE001
         return _err(f"gateway: PKCS#12 build failed: {e}")
 
+    # Output of each step, for diagnosis.
     log = []
     try:
         # 1. Upload the .pfx into flash: over SCP (same SSH connection).
@@ -1612,19 +1928,24 @@ async def cli_install_cert_gateway(session: CliSession, fullchain: str, privkey:
             f"switch-cert {name}",
         ])
         log.append("bind: " + " ".join(cfg.split())[:300])
+        # Save the configuration.
         save = await session.run("write memory")
         log.append("save: " + " ".join(save.split())[:120])
     except CliError as e:
+        # Return the log with the error so the failure point is visible.
         return _err(f"gateway cert install: {e}", {"log": log})
     except Exception as e:  # noqa: BLE001
+        # Unexpected error: same envelope.
         return _err(f"gateway cert install: {e}", {"log": log})
 
     # Best-effort error detection in the captured output.
     joined = " ".join(log).lower()
+    # Any error-looking word in the output means the install may have failed.
     for marker in ("error", "invalid", "% ", "failed", "cannot"):
         if marker in joined:
             return _err(f"gateway cert install may have failed (device said: "
                         f"{'; '.join(log)})", {"log": log})
+    # All steps look clean.
     return {"status": "SUCCESS",
             "message": f"imported {name} + bound to web-server on {session.host}",
             "log": log}
@@ -1638,6 +1959,7 @@ async def cli_get_interfaces(session: CliSession, object_type: str) -> List[dict
               # ArubaOS gateway: physical-port status via `show port status`.
               "gateway": "show port status"}.get(
               object_type, "show interfaces")
+    # Run the command and parse with the family's interface parser (AOS-S fallback).
     text = await session.run(if_cmd)
     return PARSERS.get(object_type, PARSERS["aos_switch"])[2](text)
 
@@ -1648,18 +1970,22 @@ async def cli_get_vlans(session: CliSession, object_type: str) -> List[dict]:
     vlan_cmd = {"aos_switch": "show vlans", "ex_switch": "show vlans",
                 "cx_switch": "show vlan",
                 "gateway": "show vlan"}.get(object_type, "show vlan")
+    # Run the command and parse with the family's VLAN parser.
     text = await session.run(vlan_cmd)
     return VLAN_PARSERS.get(object_type, parse_vlans_gateway)(text)
 
 
 def hostname_hint(session) -> str:
+    """Hostname from the session's last prompt, or "?" (for log messages)."""
     return _hostname_from_prompt(getattr(session, "_last_prompt", "")) or "?"
 
 
+# Other spellings of the AOS-S system-info command, tried when the first is rejected.
 _INFO_ALTERNATES = {
     "aos_switch": ("show system", "show system-information", "show system information"),
 }
 
+# CLI error banners that mean "command rejected".
 _CLI_REJECT_RE = re.compile(
     r"(?im)^\s*(?:%\s*)?(?:invalid input|unknown command|incomplete command|"
     r"command not found|syntax error|parse error)")
@@ -1671,6 +1997,7 @@ def _cli_rejected(text: str) -> bool:
 
 
 def _first_hw_token(text: str) -> str:
+    """First token that looks like a hardware model number, else ''."""
     m = re.search(r"\b([A-Z]{2,4}[-\s]?\d{2,4}[A-Z]*)\b", text or "")
     return m.group(1) if m else ""
 
@@ -1679,11 +2006,13 @@ def _hostname_from_text(text: str) -> str:
     """Best-effort configured hostname from an ``info`` show command — the
     'System Name'/'Hostname'/'Name' field AOS-S ``show system-information`` (and
     friends) print. Empty when no such line is present."""
+    # First "System Name"/"Hostname"/"Name" field value.
     m = re.search(r"(?im)^\s*(?:system name|hostname|host name|name)\s*[:=]\s*(\S+)",
                   text or "")
     return m.group(1).strip() if m else ""
 
 
+# ArubaOS prompt: "(host)" plus optional mode, node and "*" markers, then > or #.
 _ARUBAOS_PROMPT_RE = re.compile(
     r"^\(([\w][\w.\-]{0,62})\)\s*(?:\([^)]*\)\s*)?\*?\s*(?:\[[^\]]*\]\s*)?\*?\s*[>#]\s*$")
 
@@ -1693,9 +2022,11 @@ def _hostname_from_prompt(prompt: str) -> str:
     ``<hostname>#`` / ``<hostname>(config)#``). Strips ANSI, the trailing
     prompt char, and any ``(config…)`` mode suffix. Rejects a prompt with
     embedded whitespace (banner noise, not a clean hostname)."""
+    # Strip escapes and spaces; nothing left means no hostname.
     p = _ANSI_RE.sub("", str(prompt or "")).strip()
     if not p:
         return ""
+    # Use the last line only.
     p = p.splitlines()[-1].strip()
     # ArubaOS gateway/controller: "(host) #", "(host) *#", "(host) (config) #",
     # "(host) [mynode] #" — the hostname is the leading parenthesized token.
@@ -1704,11 +2035,14 @@ def _hostname_from_prompt(prompt: str) -> str:
         return m.group(1)
     p = re.sub(r"[>#]\s*$", "", p).strip()   # drop the prompt char
     p = re.sub(r"\(.*\)$", "", p).strip()    # drop a (config…) mode suffix
+    # Empty or containing spaces: not a hostname.
     if not p or any(c.isspace() for c in p):
         return ""
+    # Clean hostname.
     return p
 
 
+# A serial value: alphanumeric start, at least four characters.
 _SERIAL_VAL = r"([A-Za-z0-9][A-Za-z0-9\-]{3,})"
 _SERIAL_RES = (
     # AOS-CX `show system`: "Chassis Serial Nbr : SG9ZKMR0F4"
@@ -1723,10 +2057,12 @@ _SERIAL_RES = (
 def _serial_from(text: str) -> str:
     """Chassis serial from an info/identity show command. Chassis/system serial
     lines win over per-module ones; never returns the ':' separator."""
+    # Patterns are tried in priority order; first match wins.
     for rx in _SERIAL_RES:
         m = rx.search(text or "")
         if m:
             return m.group(1)
+    # No serial found.
     return ""
 
 
@@ -1734,12 +2070,15 @@ def _model_from(text: str, guess: bool = True) -> str:
     """Product/model: AOS-CX 'Product Name : JL627A 8325…', ArubaOS
     '(MODEL: 7005-US)' / inventory 'SC Model# : Aruba7024-US', else (when
     ``guess``) the first SKU-looking token."""
+    # AOS-CX "Product Name" field.
     m = re.search(r"(?im)^\s*product\s+name\s*:\s*(\S+)", text or "")
     if m:
         return m.group(1)
+    # ArubaOS "(MODEL: ...)" banner.
     m = re.search(r"\(MODEL:\s*([^)\s]+)\)", text or "", re.IGNORECASE)
     if m:
         return m.group(1)
+    # ArubaOS inventory "SC Model#" field.
     m = re.search(r"(?im)^\s*(?:sc\s+)?model\s*#\s*:\s*(\S+)", text or "")
     if m:
         return m.group(1)
@@ -1747,6 +2086,7 @@ def _model_from(text: str, guess: bool = True) -> str:
     m = re.search(r"(?im)^\s*chassis\s*:.*?\b(J[A-Z]?\d{3,4}[A-Z])\b", text or "")
     if m:
         return m.group(1)
+    # Fall back to a guess only when allowed.
     return _first_hw_token(text) if guess else ""
 
 
@@ -1757,15 +2097,19 @@ def _base_mac_from(text: str) -> str:
     ``3863bb-a1b2c3``, colon, or dot form; normalized to lower colon-form
     ``38:63:bb:a1:b2:c3``. Empty when absent — helps operators positively ID
     the physical box alongside the serial number."""
+    # A labelled base/system MAC field.
     m = re.search(
         r"(?im)(?:^|\s{2,})(?:(?:base|hw)\s*mac(?:\s*addr(?:ess)?)?|system\s*mac|mac\s*address)"
         r"\s*[:=]\s*([0-9A-Fa-f][0-9A-Fa-f:.\-]{10,})",
         text or "")
+    # Fallback: "Interface address is <mac>" (gateway VLAN 1).
     if not m:
         m = re.search(r"(?i)interface\s+address\s+is\s+([0-9A-Fa-f][0-9A-Fa-f:.\-]{10,})",
                       text or "")
+    # No MAC found.
     if not m:
         return ""
+    # Normalise to colon form when it has 12 hex digits; otherwise return as found.
     hexes = re.sub(r"[^0-9a-f]", "", m.group(1).lower())
     if len(hexes) == 12:
         return ":".join(hexes[i:i + 2] for i in range(0, 12, 2))
@@ -1773,6 +2117,7 @@ def _base_mac_from(text: str) -> str:
 
 
 def _firmware_from(text: str) -> str:
+    """Firmware version: the first dotted number after a Version/SW/Firmware label."""
     m = re.search(r"(?:Version|SW|Firmware|Software)[^\n]*?(\d+\.\d+(?:\.\w+)*)",
                   text or "", re.IGNORECASE)
     return m.group(1) if m else ""
