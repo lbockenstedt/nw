@@ -423,17 +423,25 @@ class NwScanner:
         # Ports that answered.
         return [p for p, ok in zip(self.tcp_ports, results) if ok is True]
 
-    async def _fingerprint(self, host: str) -> Dict[str, Any]:
-        """Probe + identify a single target. Never raises — returns a result
-        dict with ``object_type`` set when identified, else ``None``."""
-        # Canonical address and an empty result.
-        host = _norm_ip(host)
-        result: Dict[str, Any] = {
-            "address": host, "object_type": None, "hostname": "", "os": "",
+    @staticmethod
+    def _empty_result(host: str) -> Dict[str, Any]:
+        """A fresh per-target result."""
+        return {
+            "address": _norm_ip(host), "object_type": None, "hostname": "", "os": "",
             "open_ports": [], "method": None, "credential": None,
             "credential_id": None, "reachable": False,
             "snmp_ok": None, "snmp_credential_id": None,
         }
+
+    async def _fingerprint(self, host: str,
+                           result: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Probe + identify a single target. Never raises — returns a result
+        dict with ``object_type`` set when identified, else ``None``. Fills
+        ``result`` in place so a caller that times out keeps what was learned."""
+        # Canonical address and an empty result.
+        if result is None:
+            result = self._empty_result(host)
+        host = result["address"]
         # Open TCP ports; a probe failure means none.
         try:
             open_ports = await self._probe_ports(host)
@@ -586,14 +594,16 @@ class NwScanner:
             """Fingerprint a single target host within concurrency limits."""
             # Wait for a free slot, then fingerprint with a hard timeout.
             async with sem:
+                res = self._empty_result(host)
                 try:
-                    res = await asyncio.wait_for(self._fingerprint(host),
-                                                 timeout=self.target_timeout + 5)
+                    await asyncio.wait_for(self._fingerprint(host, res),
+                                           timeout=self.target_timeout + 5)
                 except Exception as e:  # noqa: BLE001
-                    # Timed out or failed: record as unreachable.
+                    # Timed out (slow SSH/SNMP) or failed: keep the open ports
+                    # already found — the host IS there, just not identified.
                     logger.debug("scan %s failed: %s", host, e)
-                    res = {"address": host, "object_type": None, "reachable": False,
-                           "open_ports": [], "method": None}
+                    res["object_type"] = None
+                    res["reachable"] = bool(res["open_ports"]) or self.pinged
                 # Result and the crawl depth it came from.
                 return res, depth
 
