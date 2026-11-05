@@ -21,17 +21,27 @@ only logs address + object_type + transport).
 one call (each independent — partial results on partial failure) for the
 hub's POLL NOW path.
 """
+# asyncio for concurrent device IO and subprocess ping.
 import asyncio
+# Standard-library logging.
 import logging
+# re for MAC normalisation and output parsing.
 import re
+# shutil finds the system ping binary.
 import shutil
+# sys.platform picks the right ping flags.
 import sys
+# time for latency measurement and probe caching.
 import time
+# Context-manager helper for driver sessions.
 from contextlib import asynccontextmanager
+# Type hints.
 from typing import Any, Dict, List, Optional
 
+# heartbeat signals progress to the fleet idle-guard.
 import heartbeat
 
+# Named logger for engine messages.
 logger = logging.getLogger("NwEngine")
 
 # ── Vendor command reference (used by the CLI driver + logged for diagnostics)─
@@ -71,6 +81,7 @@ _DEFAULT_TRANSPORT: Dict[str, str] = {
     "gateway":    "rest",
 }
 
+# Accepted transport values and device families.
 _VALID_TRANSPORTS = ("ssh", "rest", "snmp", "auto")
 _VALID_OBJECT_TYPES = tuple(_VENDOR_COMMANDS.keys())
 
@@ -84,14 +95,18 @@ def _norm_mac(m: str) -> str:
     Non-hex garbage is returned stripped-lower so two spellings still dedup
     upstream. Mirrors the hub-side ``norm_mac`` in access.py.
     """
+    # Absent value.
     if not m:
         return ""
+    # Lower-case; placeholder words mean "no MAC".
     s = str(m).strip().lower()
     if s in ("unknown", "none", "incomplete"):
         return ""
+    # Twelve hex digits make a MAC in colon form.
     hexes = re.sub(r"[^0-9a-f]", "", s)
     if len(hexes) == 12:
         return ":".join(hexes[i:i + 2] for i in range(0, 12, 2))
+    # Anything else: lower-cased as is.
     return s
 
 
@@ -108,6 +123,7 @@ def merge_endpoints(arp: Any, mac_table: Any,
     from the MAC table wins; a MAC's interface is taken from whichever table has
     a non-empty value (MAC/bridge dest preferred).
     """
+    # Endpoints keyed by normalised MAC.
     by_mac: Dict[str, Dict[str, Any]] = {}
 
     def _slot(mac: str) -> Dict[str, Any]:
@@ -115,8 +131,10 @@ def merge_endpoints(arp: Any, mac_table: Any,
         return by_mac.setdefault(mac, {"mac": mac, "ip": "", "vlan": "",
                                        "os": "", "interface": ""})
 
+    # MAC/bridge table first: it sets VLAN and the preferred interface.
     for r in (mac_table or []):
         mac = _norm_mac(r.get("mac"))
+        # Skip rows without a usable MAC.
         if not mac:
             continue
         s = _slot(mac)
@@ -125,8 +143,10 @@ def merge_endpoints(arp: Any, mac_table: Any,
         if r.get("interface") and not s["interface"]:
             s["interface"] = str(r["interface"])
 
+    # ARP/user table fills IP, OS and any still-missing fields.
     for r in (arp or []):
         mac = _norm_mac(r.get("mac"))
+        # Skip rows without a usable MAC.
         if not mac:
             continue
         s = _slot(mac)
@@ -139,6 +159,7 @@ def merge_endpoints(arp: Any, mac_table: Any,
         if r.get("interface") and not s["interface"]:
             s["interface"] = str(r["interface"])
 
+    # Sorted by VLAN, then IP, then MAC; blanks last.
     return sorted(by_mac.values(),
                   key=lambda e: (e["vlan"] or "~", e["ip"] or "~", e["mac"]))
 
@@ -146,6 +167,7 @@ def merge_endpoints(arp: Any, mac_table: Any,
 def summarize_vlans(endpoints: Any, interfaces: Any = None) -> List[Dict[str, Any]]:
     """Roll the merged endpoints (+ any L3 interfaces) into a per-VLAN summary
     ``[{vlan, endpoints, macs, ips, gateway_ip}]`` for the VLANs tab."""
+    # Summaries keyed by VLAN id.
     vlans: Dict[str, Dict[str, Any]] = {}
 
     def _slot(vlan: str) -> Dict[str, Any]:
@@ -153,8 +175,10 @@ def summarize_vlans(endpoints: Any, interfaces: Any = None) -> List[Dict[str, An
         return vlans.setdefault(vlan, {"vlan": vlan, "endpoints": 0,
                                        "macs": 0, "ips": 0, "gateway_ip": ""})
 
+    # Count endpoints, MACs and IPs per VLAN.
     for e in (endpoints or []):
         vlan = str(e.get("vlan") or "").strip()
+        # No VLAN: not counted.
         if not vlan:
             continue
         s = _slot(vlan)
@@ -173,6 +197,7 @@ def summarize_vlans(endpoints: Any, interfaces: Any = None) -> List[Dict[str, An
             if not s["gateway_ip"]:
                 s["gateway_ip"] = str(i["ip"])
 
+    # Numeric VLANs in order, non-numeric last.
     return sorted(vlans.values(), key=lambda v: (int(v["vlan"])
                   if v["vlan"].isdigit() else 9999, v["vlan"]))
 
@@ -184,17 +209,22 @@ def enrich_vlans(native_rows: Any, endpoints: Any,
     the fused user-table+bridge endpoints) and a gateway IP (from an SVI-named
     L3 interface). Keeps every VLAN from ``show vlan`` (incl. empty ones), which
     a purely endpoint-derived rollup would miss."""
+    # Live counts by VLAN.
     counts = {v["vlan"]: v for v in summarize_vlans(endpoints, interfaces)}
+    # Annotate each native VLAN row.
     out = []
     for r in (native_rows or []):
         vid = str(r.get("vlan") or "").strip()
+        # Skip rows without a VLAN id.
         if not vid:
             continue
+        # Counts for this VLAN (zeros when none).
         c = counts.get(vid, {})
         out.append({"vlan": vid, "name": r.get("name", ""),
                     "ports": r.get("ports", ""),
                     "endpoints": c.get("endpoints", 0), "macs": c.get("macs", 0),
                     "ips": c.get("ips", 0), "gateway_ip": c.get("gateway_ip", "")})
+    # Enriched VLAN list.
     return out
 
 
@@ -219,11 +249,14 @@ async def icmp_ping(host: str, timeout: float = 2.0, count: int = 1) -> Dict[str
     ``ping`` runs unprivileged on Linux (net.ipv4.ping_group_range) and macOS,
     so no CAP_NET_RAW / root is needed on the spoke.
     """
+    # No host: result unknown.
     if not host:
         return {"reachable": None, "latency_ms": None}
+    # No ping binary: result unknown.
     ping_bin = shutil.which("ping")
     if not ping_bin:
         return {"reachable": None, "latency_ms": None}
+    # Whole-second timeout, at least 1.
     to = int(max(1, round(timeout)))
     # -W is a per-reply wait in SECONDS on Linux/iputils but MILLISECONDS on
     # BSD/macOS; macOS uses -t for an overall deadline instead.
@@ -231,6 +264,7 @@ async def icmp_ping(host: str, timeout: float = 2.0, count: int = 1) -> Dict[str
         args = [ping_bin, "-c", str(count), "-t", str(to), host]
     else:
         args = [ping_bin, "-c", str(count), "-W", str(to), host]
+    # Run ping, capped a little past its own timeout.
     proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -239,6 +273,7 @@ async def icmp_ping(host: str, timeout: float = 2.0, count: int = 1) -> Dict[str
         out, _ = await asyncio.wait_for(proc.communicate(),
                                         timeout=to * count + 3)
     except asyncio.TimeoutError:
+        # Overran: kill ping and treat the host as down.
         if proc is not None:
             try:
                 proc.kill()
@@ -246,8 +281,11 @@ async def icmp_ping(host: str, timeout: float = 2.0, count: int = 1) -> Dict[str
                 pass
         return {"reachable": False, "latency_ms": None}
     except Exception:  # noqa: BLE001 - spawn failure -> unknown, fail open
+        # Could not start ping: result unknown.
         return {"reachable": None, "latency_ms": None}
+    # Exit code 0 means the host answered.
     reachable = proc.returncode == 0
+    # Round-trip time from the "time=X ms" part of the reply, if any.
     latency_ms = None
     m = re.search(r"time[=<]\s*([\d.]+)\s*ms",
                   (out or b"").decode("utf-8", "replace"))
@@ -255,7 +293,9 @@ async def icmp_ping(host: str, timeout: float = 2.0, count: int = 1) -> Dict[str
         try:
             latency_ms = float(m.group(1))
         except ValueError:
+            # Unparseable number.
             latency_ms = None
+    # Three-state reachability plus latency.
     return {"reachable": reachable, "latency_ms": latency_ms}
 
 
@@ -267,44 +307,54 @@ class _SharedTransportSession:
 
     def __init__(self, factory):
         """Initialize SharedSession with a session factory callable."""
+        # Session factory, current session, and whether the reconnect was used.
         self._factory = factory
         self.session = None
         self._reconnect_used = False
 
     async def open(self) -> None:
         """Create and connect a new underlying transport session."""
+        # Build and connect a new session.
         s = self._factory()
         try:
             await s.connect()
         except Exception:
+            # Connect failed: close the half-open session and re-raise.
             try:
                 await s.close()
             except Exception:
+                # Close errors are irrelevant here.
                 pass
             raise
+        # Connected: make it the active session.
         self.session = s
 
     async def reconnect_once(self) -> bool:
         """One-shot reconnect after a mid-poll session death. True when a fresh
         session is live; False when the credit is spent or the reconnect itself
         failed (callers then fall back to per-datum handling)."""
+        # Only one reconnect per shared session.
         if self._reconnect_used:
             return False
         self._reconnect_used = True
+        # Drop the dead session and open a fresh one.
         await self.close()
         try:
             await self.open()
             return True
         except Exception:
+            # Reconnect failed.
             return False
 
     async def close(self) -> None:
         """Close the active underlying transport session safely."""
+        # Take the session out first so it is closed only once.
         s, self.session = self.session, None
         if s is not None:
             try:
                 await s.close()
             except Exception:
+                # Close errors are ignored.
                 pass
 
 
@@ -331,10 +381,12 @@ class NwDriver:
 
     def __init__(self, device: Dict[str, Any]):
         """Initialize driver instance with target device parameters and resolved transport."""
+        # Device record and its key fields.
         self.device = device
         self.device_id = device.get("id", "")
         self.object_type = device.get("object_type", "")
         self.address = device.get("address", "")
+        # Effective transport for this device; no shared session yet.
         self.transport = self._resolve_transport(device)
         self._shared: Optional[_SharedTransportSession] = None
 
@@ -346,16 +398,20 @@ class NwDriver:
         composite fetches reuse the outer scope's session. A failed connect
         degrades silently to the legacy per-call sessions so the per-datum
         ERROR-envelope contract is unchanged."""
+        # Cheap transports, or already inside a scope: nothing to do.
         if not self.shares_session or self._shared is not None:
             yield
             return
+        # Open one shared session for the scope.
         shared = _SharedTransportSession(self._session)
         try:
             await shared.open()
             self._shared = shared
         except Exception as e:
+            # Connect failed: datum calls fall back to their own sessions.
             logger.debug("shared %s session %s: %s (per-call fallback)",
                          self.transport, self.address, e)
+        # Run the scope body, then always drop and close the shared session.
         try:
             yield
         finally:
@@ -367,10 +423,12 @@ class NwDriver:
         once if the session died mid-poll. Caller checks ``self._shared`` (and
         its ``.session``) first; raises on failure so the caller's existing
         except clauses build the usual ERROR envelope."""
+        # Run on the shared session.
         shared = self._shared
         try:
             return await fn(shared.session, self.object_type)
         except Exception:
+            # Session died: reconnect once and retry, else re-raise.
             if not await shared.reconnect_once():
                 raise
             return await fn(shared.session, self.object_type)
@@ -378,15 +436,18 @@ class NwDriver:
     @staticmethod
     def _resolve_transport(device: Dict[str, Any]) -> str:
         """Determine effective transport ('ssh', 'rest', 'snmp') for the device."""
+        # Requested transport, defaulting to auto; unknown values become auto.
         t = (device.get("transport") or "auto").strip().lower()
         if t not in _VALID_TRANSPORTS:
             t = "auto"
+        # Auto: the family's default transport (SSH if unknown).
         if t == "auto":
             t = _DEFAULT_TRANSPORT.get(device.get("object_type", ""), "ssh")
         return t
 
     def _log(self, method: str, extra: str = "") -> None:
         """Log a standard formatted driver action message."""
+        # "[family/transport] method on address" prefix.
         tag = f"[{self.object_type}/{self.transport}] {method} on {self.address}"
         logger.info(f"{tag} {extra}".rstrip())
 
@@ -443,11 +504,16 @@ class SnmpDriver(NwDriver):
     transport = "snmp"
 
     def _session(self):
+        """New SNMP session for this device."""
+        # Imported lazily; pysnmp may be absent.
         from transports import snmp_io
         return snmp_io.SnmpSession(self.device)
 
     async def probe(self) -> Dict[str, Any]:
+        """GET sysUpTime to check reachability."""
+        # Imported lazily; pysnmp may be absent.
         from transports import snmp_io
+        # Any failure becomes an ERROR envelope marked unreachable.
         try:
             s = self._session()
             res = await snmp_io.snmp_probe(s)
@@ -457,14 +523,20 @@ class SnmpDriver(NwDriver):
                         {"reachable": False, "latency_ms": 0})
 
     async def get_device_info(self) -> Dict[str, Any]:
+        """sysDescr/sysName/ENTITY-MIB identity."""
+        # Imported lazily; pysnmp may be absent.
         from transports import snmp_io
+        # Any failure becomes an ERROR envelope.
         try:
             return self._ok(await snmp_io.snmp_get_device_info(self._session()))
         except Exception as e:
             return _err(f"snmp device info {self.address}: {e}")
 
     async def get_interfaces(self) -> Dict[str, Any]:
+        """Walk ifTable/ipAdEntTable into interface rows."""
+        # Imported lazily; pysnmp may be absent.
         from transports import snmp_io
+        # Any failure becomes an ERROR envelope.
         try:
             rows = await snmp_io.snmp_get_interfaces(self._session())
             return self._ok(rows)
@@ -472,7 +544,10 @@ class SnmpDriver(NwDriver):
             return _err(f"snmp interfaces {self.address}: {e}")
 
     async def get_arp(self) -> Dict[str, Any]:
+        """Walk the ARP table, naming interfaces from ifTable."""
+        # Imported lazily; pysnmp may be absent.
         from transports import snmp_io
+        # Any failure becomes an ERROR envelope.
         try:
             s = self._session()
             # Map ifIndex → name so the ARP rows carry a friendly interface.
@@ -481,17 +556,23 @@ class SnmpDriver(NwDriver):
             rows = await snmp_io.snmp_get_arp(s, ifaces=iftable)
             return self._ok(rows)
         except Exception as e:
+            # Walk failed.
             return _err(f"snmp arp {self.address}: {e}")
 
     async def get_mac_table(self) -> Dict[str, Any]:
+        """Walk the bridge forwarding table, naming interfaces from ifTable."""
+        # Imported lazily; pysnmp may be absent.
         from transports import snmp_io
+        # Any failure becomes an ERROR envelope.
         try:
+            # Map ifIndex to name so MAC rows carry a friendly interface.
             s = self._session()
             iftable = snmp_io.parse_iftable(
                 await snmp_io._to_thread(s.walk, snmp_io.IF_PREFIX))
             rows = await snmp_io.snmp_get_mac_table(s, ifaces=iftable)
             return self._ok(rows)
         except Exception as e:
+            # Walk failed.
             return _err(f"snmp mac table {self.address}: {e}")
 
 
@@ -514,26 +595,39 @@ class SshCliDriver(NwDriver):
     fleet_hard_cap = 30.0
 
     def _session(self):
+        """New (unconnected) CLI session for this device."""
+        # Imported lazily; asyncssh may be absent.
         from transports import cli_io
         return cli_io.CliSession(self.device)
 
     async def _with_session(self, fn) -> Dict[str, Any]:
+        """Run ``fn(session, object_type)`` on the shared or a fresh session; wrap errors."""
+        # Imported lazily; asyncssh may be absent.
         from transports import cli_io
+        # Errors become ERROR envelopes.
         try:
+            # Inside a session scope: reuse the shared session.
             if self._shared is not None and self._shared.session is not None:
                 return self._ok(await self._run_on_shared(fn))
+            # Otherwise open a session just for this call.
             async with self._session() as s:
                 rows = await fn(s, self.object_type)
                 return self._ok(rows)
         except cli_io.CliError as e:
+            # Connect/auth/command failure.
             return _err(f"cli {self.address}: {e}")
         except Exception as e:
+            # Any other failure.
             return _err(f"cli {self.address}: {e}")
 
     async def probe(self) -> Dict[str, Any]:
+        """Reachable if a CLI login plus one command succeeds; latency is the round trip."""
+        # Imported lazily; asyncssh may be absent.
         from transports import cli_io
         import time
+        # Start the clock.
         t0 = time.monotonic()
+        # Any failure marks the device unreachable.
         try:
             if self._shared is not None and self._shared.session is not None:
                 # Shared-session poll: reachability == one command round-trip
@@ -541,39 +635,55 @@ class SshCliDriver(NwDriver):
                 await self._run_on_shared(
                     lambda s, _ot: s.run("show version"))
             else:
+                # No shared session: open one just for the probe.
                 async with self._session() as s:
                     # A successful connection + one command == reachable.
                     await s.run("show version")
+            # Success: reachable, with elapsed milliseconds.
             return self._ok({"reachable": True,
                              "latency_ms": int((time.monotonic() - t0) * 1000)})
         except cli_io.CliError as e:
+            # Connect/auth/command failure.
             return _err(f"cli probe {self.address}: {e}",
                         {"reachable": False, "latency_ms": 0})
         except Exception as e:
+            # Any other failure.
             return _err(f"cli probe {self.address}: {e}",
                         {"reachable": False, "latency_ms": 0})
 
     async def get_device_info(self) -> Dict[str, Any]:
+        """Model/serial/firmware/hostname via the vendor info command."""
+        # Imported lazily; asyncssh may be absent.
         from transports import cli_io
         return await self._with_session(cli_io.cli_get_device_info)
 
     async def get_arp(self) -> Dict[str, Any]:
+        """ARP rows via the vendor show command."""
+        # Imported lazily; asyncssh may be absent.
         from transports import cli_io
         return await self._with_session(cli_io.cli_get_arp)
 
     async def get_mac_table(self) -> Dict[str, Any]:
+        """MAC-table rows via the vendor show command."""
+        # Imported lazily; asyncssh may be absent.
         from transports import cli_io
         return await self._with_session(cli_io.cli_get_mac_table)
 
     async def get_lldp_neighbors(self) -> Dict[str, Any]:
+        """Structured LLDP (plus CDP) neighbour records."""
+        # Imported lazily; asyncssh may be absent.
         from transports import cli_io
         return await self._with_session(cli_io.cli_get_lldp_detail)
 
     async def get_interfaces(self) -> Dict[str, Any]:
+        """Interface rows via the vendor show command."""
+        # Imported lazily; asyncssh may be absent.
         from transports import cli_io
         return await self._with_session(cli_io.cli_get_interfaces)
 
     async def get_vlans(self) -> Dict[str, Any]:
+        """Native VLAN list via ``show vlan``."""
+        # Imported lazily; asyncssh may be absent.
         from transports import cli_io
         return await self._with_session(cli_io.cli_get_vlans)
 
@@ -582,17 +692,22 @@ class SshCliDriver(NwDriver):
         """Install an LE server cert over SSH. Implemented for the ArubaOS
         gateway/controller (PKCS#12 + SCP + crypto pki-import + web-server bind);
         other CLI object_types have no external-key import path."""
+        # Imported lazily; asyncssh may be absent.
         from transports import cli_io
+        # Only gateways have a CLI import path.
         if self.object_type != "gateway":
             return _err(f"CLI cert install not implemented for object_type "
                         f"'{self.object_type}'")
+        # Open a session and run the install sequence.
         try:
             async with self._session() as s:
                 return await cli_io.cli_install_cert_gateway(
                     s, fullchain, privkey, chain, domain)
         except cli_io.CliError as e:
+            # Connect/auth/command failure.
             return _err(f"cli {self.address}: {e}")
         except Exception as e:  # noqa: BLE001
+            # Any other failure.
             return _err(f"cli {self.address}: {e}")
 
 
@@ -605,50 +720,74 @@ class RestDriver(NwDriver):
     shares_session = True
 
     def _session(self):
+        """New (unconnected) REST session for this device."""
+        # Imported lazily; httpx may be absent.
         from transports import rest_io
         return rest_io.RestSession(self.device)
 
     async def _with_session(self, fn) -> Dict[str, Any]:
+        """Run ``fn(session, object_type)`` on the shared or a fresh session; wrap errors."""
+        # Imported lazily; httpx may be absent.
         from transports import rest_io
+        # Errors become ERROR envelopes.
         try:
+            # Inside a session scope: reuse the shared client.
             if self._shared is not None and self._shared.session is not None:
                 return self._ok(await self._run_on_shared(fn))
+            # Otherwise open a client just for this call.
             async with self._session() as s:
                 rows = await fn(s, self.object_type)
                 return self._ok(rows)
         except rest_io.RestError as e:
+            # HTTP/transport failure.
             return _err(f"rest {self.address}: {e}")
         except Exception as e:
+            # Any other failure.
             return _err(f"rest {self.address}: {e}")
 
     async def probe(self) -> Dict[str, Any]:
+        """Reachable if the system-info GET succeeds; latency is the round trip."""
+        # Start the clock.
         import time
         t0 = time.monotonic()
+        # Any failure marks the device unreachable.
         try:
+            # Use the shared client if there is one.
             if self._shared is not None and self._shared.session is not None:
                 await self._run_on_shared(rest_get_device_info)
             else:
+                # Otherwise open a client just for the probe.
                 async with self._session() as s:
                     await rest_get_device_info(s, self.object_type)
+            # Success: reachable, with elapsed milliseconds.
             return self._ok({"reachable": True,
                              "latency_ms": int((time.monotonic() - t0) * 1000)})
         except Exception as e:
+            # Request failed: unreachable.
             return _err(f"rest probe {self.address}: {e}",
                         {"reachable": False, "latency_ms": 0})
 
     async def get_device_info(self) -> Dict[str, Any]:
+        """Model/serial/firmware via the vendor system endpoint."""
+        # Imported lazily; httpx may be absent.
         from transports import rest_io
         return await self._with_session(rest_io.rest_get_device_info)
 
     async def get_arp(self) -> Dict[str, Any]:
+        """ARP rows via the vendor endpoint."""
+        # Imported lazily; httpx may be absent.
         from transports import rest_io
         return await self._with_session(rest_io.rest_get_arp)
 
     async def get_mac_table(self) -> Dict[str, Any]:
+        """MAC-table rows via the vendor endpoint."""
+        # Imported lazily; httpx may be absent.
         from transports import rest_io
         return await self._with_session(rest_io.rest_get_mac_table)
 
     async def get_interfaces(self) -> Dict[str, Any]:
+        """Interface rows via the vendor endpoint."""
+        # Imported lazily; httpx may be absent.
         from transports import rest_io
         return await self._with_session(rest_io.rest_get_interfaces)
 
@@ -659,29 +798,38 @@ class RestDriver(NwDriver):
         envelope carries a clear install message rather than a datum row
         count. The cert material + key are pushed inline (no SCP); see
         :func:`transports.rest_io.rest_install_cert` for the sequence."""
+        # Imported lazily; httpx may be absent.
         from transports import rest_io
+        # Any failure becomes an ERROR envelope.
         try:
+            # Open a client and run the install sequence.
             async with self._session() as s:
                 data = await rest_io.rest_install_cert(
                     s, self.object_type, fullchain, privkey, chain, domain)
+            # Summarise and log what was installed.
             msg = (f"cert '{data.get('cert_name')}' installed on "
                    f"{self.address} ({data.get('service')})")
             self._log("install_cert",
                       f"cert={data.get('cert_name')} prefix={data.get('rest_prefix')}")
             return self._ok(data, message=msg)
         except rest_io.RestError as e:
+            # HTTP/transport failure.
             return _err(f"rest install_cert {self.address}: {e}")
         except Exception as e:
+            # Any other failure.
             return _err(f"rest install_cert {self.address}: {e}")
 
 
 # Forward ref for RestDriver.probe (defined above in the class body via the
 # rest_io helper; keep a module-level alias for clarity).
 async def rest_get_device_info(session, object_type):
+    """Fetch device info over REST (thin wrapper around the rest_io helper)."""
+    # Imported lazily; httpx may be absent.
     from transports import rest_io
     return await rest_io.rest_get_device_info(session, object_type)
 
 
+# Driver class for each resolved transport.
 _TRANSPORT_CLASSES = {
     "ssh": SshCliDriver,
     "rest": RestDriver,
@@ -697,11 +845,13 @@ async def _null_scope():
 
 def build_driver(device: Dict[str, Any]) -> Optional[NwDriver]:
     """Build the right driver for a device dict (or None for unknown type)."""
+    # Unknown device family: no driver.
     object_type = (device.get("object_type") or "").strip().lower()
     if object_type not in _VALID_OBJECT_TYPES:
         logger.warning(f"Unknown object_type {object_type!r} for device "
                        f"{device.get('id')} — skipped")
         return None
+    # Pick the class for the effective transport (SSH fallback).
     transport = NwDriver._resolve_transport(device)
     cls = _TRANSPORT_CLASSES.get(transport, SshCliDriver)
     return cls(device)
@@ -717,6 +867,8 @@ class NwEngine:
     """
 
     def __init__(self, devices: Optional[List[Dict[str, Any]]] = None):
+        """Store the initial fleet and set up the shared-tenant id and reachability cache."""
+        # Fleet device list.
         self.devices: List[Dict[str, Any]] = list(devices or [])
         # The shared tenant id (set via UPDATE_CONFIG from the hub) — a device
         # whose ``tenant_id`` equals this is visible to ALL tenants (matches the
@@ -734,8 +886,10 @@ class NwEngine:
     def set_devices(self, devices: List[Dict[str, Any]],
                     shared_tenant_id: str = "") -> None:
         """Update active fleet device definitions and shared tenant ID."""
+        # Replace the fleet and the shared tenant id.
         self.devices = list(devices or [])
         self.shared_tenant_id = shared_tenant_id or ""
+        # Count devices per family for the log line.
         types = {}
         for d in self.devices:
             ot = (d.get("object_type") or "unknown")
@@ -748,8 +902,10 @@ class NwEngine:
         """True if ``device`` is visible to ``tenant``: own-tenant or the
         shared tenant. ``tenant`` None/empty → no filter (whole fleet, today's
         behavior — backward-compatible with a hub that doesn't pass a tenant)."""
+        # No tenant filter: everything is visible.
         if not tenant:
             return True
+        # Own tenant, or the shared tenant when one is set.
         dt = (device or {}).get("tenant_id", "")
         return dt == tenant or (bool(self.shared_tenant_id)
                                 and dt == self.shared_tenant_id)
@@ -757,17 +913,21 @@ class NwEngine:
     def _get_device(self, device_id: str,
                     tenant: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """Find a device dictionary by ID and tenant visibility filter."""
+        # First matching id visible to the tenant.
         for d in self.devices:
             if d.get("id") == device_id and self._tenant_matches(d, tenant):
                 return d
+        # Not found or not visible.
         return None
 
     def _driver_for(self, device_id: str,
                     tenant: Optional[str] = None) -> Optional[NwDriver]:
         """Construct a resolved NwDriver instance for the specified device ID."""
+        # Look up the device; unknown means no driver.
         d = self._get_device(device_id, tenant)
         if not d:
             return None
+        # Build a driver for its family and transport.
         return build_driver(d)
 
     # ── Logging: standard per-datum outcome trail ───────────────────────────
@@ -782,19 +942,24 @@ class NwEngine:
         spoke-log dig). Best-effort: logging never raises — a transport failure
         is still returned in the envelope regardless."""
         try:
+            # Status and message from the result.
             status = str((res or {}).get("status", "")).upper()
             msg = (res or {}).get("message", "") or "transport failure"
+            # Default detail: row count for lists, else "ok".
             if detail is None:
                 data = (res or {}).get("data")
                 detail = f"{len(data)} rows" if isinstance(data, list) else "ok"
+            # "[family/transport] method address" tag.
             tag = (f"[{getattr(drv, 'object_type', '')}/"
                    f"{getattr(drv, 'transport', '')}] "
                    f"{method} {getattr(drv, 'address', '')}")
+            # INFO on success, ERROR (with the message) on failure.
             if status == "SUCCESS":
                 logger.info("nw %s -> %s", tag, detail)
             else:
                 logger.error("nw %s -> error: %s", tag, msg)
         except Exception:
+            # Logging must never raise.
             logger.debug("nw log_datum %s failed", method, exc_info=True)
 
     # ── Fleet ───────────────────────────────────────────────────────────────
@@ -810,17 +975,23 @@ class NwEngine:
         by the device record's ``tenant_id``). Omit → whole fleet (today's
         behavior). Each row carries ``tenant_id`` + ``shared`` so the hub can
         re-filter its cached envelope on serve."""
+        # Devices visible to this tenant.
         fleet = [d for d in self.devices if self._tenant_matches(d, tenant)]
         rows = []
         async def _probe_row(d):
+            """Probe one device under the heartbeat guard and build its fleet row."""
+            # Driver for this device; reachability starts unknown.
             drv = build_driver(d)
             rcell = {"reachable": None, "latency_ms": None}
+            # Only probe devices that have a driver.
             if drv:
+                # Probe with the progress-aware idle timeout.
                 try:
                     pr = await heartbeat.guard(
                         drv.probe(),
                         idle_timeout=getattr(drv, "fleet_idle_timeout", 3.0),
                         hard_cap=getattr(drv, "fleet_hard_cap", None))
+                    # Success: copy reachability and latency.
                     if pr.get("status") == "SUCCESS":
                         rcell.update(pr.get("data") or {})
                     else:
@@ -832,9 +1003,11 @@ class NwEngine:
                                        getattr(drv, "address", ""),
                                        pr.get("message", "probe failed"))
                 except (asyncio.TimeoutError, Exception) as e:
+                    # Timed out or crashed: mark as down.
                     rcell = {"reachable": False, "latency_ms": None}
                     logger.warning("nw probe %s during fleet list: %s",
                                    getattr(drv, "address", ""), e)
+            # Fleet row (no credentials).
             return {
                 "id": d.get("id", ""),
                 "name": d.get("name", ""),
@@ -847,11 +1020,14 @@ class NwEngine:
                 "shared": bool(self.shared_tenant_id
                                and d.get("tenant_id", "") == self.shared_tenant_id),
             }
+        # Probe all devices at once.
         rows = await asyncio.gather(*(_probe_row(d) for d in fleet))
+        # Tally up/down for the log line.
         up = sum(1 for r in rows if r.get("reachable") is True)
         down = sum(1 for r in rows if r.get("reachable") is False)
         logger.info("nw list_devices -> %d device(s): %d reachable, %d unreachable, "
                     "%d unknown", len(rows), up, down, len(rows) - up - down)
+        # Fleet rows.
         return {"status": "SUCCESS", "data": list(rows)}
 
     # ── Per-device passthroughs ─────────────────────────────────────────────
@@ -870,16 +1046,19 @@ class NwEngine:
         :meth:`probe` (no SSH/SNMP/REST) used by the spoke's periodic sweep to
         keep fleet up/down fresh and to gate the expensive poll. Returns
         ``{status, reachable (bool|None), latency_ms}``."""
+        # Unknown device: error.
         d = self._get_device(device_id, tenant)
         if not d:
             logger.warning("nw ping: device %s not in fleet", device_id)
             return _err(f"Device {device_id} not found")
+        # ICMP ping the address and cache the verdict with a timestamp.
         res = await icmp_ping(d.get("address", ""), timeout=self._PING_TIMEOUT_S)
         self.reachability[device_id] = {
             "reachable": res.get("reachable"),
             "latency_ms": res.get("latency_ms"),
             "checked_at": time.monotonic(),
         }
+        # Debug log and result.
         logger.debug("nw ping %s (%s) -> reachable=%s latency=%sms",
                      device_id, d.get("address", ""), res.get("reachable"),
                      res.get("latency_ms"))
@@ -892,18 +1071,23 @@ class NwEngine:
         (``reachable is False``) within ``ttl`` seconds. An UNKNOWN result
         (ping unavailable) or a stale/absent entry never gates — the poll must
         fail OPEN so a spoke without a usable ``ping`` binary still polls."""
+        # Default to the gate TTL.
         ttl = self._REACH_GATE_TTL_S if ttl is None else ttl
+        # Only a confirmed down result can gate.
         r = self.reachability.get(device_id)
         if not r or r.get("reachable") is not False:
             return False
+        # Gate only while the result is fresh.
         return (time.monotonic() - float(r.get("checked_at", 0.0))) <= ttl
 
     async def probe(self, device_id: str, tenant: Optional[str] = None) -> Dict[str, Any]:
         """Probe reachability for a single device in the fleet."""
+        # Unknown device: error.
         drv = self._driver_for(device_id, tenant)
         if not drv:
             logger.warning("nw probe: device %s not in fleet", device_id)
             return _err(f"Device {device_id} not found")
+        # Probe and log reachability/latency.
         res = await drv.probe()
         pd = res.get("data") if isinstance(res.get("data"), dict) else {}
         self._log_datum("probe", drv, res,
@@ -913,16 +1097,19 @@ class NwEngine:
 
     async def get_device_info(self, device_id: str, tenant: Optional[str] = None) -> Dict[str, Any]:
         """Fetch hardware metadata and OS version for a single device."""
+        # Unknown device: error.
         drv = self._driver_for(device_id, tenant)
         if not drv:
             logger.warning("nw get_device_info: device %s not in fleet", device_id)
             return _err(f"Device {device_id} not found")
+        # Fetch and log.
         res = await drv.get_device_info()
         self._log_datum("device_info", drv, res)
         return res
 
     async def get_mac_table(self, device_id: str, tenant: Optional[str] = None) -> Dict[str, Any]:
         """Fetch forwarding MAC table entries for a single device."""
+        # Unknown device: error.
         drv = self._driver_for(device_id, tenant)
         if not drv:
             logger.warning("nw get_mac_table: device %s not in fleet", device_id)
@@ -935,10 +1122,12 @@ class NwEngine:
                 arp = await drv.get_arp()        # user-table / show arp
                 mac = await drv.get_mac_table()  # datapath bridge / show mac-address
             self._log_datum("mac_table", drv, mac)
+            # Join on MAC; failed datums contribute nothing.
             merged = merge_endpoints(
                 arp.get("data") if arp.get("status") == "SUCCESS" else [],
                 mac.get("data") if mac.get("status") == "SUCCESS" else [])
             return self._ok_or_partial(merged, [arp, mac], "mac(s)")
+        # Other families: plain MAC table.
         res = await drv.get_mac_table()
         self._log_datum("mac_table", drv, res)
         return res
@@ -955,30 +1144,36 @@ class NwEngine:
         fleet can tell us, and the gaps are exactly what the hub then fills in
         from MAC-table inference and operator-declared links.
         """
+        # Unknown device: error.
         drv = self._driver_for(device_id, tenant)
         if not drv:
             logger.warning("nw get_lldp_neighbors: device %s not in fleet", device_id)
             return _err(f"Device {device_id} not found")
+        # Fetch and log.
         res = await drv.get_lldp_neighbors()
         self._log_datum("lldp", drv, res)
         return res
 
     async def get_arp(self, device_id: str, tenant: Optional[str] = None) -> Dict[str, Any]:
         """Fetch ARP table entries for a single device."""
+        # Unknown device: error.
         drv = self._driver_for(device_id, tenant)
         if not drv:
             logger.warning("nw get_arp: device %s not in fleet", device_id)
             return _err(f"Device {device_id} not found")
+        # Fetch and log.
         res = await drv.get_arp()
         self._log_datum("arp", drv, res)
         return res
 
     async def get_interfaces(self, device_id: str, tenant: Optional[str] = None) -> Dict[str, Any]:
         """Fetch interface operational status and metrics for a single device."""
+        # Unknown device: error.
         drv = self._driver_for(device_id, tenant)
         if not drv:
             logger.warning("nw get_interfaces: device %s not in fleet", device_id)
             return _err(f"Device {device_id} not found")
+        # Fetch and log.
         res = await drv.get_interfaces()
         self._log_datum("interfaces", drv, res)
         return res
@@ -987,16 +1182,20 @@ class NwEngine:
         """Unified endpoint list: gather ARP + MAC table (+ interfaces) and fuse
         on MAC → ``[{mac, ip, vlan, interface}]`` (the "IP Addresses" view). On a
         gateway this joins ``show user-table`` with ``show datapath bridge table``."""
+        # Unknown device: error.
         drv = self._driver_for(device_id, tenant)
         if not drv:
             logger.warning("nw get_endpoints: device %s not in fleet", device_id)
             return _err(f"Device {device_id} not found")
+        # Gather the three datums.
         arp, mac, ifs = await self._gather_endpoint_datums(drv)
         self._log_datum("endpoints", drv, arp)
+        # Join on MAC; failed datums contribute nothing.
         eps = merge_endpoints(
             arp.get("data") if arp.get("status") == "SUCCESS" else [],
             mac.get("data") if mac.get("status") == "SUCCESS" else [],
             ifs.get("data") if ifs.get("status") == "SUCCESS" else [])
+        # SUCCESS or PARTIAL depending on errors.
         return self._ok_or_partial(eps, [arp, mac], "endpoint(s)")
 
     async def get_vlans(self, device_id: str, tenant: Optional[str] = None) -> Dict[str, Any]:
@@ -1005,17 +1204,21 @@ class NwEngine:
         gateway_ip}]`` (the "VLANs" view). Falls back to an endpoint-derived
         rollup when the device/transport has no native ``show vlan``."""
         drv = self._driver_for(device_id, tenant)
+        # Unknown device: error.
         if not drv:
             logger.warning("nw get_vlans: device %s not in fleet", device_id)
             return _err(f"Device {device_id} not found")
+        # Native VLANs plus endpoint datums, over one session.
         async with self._session_scope(drv):
             native = await drv.get_vlans()
             arp, mac, ifs = await self._gather_endpoint_datums(drv)
         self._log_datum("vlans", drv, native)
+        # Merge endpoints from the successful datums.
         ifdata = ifs.get("data") if ifs.get("status") == "SUCCESS" else []
         eps = merge_endpoints(
             arp.get("data") if arp.get("status") == "SUCCESS" else [],
             mac.get("data") if mac.get("status") == "SUCCESS" else [], ifdata)
+        # Native list available: enrich it with counts.
         native_rows = native.get("data") if native.get("status") == "SUCCESS" else None
         if native_rows:
             return self._ok_or_partial(enrich_vlans(native_rows, eps, ifdata),
@@ -1029,6 +1232,7 @@ class NwEngine:
         """The driver's shared-session scope (ONE connection for all the datum
         calls inside it); a no-op scope for drivers without one (test fakes) or
         with cheap sessions (SNMP)."""
+        # Use the driver's scope if it has one.
         scope = getattr(drv, "session_scope", None)
         if callable(scope):
             return scope()
@@ -1045,14 +1249,17 @@ class NwEngine:
         async def _safe(coro):
             """Safely await a coroutine, converting any exception to an ERROR envelope."""
             try:
+                # Await and return the envelope.
                 return await coro
             except Exception as e:  # noqa: BLE001 - degrade to ERROR envelope
                 return _err(str(e))
+        # Session-sharing transports: run one after another on one session.
         if getattr(drv, "shares_session", False):
             async with NwEngine._session_scope(drv):
                 return (await _safe(drv.get_arp()),
                         await _safe(drv.get_mac_table()),
                         await _safe(drv.get_interfaces()))
+        # Cheap sessions: run all three at once.
         return await asyncio.gather(_safe(drv.get_arp()),
                                     _safe(drv.get_mac_table()),
                                     _safe(drv.get_interfaces()))
@@ -1061,20 +1268,25 @@ class NwEngine:
     def _ok_or_partial(data, sources, noun):
         """SUCCESS envelope; downgrade to PARTIAL (still returning ``data``) when
         any source datum errored, carrying the first error message."""
+        # Error messages from failed sources.
         errs = [s.get("message", "failed") for s in sources
                 if s.get("status") != "SUCCESS"]
+        # Everything failed and nothing came back: plain error.
         if errs and not data:
             return _err("; ".join(errs))
+        # SUCCESS, or PARTIAL with the first error noted.
         return {"status": "PARTIAL" if errs else "SUCCESS", "data": data,
                 "message": f"{len(data)} {noun}" + (f" ({errs[0]})" if errs else "")}
 
     async def run_config(self, device_id: str, commands: List[str],
                          tenant: Optional[str] = None) -> Dict[str, Any]:
         """Apply configuration commands to a managed device via its transport driver."""
+        # Unknown device: error.
         drv = self._driver_for(device_id, tenant)
         if not drv:
             logger.warning("nw run_config: device %s not in fleet", device_id)
             return _err(f"Device {device_id} not found")
+        # Delegate to the driver.
         return await drv.run_config(commands or [])
 
     async def install_cert(self, device_id: str, fullchain: str, privkey: str,
@@ -1097,38 +1309,47 @@ class NwEngine:
         The hub addresses a device by ``identifier`` (its fleet ``id``); the
         spoke maps that to ``device_id`` here. Returns the standard envelope."""
         drv = self._driver_for(device_id, tenant)
+        # Unknown device: error.
         if not drv:
             logger.warning("nw install_cert: device %s not in fleet", device_id)
             return _err(f"Device {device_id} not found")
+        # Dispatch by device family.
         ot = (drv.object_type or "").strip().lower()
         if ot == "cx_switch":
+            # AOS-CX installs only over REST.
             if drv.transport != "rest":
                 return _err(f"cx_switch cert install requires the REST transport "
                             f"(device '{device_id}' is '{drv.transport}'; "
                             f"CLI PEM-paste not yet wired)")
+            # Install and log the outcome.
             res = await drv.install_cert(fullchain, privkey, chain, domain)
             self._log_datum(
                 "install_cert", drv, res,
                 detail=res.get("message") if res.get("status") == "SUCCESS" else None)
             return res
         if ot == "aos_switch":
+            # AOS-S cannot import an external key.
             return _err("AOS-Switch cannot import an external private key "
                         "(on-switch CSR model) — ACME/certbot external key "
                         "is incompatible; generate the CSR on the switch instead")
         if ot == "ex_switch":
+            # Juniper EX: not implemented yet.
             return _err("Juniper EX cert install not yet implemented "
                         "(needs SFTP upload + config-mode plumbing)")
         if ot == "gateway":
             # ArubaOS mobility gateway/controller: PKCS#12 + SCP upload +
             # crypto pki-import + web-server bind (SshCliDriver.install_cert).
+            # Driver must provide an install path.
             if not hasattr(drv, "install_cert"):
                 return _err(f"gateway '{device_id}' driver has no cert-install path "
                             f"(transport '{drv.transport}')")
+            # Install and log the outcome.
             res = await drv.install_cert(fullchain, privkey, chain, domain)
             self._log_datum(
                 "install_cert", drv, res,
                 detail=res.get("message") if res.get("status") == "SUCCESS" else None)
             return res
+        # Any other family: not supported.
         return _err(f"cert install not supported for object_type '{ot}'")
 
     async def install_cert_fleet(self, fullchain: str, privkey: str, chain: str,
@@ -1143,29 +1364,37 @@ class NwEngine:
         ``tenant`` (optional) scopes the fan-out to that tenant's own + shared
         devices on a multi-tenant spoke (defense-in-depth; the hub already
         resolves per-device cert targets). Omit → whole fleet."""
+        # Per-device results and success/failure counts.
         results: List[Dict[str, Any]] = []
         ok = fail = 0
+        # Walk the fleet visible to this tenant.
         for d in self.devices:
             if not self._tenant_matches(d, tenant):
                 continue
+            # Device id, family, display name and address for the report.
             did = d.get("id", "")
             ot = (d.get("object_type") or "").strip().lower()
             name = d.get("name") or d.get("hostname") or did
             ip = d.get("address") or d.get("ip") or d.get("mgmt_ip") or ""
+            # Families without an install path are skipped, not failed.
             if ot not in ("cx_switch", "gateway"):
                 results.append({"device_id": did, "name": name, "ip": ip,
                                 "object_type": ot, "status": "SKIPPED",
                                 "message": f"cert install not supported for '{ot or 'unknown'}'"})
                 continue
+            # Install and record the outcome.
             res = await self.install_cert(did, fullchain, privkey, chain, domain)
             st = res.get("status", "ERROR")
             results.append({"device_id": did, "name": name, "ip": ip,
                             "object_type": ot, "status": st,
                             "message": res.get("message", "")})
+            # Count successes and failures.
             if st == "SUCCESS":
                 ok += 1
             else:
+                # Anything else counts as a failure.
                 fail += 1
+        # Devices attempted.
         total = ok + fail
         # The SPOKE now HOLDS the cert (valid material was received + validated by
         # the caller) — that alone is SUCCESS, like a proxmox node holding a cert
@@ -1173,6 +1402,7 @@ class NwEngine:
         # ``devices`` for the drill-down, but a device failure does NOT fail the
         # spoke-level target (the operator only needs "the spoke has the cert").
         if total == 0:
+            # Summary message for each outcome.
             message = "cert received by spoke (no cert-installable devices in the fleet)"
         elif fail == 0:
             message = f"cert received; installed on all {ok} switch(es)"
@@ -1180,6 +1410,7 @@ class NwEngine:
             message = f"cert received by spoke; install failed on all {fail} switch(es) — see devices"
         else:
             message = f"cert received; installed on {ok}/{total} switch(es), {fail} failed — see devices"
+        # Log and return the aggregate plus per-device results.
         logger.info("nw install_cert_fleet: spoke holds cert (%d installed, %d failed, %d total)",
                     ok, fail, total)
         return {"status": "SUCCESS", "message": message, "devices": results,
@@ -1196,9 +1427,11 @@ class NwEngine:
         """Full poll for one device, bounded by an overall deadline so no single
         wedged transport can pin the caller. Delegates to :meth:`_poll_once`."""
         try:
+            # Run the poll under the overall deadline.
             return await asyncio.wait_for(self._poll_once(device_id, tenant),
                                           timeout=self._POLL_DEADLINE_S)
         except asyncio.TimeoutError:
+            # Deadline hit: log and return an error.
             logger.warning("nw poll %s exceeded %ss deadline",
                            device_id, self._POLL_DEADLINE_S)
             return _err(f"poll timed out after {self._POLL_DEADLINE_S}s")
@@ -1208,10 +1441,12 @@ class NwEngine:
         for one device. Each sub-call is independent — a failure on one datum
         doesn't sink the rest; failed datums come back as empty lists + an
         entry in ``errors``. Used by the hub's POLL NOW path."""
+        # Unknown device: error.
         drv = self._driver_for(device_id, tenant)
         if not drv:
             logger.warning("nw poll: device %s not in fleet", device_id)
             return _err(f"Device {device_id} not found")
+        # Errors from sub-datums, plus reachability defaults.
         errors: List[str] = []
         reachable = False
         latency_ms = None
@@ -1240,10 +1475,13 @@ class NwEngine:
 
         async def _safe(coro, label):
             """Safely execute a poll datum coroutine, logging outcome and collecting errors."""
+            # Await the datum and log it.
             r = await coro
             self._log_datum(label, drv, r)
+            # Success: return the data.
             if r.get("status") == "SUCCESS":
                 return r.get("data")
+            # Failure: record the error and return an empty value of the right type.
             errors.append(f"{label}: {r.get('message', 'failed')}")
             return [] if label != "device_info" else {}
 
@@ -1252,6 +1490,7 @@ class NwEngine:
         # sub-call. Each call still fails independently (ERROR envelope), and a
         # session that dies mid-poll gets one reconnect.
         async with self._session_scope(drv):
+            # Probe first: sets reachability and latency.
             pr = await drv.probe()
             if pr.get("status") == "SUCCESS":
                 pd = pr.get("data") or {}
@@ -1260,9 +1499,11 @@ class NwEngine:
                 self._log_datum("probe", drv, pr,
                                 detail=f"reachable={reachable} latency={latency_ms}ms")
             else:
+                # Probe failed: log and record the error.
                 self._log_datum("probe", drv, pr)
                 errors.append(f"probe: {pr.get('message', 'failed')}")
 
+            # Fetch each datum independently.
             device_info = await _safe(drv.get_device_info(), "device_info")
             interfaces = await _safe(drv.get_interfaces(), "interfaces")
             arp = await _safe(drv.get_arp(), "arp")
@@ -1271,6 +1512,7 @@ class NwEngine:
             # the MAC Table tab).
             bridge = await _safe(drv.get_mac_table(), "mac_table")
 
+            # Native VLAN list only on gateways.
             is_gw = getattr(drv, "object_type", "") == "gateway"
             native_vlans = await _safe(drv.get_vlans(), "vlans") if is_gw else []
 
@@ -1281,10 +1523,13 @@ class NwEngine:
         # list; VLANs come from the authoritative `show vlan`, enriched with the
         # endpoint counts (endpoint-derived rollup is the no-`show vlan` fallback).
         endpoints = merge_endpoints(arp, bridge, interfaces)
+        # Gateways show the fused table; other families show the raw bridge table.
         mac_table = endpoints if is_gw else bridge
+        # Native VLANs enriched with counts, else a rollup from endpoints.
         vlans = (enrich_vlans(native_vlans, endpoints, interfaces)
                  if native_vlans else summarize_vlans(endpoints, interfaces))
 
+        # Overall status and row counts for the log line.
         status = "SUCCESS" if (reachable and not any(errors)) else "PARTIAL"
         n_if = len(interfaces) if isinstance(interfaces, list) else 0
         n_arp = len(arp) if isinstance(arp, list) else 0
@@ -1292,6 +1537,7 @@ class NwEngine:
         logger.info("nw poll %s -> status=%s reachable=%s interfaces=%d arp=%d "
                     "mac=%d errors=%d", getattr(drv, "address", ""), status,
                     reachable, n_if, n_arp, n_mac, len(errors))
+        # Surface any sub-errors at ERROR level.
         if errors:
             # A reachable-but-PARTIAL poll (one or more sub-datums failed) must
             # also raise the aggregate at ERROR so it lands in the hub's
@@ -1302,6 +1548,7 @@ class NwEngine:
             logger.error("nw poll %s -> %d error(s): %s",
                          getattr(drv, "address", ""), len(errors),
                          "; ".join(errors))
+        # Full poll envelope.
         return {
             "status": status,
             "data": {

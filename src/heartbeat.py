@@ -21,12 +21,17 @@ scheduling the operation as a child task — which copies the context — so eac
 concurrent probe under ``asyncio.gather`` gets its own independent watch with
 no cross-talk. Calling :func:`beat` outside a :func:`guard` is a safe no-op.
 """
+# asyncio provides the event-loop clock, tasks and the TimeoutError raised here.
 import asyncio
+# contextvars gives each guarded task its own ambient watch object.
 import contextvars
+# Type hints: guard() returns whatever type the guarded awaitable returns.
 from typing import Awaitable, Optional, TypeVar
 
+# Generic result type of the guarded operation.
 T = TypeVar("T")
 
+# The current task's watch (None when no guard() is active); child tasks copy it.
 _watch: "contextvars.ContextVar" = contextvars.ContextVar(
     "nw_heartbeat", default=None)
 
@@ -34,23 +39,29 @@ _watch: "contextvars.ContextVar" = contextvars.ContextVar(
 class _Watch:
     """Records the monotonic time of the most recent progress beat."""
 
+    # Only one attribute; __slots__ keeps the object tiny since one is made per probe.
     __slots__ = ("_last",)
 
     def __init__(self) -> None:
+        """Start the watch with "progress just happened" at creation time."""
         self._last = asyncio.get_event_loop().time()
 
     def beat(self) -> None:
+        """Record that progress happened now."""
         self._last = asyncio.get_event_loop().time()
 
     @property
     def idle(self) -> float:
+        """Seconds elapsed since the last recorded progress."""
         return asyncio.get_event_loop().time() - self._last
 
 
 def beat() -> None:
     """Signal progress to an enclosing :func:`guard`. No-op when called outside
     one, so IO code may call it unconditionally."""
+    # Find the watch of the enclosing guard(), if any.
     w = _watch.get()
+    # Outside a guard there is nothing to notify.
     if w is not None:
         w.beat()
 
@@ -66,33 +77,47 @@ async def guard(op: "Awaitable[T]", idle_timeout: float,
     An operation that emits no beats at all degrades to a plain ``idle_timeout``
     total timeout — so SNMP/REST probes (no heartbeat instrumentation) keep
     their original fixed-budget behaviour."""
+    # A zero/negative idle timeout would cancel immediately; reject it.
     if idle_timeout <= 0:
         raise ValueError("idle_timeout must be > 0")
+    # Event loop whose monotonic clock measures idle time and the hard cap.
     loop = asyncio.get_event_loop()
+    # Create this guard's watch and make it current BEFORE scheduling the op, so the
+    # op's task copies a context that points at this watch.
     watch = _Watch()
     token = _watch.set(watch)
+    # Schedule the operation as its own task and note when it started.
     task = asyncio.ensure_future(op)
     started = loop.time()
+    # The finally block below always restores the context and cleans up the task.
     try:
+        # Re-check after every wake-up until the op ends or a bound is exceeded.
         while True:
             # Sleep until the earliest of: op finishing, the idle deadline, or
             # (if set) the hard cap — then re-evaluate. Beats landing during
             # the sleep push watch.idle back down, extending the idle deadline.
             waits = [idle_timeout - watch.idle]
+            # Also wake up in time for the hard cap if one is set.
             if hard_cap is not None:
                 waits.append(hard_cap - (loop.time() - started))
+            # Never sleep less than 50 ms, to avoid a busy loop near the deadline.
             delay = max(0.05, min(waits))
+            # Wait for the op to finish, or for the computed delay to pass.
             done, _ = await asyncio.wait({task}, timeout=delay)
+            # Finished: return its result (or re-raise its exception).
             if task in done:
                 return task.result()
+            # No beat for the whole idle window: the op is considered hung.
             if watch.idle >= idle_timeout:
                 raise asyncio.TimeoutError(
                     f"no progress for {watch.idle:.1f}s "
                     f"(idle timeout {idle_timeout:.1f}s)")
+            # Still making progress but has run longer than the safety cap.
             if hard_cap is not None and (loop.time() - started) >= hard_cap:
                 raise asyncio.TimeoutError(
                     f"exceeded hard cap {hard_cap:.1f}s")
     finally:
+        # Restore the previous watch so later code is not affected by this guard.
         _watch.reset(token)
         if not task.done():
             # Cancel the still-running op and let its own cleanup (e.g.
@@ -102,4 +127,5 @@ async def guard(op: "Awaitable[T]", idle_timeout: float,
             try:
                 await task
             except BaseException:  # noqa: BLE001 — cancellation/cleanup errors
+                # Errors raised while unwinding the cancelled op are irrelevant here.
                 pass
