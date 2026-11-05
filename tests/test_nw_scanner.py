@@ -297,3 +297,12 @@ def test_ssh_identified_device_also_reports_snmp_result():
     by = {d["address"]: d for d in res["identified"]}
     assert by["10.0.0.1"]["method"] == "ssh" and by["10.0.0.1"]["snmp_ok"] is True
     assert by["10.0.0.2"]["snmp_ok"] is False
+
+
+def test_pinged_host_without_open_ports_still_gets_snmp():
+    kw = dict(tcp_probe=make_probe({}), ssh_identify=make_ssh({}),
+              snmp_identify=make_snmp({"10.0.0.9": "Aruba JL256A 2930F Switch"}))
+    res = run(NwScanner(CREDS, pinged=True, **kw).scan(["10.0.0.9"]))
+    assert res["identified"][0]["method"] == "snmp"
+    # Without the hint a host with no open port is never SNMP-probed.
+    assert run(NwScanner(CREDS, **kw).scan(["10.0.0.9"]))["identified"] == []
