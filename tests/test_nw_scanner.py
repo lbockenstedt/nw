@@ -317,6 +317,18 @@ def test_pinged_host_without_open_ports_still_gets_snmp():
     assert run(NwScanner(CREDS, **kw).scan(["10.0.0.9"]))["identified"] == []
 
 
+def test_slow_identify_keeps_the_open_ports_found():
+    # SNMP stuck behind a busy pool must not erase the host: its open ports
+    # are still reported as reachable when the per-target cap fires.
+    async def _hang(host, community, timeout):
+        await asyncio.sleep(10)
+    scanner = NwScanner(CREDS, target_timeout=0.01, tcp_probe=make_probe({"10.0.0.6": {22}}),
+                        ssh_identify=make_ssh({}), snmp_identify=_hang)
+    res = run(scanner.scan(["10.0.0.6", "10.0.0.8"]))
+    assert [(d["address"], d["open_ports"]) for d in res["reachable"]] == [("10.0.0.6", [22])]
+    assert res["identified"] == []
+
+
 def test_unidentified_host_carries_its_probe_profile():
     async def _profile(host, open_ports, timeout):
         return {"http_title": "iLO 5", "http_server": "HPE-iLO-Server/1.30"}
