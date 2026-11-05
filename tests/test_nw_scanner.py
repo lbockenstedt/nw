@@ -9,6 +9,8 @@ import os
 import sys
 import asyncio
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import nw_scanner  # noqa: E402
@@ -92,6 +94,13 @@ def make_snmp(descr_map):
             return {"text": d["text"], "hostname": d.get("hostname", "")}
         return {"text": d, "hostname": ""}
     return _snmp
+
+
+@pytest.fixture(autouse=True)
+def _no_live_profile_probe(monkeypatch):
+    async def _none(host, open_ports, timeout):
+        return {}
+    monkeypatch.setattr(nw_scanner, "_profile_probe", _none)
 
 
 CREDS = [{"name": "primary", "username": "admin", "password": "x", "snmp_community": "public"}]
@@ -306,3 +315,28 @@ def test_pinged_host_without_open_ports_still_gets_snmp():
     assert res["identified"][0]["method"] == "snmp"
     # Without the hint a host with no open port is never SNMP-probed.
     assert run(NwScanner(CREDS, **kw).scan(["10.0.0.9"]))["identified"] == []
+
+
+def test_unidentified_host_carries_its_probe_profile():
+    async def _profile(host, open_ports, timeout):
+        return {"http_title": "iLO 5", "http_server": "HPE-iLO-Server/1.30"}
+    scanner = NwScanner(
+        CREDS,
+        tcp_probe=make_probe({"10.0.0.7": {443}}),
+        ssh_identify=make_ssh({}),
+        snmp_identify=make_snmp({"10.0.0.7": "Integrated Lights-Out 5 2.72"}),
+        profile_probe=_profile,
+    )
+    dev = run(scanner.scan(["10.0.0.7"]))["reachable"][0]
+    assert dev["object_type"] is None
+    assert dev["profile"] == {"sys_descr": "Integrated Lights-Out 5 2.72",
+                              "http_title": "iLO 5", "http_server": "HPE-iLO-Server/1.30"}
+
+
+def test_parse_http_reads_server_realm_title_and_location():
+    raw = ("HTTP/1.1 401 Unauthorized\r\nServer: lighttpd\r\n"
+           'WWW-Authenticate: Basic realm="APC Management Card"\r\n'
+           "Location: /login.html\r\n\r\n<html><title> Rack\n PDU </title>")
+    assert nw_scanner._parse_http(raw) == {
+        "http_server": "lighttpd", "http_realm": "APC Management Card",
+        "location": "/login.html", "http_title": "Rack PDU"}
