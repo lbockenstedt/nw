@@ -621,3 +621,11 @@ def test_lldp_in_session_failure_matches_sibling_datums():
                 for name in ("get_arp", "get_mac_table", "get_interfaces",
                              "get_lldp_neighbors")}
     assert set(statuses.values()) == {"ERROR"}, statuses
+
+
+def test_ping_sweep_returns_only_answering_ips():
+    async def ping(ip, timeout):
+        return {"reachable": True if ip == "10.1.1.1" else False}
+    res = _run(_spoke_with([])._ping_sweep(
+        {"targets": ["10.1.1.1", "10.1.1.254", ""]}, ping=ping))
+    assert res == {"status": "SUCCESS", "probed": 2, "alive": ["10.1.1.1"]}

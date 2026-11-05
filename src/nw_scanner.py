@@ -242,8 +242,11 @@ class NwScanner:
                  tcp_probe: Callable = _tcp_probe,
                  ssh_identify: Callable = _ssh_identify,
                  snmp_identify: Callable = _snmp_identify,
-                 lldp_neighbors: Optional[Callable] = None):
-        """Initialize the network scanner with credentials, ports, timeouts, and probe hooks."""
+                 lldp_neighbors: Optional[Callable] = None,
+                 pinged: bool = False):
+        """Initialize the network scanner with credentials, ports, timeouts, and probe hooks.
+        ``pinged`` means every target already answered a ping, so it counts as
+        reachable and gets the SNMP attempt even with no open TCP port."""
         self.credentials = [c for c in (credentials or []) if isinstance(c, dict)]
         self.tcp_ports = tuple(tcp_ports or DEFAULT_TCP_PORTS)
         self.try_snmp = bool(try_snmp)
@@ -255,6 +258,7 @@ class NwScanner:
         self._ssh_identify = ssh_identify
         self._snmp_identify = snmp_identify
         self._lldp_neighbors = lldp_neighbors  # callable(host, cred) -> [ips]
+        self.pinged = bool(pinged)
 
     async def _probe_ports(self, host: str) -> List[int]:
         """Probe configured TCP ports concurrently on the host and return list of open ports."""
@@ -278,7 +282,7 @@ class NwScanner:
         except Exception:  # noqa: BLE001
             open_ports = []
         result["open_ports"] = open_ports
-        result["reachable"] = bool(open_ports)
+        result["reachable"] = bool(open_ports) or self.pinged
 
         banner = ""
         # SSH identify — try each credential until one logs in + classifies.
@@ -307,7 +311,7 @@ class NwScanner:
         # SNMP identify — try each candidate community. Only on hosts that answered
         # the TCP probe: UDP gives no cheap liveness signal, and timing out on every
         # dead address of a large sweep would take far longer than the sweep itself.
-        if self.try_snmp and result["object_type"] is None and open_ports:
+        if self.try_snmp and result["object_type"] is None and (open_ports or self.pinged):
             for cred in self.credentials:
                 community = cred.get("snmp_community") or cred.get("community")
                 if not community:
