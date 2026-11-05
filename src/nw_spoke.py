@@ -492,6 +492,9 @@ class NwSpoke(BaseSpoke):
             commands = (data or {}).get("commands", []) if isinstance(data, dict) else []
             return await self.engine.run_config(device_id, commands, tenant)
 
+        if normalized_cmd == "NW_PING_SWEEP":
+            return await self._ping_sweep(data or {})
+
         if normalized_cmd in ("NW_SCAN", "NW_DISCOVER"):
             # Fingerprint scan: the hub sends candidate target IPs + candidate
             # scan credentials (already overlaid from the vault) + options. The
@@ -545,6 +548,24 @@ class NwSpoke(BaseSpoke):
         return {"status": "ERROR",
                 "message": f"Command {command_type} not supported by nw module"}
 
+    async def _ping_sweep(self, data: Dict[str, Any], ping=None) -> Dict[str, Any]:
+        """NW_PING_SWEEP: one ICMP echo to each target IP (at most 2048, 64 at a
+        time). Returns ``{"status": "SUCCESS", "alive": [ips that answered]}``.
+        The hub uses it to find subnet gateways (.1 / .254)."""
+        from nw_engine import icmp_ping
+        ping = ping or icmp_ping
+        targets = [str(t).strip() for t in (data.get("targets") or []) if str(t).strip()][:2048]
+        sem = asyncio.Semaphore(64)
+
+        async def _one(ip):
+            async with sem:
+                res = await ping(ip, timeout=1.0)
+                return ip if res.get("reachable") is True else None
+
+        alive = [ip for ip in await asyncio.gather(*(_one(t) for t in targets)) if ip]
+        logger.info("NW_PING_SWEEP: %d/%d answered", len(alive), len(targets))
+        return {"status": "SUCCESS", "probed": len(targets), "alive": alive}
+
     async def _run_scan(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """Execute an NW_SCAN: build an :class:`NwScanner` from the pushed
         credentials + options and fingerprint the target IP list. Returns an
@@ -588,6 +609,7 @@ class NwSpoke(BaseSpoke):
                 tcp_timeout=float(opts.get("tcp_timeout") or 1.5),
                 target_timeout=float(opts.get("target_timeout") or 20.0),
                 lldp_neighbors=self._lldp_neighbors if crawl else None,
+                pinged=bool(opts.get("pinged", False)),
             )
             result = await scanner.scan(
                 targets,
