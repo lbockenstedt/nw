@@ -131,6 +131,88 @@ async def _tcp_probe(host: str, port: int, timeout: float) -> bool:
         return False
 
 
+_HTTP_PORTS: Tuple[Tuple[int, bool], ...] = ((443, True), (8443, True), (80, False), (8080, False))
+
+
+async def _read_ssh_banner(host: str, timeout: float) -> str:
+    """The server's SSH identification line (``SSH-2.0-…``), or ''."""
+    try:
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, 22), timeout)
+        try:
+            line = await asyncio.wait_for(reader.readline(), timeout)
+        finally:
+            writer.close()
+        return line.decode("utf-8", "replace").strip()[:200]
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+async def _http_get(host: str, port: int, tls: bool, path: str, timeout: float) -> str:
+    """Raw response head + first 16 KB of ``GET path`` (TLS unverified), or ''."""
+    import ssl
+    ctx = None
+    if tls:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port, ssl=ctx), timeout)
+        try:
+            writer.write(f"GET {path} HTTP/1.0\r\nHost: {host}\r\n"
+                         "User-Agent: lm-nw-scan\r\nConnection: close\r\n\r\n".encode())
+            await writer.drain()
+            data = await asyncio.wait_for(reader.read(16384), timeout)
+        finally:
+            writer.close()
+        return data.decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _parse_http(raw: str) -> Dict[str, str]:
+    """``http_server`` / ``http_realm`` / ``http_title`` / ``location`` of a raw response."""
+    head, _, body = raw.partition("\r\n\r\n")
+    out: Dict[str, str] = {}
+    for key, pattern in (("http_server", r"(?im)^server:\s*(.+)$"),
+                         ("http_realm", r'(?im)^www-authenticate:.*realm="?([^"\r\n]+)'),
+                         ("location", r"(?im)^location:\s*(\S+)")):
+        m = re.search(pattern, head)
+        if m:
+            out[key] = m.group(1).strip()[:200]
+    m = re.search(r"(?is)<title[^>]*>(.*?)</title>", body)
+    if m:
+        out["http_title"] = " ".join(m.group(1).split())[:200]
+    return out
+
+
+async def _profile_probe(host: str, open_ports: List[int], timeout: float) -> Dict[str, str]:
+    """What an unidentified host answers with: SSH banner + the first web
+    port's Server / title / auth realm (one same-host redirect followed).
+    The hub forwards this to NetBox, which guesses a role from it."""
+    timeout = min(timeout, 3.0)
+    profile: Dict[str, str] = {}
+    if 22 in open_ports:
+        banner = await _read_ssh_banner(host, timeout)
+        if banner:
+            profile["ssh_banner"] = banner
+    for port, tls in _HTTP_PORTS:
+        if port not in open_ports:
+            continue
+        info = _parse_http(await _http_get(host, port, tls, "/", timeout))
+        loc = info.pop("location", "")
+        if loc and "http_title" not in info:
+            path = re.sub(r"^https?://[^/]*", "", loc) or "/"
+            if path.startswith("/"):
+                more = _parse_http(await _http_get(host, port, tls, path, timeout))
+                more.pop("location", None)
+                info = {**more, **info}
+        if info:
+            profile.update(info)
+            break
+    return profile
+
+
 async def _ssh_identify(host: str, port: int, cred: Dict[str, Any],
                         timeout: float) -> Optional[Dict[str, Any]]:
     """Log in over SSH with ``cred`` and collect a version banner. Returns
@@ -243,6 +325,7 @@ class NwScanner:
                  ssh_identify: Callable = _ssh_identify,
                  snmp_identify: Callable = _snmp_identify,
                  lldp_neighbors: Optional[Callable] = None,
+                 profile_probe: Optional[Callable] = None,
                  pinged: bool = False):
         """Initialize the network scanner with credentials, ports, timeouts, and probe hooks.
         ``pinged`` means every target already answered a ping, so it counts as
@@ -258,6 +341,7 @@ class NwScanner:
         self._ssh_identify = ssh_identify
         self._snmp_identify = snmp_identify
         self._lldp_neighbors = lldp_neighbors  # callable(host, cred) -> [ips]
+        self._profile_probe = profile_probe or _profile_probe
         self.pinged = bool(pinged)
 
     async def _probe_ports(self, host: str) -> List[int]:
@@ -332,6 +416,7 @@ class NwScanner:
                                   os=_os_from_banner(descr))
                     return result
                 # Answered SNMP but isn't a platform we auto-add: still monitorable.
+                result["profile"] = {"sys_descr": " ".join(descr.split())[:300]}
                 result.update(snmp_ok=True, snmp_credential_id=cred.get("id"),
                               hostname=info.get("hostname") or result["hostname"],
                               os=result["os"] or _os_from_banner(descr))
@@ -344,6 +429,14 @@ class NwScanner:
             if ot:
                 result.update(object_type=ot, method="nmap",
                               os=_os_from_banner(svc))
+        if result["object_type"] is None and open_ports:
+            try:
+                extra = await asyncio.wait_for(
+                    self._profile_probe(host, open_ports, self.target_timeout), 10)
+            except Exception:  # noqa: BLE001
+                extra = {}
+            if extra:
+                result["profile"] = {**result.get("profile", {}), **extra}
         return result
 
     async def _probe_snmp(self, host: str, result: Dict[str, Any]) -> None:
