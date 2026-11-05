@@ -33,6 +33,7 @@ device_info ``{model,serial,firmware,interfaces_count}``.
 """
 # asyncio runs the blocking SNMP calls on worker threads and drives pysnmp's loop.
 import asyncio
+import concurrent.futures
 # Standard-library logging for transport messages.
 import logging
 # re parses MACs, firmware revisions and model names from text.
@@ -474,9 +475,15 @@ def parse_bridge_port_if(walk_pairs: List[Tuple[str, Any]]) -> Dict[int, int]:
 
 
 # ── High-level async gathers (driver calls these) ────────────────────────────
+# SNMP's own worker threads: a scan runs ~32 hosts at once and a silent host
+# holds a thread for timeout x (retries+1), so sharing the small default pool
+# (cpu+4) starved SNMP and every other role in the process.
+_SNMP_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=32, thread_name_prefix="snmp")
+
+
 async def _to_thread(fn, *args):
-    """Run a blocking function on a worker thread and await its result."""
-    return await asyncio.to_thread(fn, *args)
+    """Run a blocking function on an SNMP worker thread and await its result."""
+    return await asyncio.get_running_loop().run_in_executor(_SNMP_POOL, fn, *args)
 
 
 async def snmp_probe(session: SnmpSession) -> dict:
