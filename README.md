@@ -84,6 +84,7 @@ The spoke receives commands from the Lab Manager hub over WebSocket and executes
 | `NW_GET_VLANS` | `device_id`, `tenant` *(optional)* | Lists 802.1Q VLAN IDs and names configured on the switch. |
 | `NW_POLL` | `device_id`, `tenant` *(optional)* | Comprehensive multi-metric poll (probe, info, interfaces, ARP, and MAC table) in one pass. |
 | `NW_RUN_CONFIG` | `device_id`, `commands` | Stub handler returning not-implemented envelope (config push planned for phase 3). |
+| `NW_PING_SWEEP` | `targets` | Pings each IP once (≤2048) and returns the `alive` ones; used by the hub's gateway sweep. |
 | `NW_SCAN` / `NW_DISCOVER` | `targets`, `credentials`, `options` | Probes candidate IP addresses, fingerprinting manageable devices without modifying fleet. |
 | `INSTALL_CERT` | `identifier`, `fullchain`, `privkey` | Installs delivered SSL/TLS certificates onto the target device management interface. |
 
