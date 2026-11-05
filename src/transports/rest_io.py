@@ -8,10 +8,14 @@ overridable via the ``LM_NW_VERIFY_TLS`` env knob.
 JSON→row mappers are pure functions (testable without HTTP); the RestSession
 does the GETs and the driver calls the high-level gather functions.
 """
+# Standard-library logging for transport messages.
 import logging
+# os reads the TLS-verification env knob.
 import os
+# Type hints.
 from typing import Any, Dict, List
 
+# Named logger for REST transport messages.
 logger = logging.getLogger("NwRest")
 
 
@@ -20,6 +24,7 @@ class RestError(Exception):
 
 
 def _verify_tls() -> bool:
+    """True when LM_NW_VERIFY_TLS turns certificate verification on (default off)."""
     return str(os.environ.get("LM_NW_VERIFY_TLS", "")).strip().lower() in (
         "1", "true", "yes", "on")
 
@@ -29,78 +34,108 @@ class RestSession:
     manager, or call connect()/close()."""
 
     def __init__(self, device: Dict[str, Any], timeout: float = 10.0):
+        """Read address, credentials and type from the device dict; no network I/O yet."""
+        # Tolerate a missing device dict.
         d = device or {}
+        # Connection details and credentials from the fleet config.
         self.host = str(d.get("address") or "").strip()
         self.port = int(d.get("port") or 0)
         self.username = str(d.get("username") or "").strip()
         self.password = str(d.get("password") or "")
         self.api_token = str(d.get("api_token") or "")
         self.object_type = str(d.get("object_type") or "").strip()
+        # Without an address there is nothing to talk to.
         if not self.host:
             raise RestError("device address not configured")
+        # Always HTTPS; add the port only when one was configured.
         scheme = "https"
         base = f"{scheme}://{self.host}" + (f":{self.port}" if self.port else "")
         self.base = base.rstrip("/")
+        # Request timeout (seconds); the httpx client is created in connect().
         self.timeout = timeout
         self._client = None
 
     async def __aenter__(self):
+        """Open the client when entering ``async with``."""
         await self.connect()
         return self
 
     async def __aexit__(self, *exc):
+        """Close the client when leaving ``async with``."""
         await self.close()
 
     async def connect(self) -> None:
+        """Create the httpx client with token or basic auth."""
+        # httpx imported lazily so the module loads without it installed.
         import httpx
+        # Extra headers and basic-auth tuple, filled in below.
         headers = {}
         auth = None
+        # An API token takes precedence and is sent as a bearer header.
         if self.api_token:
             headers["Authorization"] = f"Bearer {self.api_token}"
         elif self.username:
+            # Otherwise use username/password basic auth.
             auth = (self.username, self.password)
         if self.object_type == "cx_switch" and self.username and not self.api_token:
             # AOS-CX RESTv1 accepts basic auth; label the session.
             headers.setdefault("Accept", "application/json")
+        # Client bound to the device's base URL; TLS verification per the env knob.
         self._client = httpx.AsyncClient(base_url=self.base, auth=auth,
                                          headers=headers, timeout=self.timeout,
                                          verify=_verify_tls())
 
     async def close(self) -> None:
+        """Close the client if one is open."""
         if self._client:
             await self._client.aclose()
             self._client = None
 
     async def get(self, path: str) -> Any:
+        """GET ``path`` and return parsed JSON; raise RestError on any failure."""
+        # Connect lazily on first use.
         if not self._client:
             await self.connect()
+        # Wrap every failure (network, HTTP status, bad JSON) in RestError.
         try:
+            # Send the request; non-2xx raises.
             r = await self._client.get(path)
             r.raise_for_status()
             return r.json()
         except Exception as e:
+            # Include method, path and host so the error is easy to trace.
             raise RestError(f"GET {path} on {self.host}: {e}")
 
     async def post(self, path: str, json: Any = None) -> Any:
+        """POST ``json`` to ``path``; return parsed JSON or None for an empty body."""
+        # Connect lazily on first use.
         if not self._client:
             await self.connect()
+        # Wrap every failure in RestError.
         try:
+            # Send the request; non-2xx raises.
             r = await self._client.post(path, json=json)
             r.raise_for_status()
             # Tolerate empty success bodies (204 No Content) — r.json() on an
             # empty body raises, so return None for a contentless 2xx.
             return r.json() if r.content else None
         except Exception as e:
+            # Include method, path and host so the error is easy to trace.
             raise RestError(f"POST {path} on {self.host}: {e}")
 
     async def put(self, path: str, json: Any = None) -> Any:
+        """PUT ``json`` to ``path``; return parsed JSON or None for an empty body."""
+        # Connect lazily on first use.
         if not self._client:
             await self.connect()
+        # Wrap every failure in RestError.
         try:
+            # Send; non-2xx raises; an empty 2xx body returns None.
             r = await self._client.put(path, json=json)
             r.raise_for_status()
             return r.json() if r.content else None
         except Exception as e:
+            # Include method, path and host so the error is easy to trace.
             raise RestError(f"PUT {path} on {self.host}: {e}")
 
 
@@ -108,18 +143,23 @@ class RestSession:
 def _elements(payload: Any) -> List[dict]:
     """Normalize a REST list payload to a list of dicts. AOS-CX RESTv1 returns
     a bare JSON array; RESTv10 returns {collection: {elements: [...]}}."""
+    # Bare array (RESTv1): keep the dict items.
     if isinstance(payload, list):
         return [x for x in payload if isinstance(x, dict)]
+    # Wrapped collection (RESTv10): dig out the "elements" list.
     if isinstance(payload, dict):
         coll = payload.get("collection") or payload.get("elements") or payload
         if isinstance(coll, dict):
             els = coll.get("elements")
             if isinstance(els, list):
                 return [x for x in els if isinstance(x, dict)]
+    # Anything else: no rows.
     return []
 
 
 def map_arp_cx(payload: Any) -> List[dict]:
+    """Map an AOS-CX ARP payload to ``[{ip, mac, interface}]`` rows."""
+    # Accept either field-name spelling the API versions use.
     rows = []
     for e in _elements(payload):
         rows.append({
@@ -132,16 +172,21 @@ def map_arp_cx(payload: Any) -> List[dict]:
 
 
 def map_interfaces_cx(payload: Any) -> List[dict]:
+    """Map an AOS-CX interfaces payload to ``[{name, ip, mac, vlan, status, speed}]``."""
+    # One row per named interface.
     rows = []
     for e in _elements(payload):
         name = str(e.get("name") or e.get("if_name") or "").strip()
+        # Unnamed entries are skipped.
         if not name:
             continue
+        # Speed as an integer; non-numeric becomes 0.
         speed = e.get("speed") or e.get("link_speed") or 0
         try:
             speed = int(speed)
         except (TypeError, ValueError):
             speed = 0
+        # Normalise the remaining fields; any "up"-like state counts as up.
         rows.append({
             "name": name,
             "ip": str(e.get("ip4_address") or e.get("ip_address") or "").strip(),
@@ -155,6 +200,8 @@ def map_interfaces_cx(payload: Any) -> List[dict]:
 
 
 def map_system_cx(payload: Any) -> dict:
+    """Map an AOS-CX system payload to model/serial/firmware/port count."""
+    # A non-dict payload maps to empty values.
     p = payload if isinstance(payload, dict) else {}
     return {
         "model": str(p.get("model_name") or p.get("model") or "").strip(),
@@ -166,6 +213,8 @@ def map_system_cx(payload: Any) -> dict:
 
 
 def map_arp_gateway(payload: Any) -> List[dict]:
+    """Map a gateway ARP payload to ``[{ip, mac, interface}]`` rows."""
+    # Accept either field-name spelling.
     rows = []
     for e in _elements(payload):
         rows.append({
@@ -177,6 +226,8 @@ def map_arp_gateway(payload: Any) -> List[dict]:
 
 
 def map_mac_gateway(payload: Any) -> List[dict]:
+    """Map a gateway MAC-table payload to ``[{mac, vlan, interface}]`` rows."""
+    # Accept either field-name spelling.
     rows = []
     for e in _elements(payload):
         rows.append({
@@ -188,10 +239,13 @@ def map_mac_gateway(payload: Any) -> List[dict]:
 
 
 def map_interfaces_gateway(payload: Any) -> List[dict]:
+    """Gateway interface payloads have the same shape as AOS-CX: reuse that mapper."""
     return map_interfaces_cx(payload)
 
 
 def map_system_gateway(payload: Any) -> dict:
+    """Map a gateway system payload to model/serial/firmware/interface count."""
+    # A non-dict payload maps to empty values.
     p = payload if isinstance(payload, dict) else {}
     return {
         "model": str(p.get("model") or p.get("device_model") or "").strip(),
@@ -206,6 +260,7 @@ def map_system_gateway(payload: Any) -> dict:
 async def rest_get_device_info(session: RestSession, object_type: str) -> dict:
     """GET the vendor system endpoint and map to
     ``{model, serial, firmware, interfaces_count}``."""
+    # Pick the vendor endpoint and its mapper by device type, then GET and map.
     path = "/rest/v1/system" if object_type == "cx_switch" else "/api/system/info"
     mapper = map_system_cx if object_type == "cx_switch" else map_system_gateway
     return mapper(await session.get(path))
@@ -213,6 +268,7 @@ async def rest_get_device_info(session: RestSession, object_type: str) -> dict:
 
 async def rest_get_arp(session: RestSession, object_type: str) -> List[dict]:
     """GET the vendor ARP endpoint and map to ``[{ip, mac, interface}]``."""
+    # Pick the vendor endpoint and its mapper by device type, then GET and map.
     path = "/rest/v1/system/arp" if object_type == "cx_switch" else "/api/arp"
     mapper = map_arp_cx if object_type == "cx_switch" else map_arp_gateway
     return mapper(await session.get(path))
@@ -221,6 +277,7 @@ async def rest_get_arp(session: RestSession, object_type: str) -> List[dict]:
 async def rest_get_mac_table(session: RestSession, object_type: str) -> List[dict]:
     """GET the vendor MAC-table endpoint and map to
     ``[{mac, vlan, interface}]``."""
+    # Pick the vendor endpoint by device type.
     path = "/rest/v1/system/mac-table" if object_type == "cx_switch" else "/api/mac-table"
     # AOS-CX mac-table mapper ~ gateway mac mapper.
     return map_mac_gateway(await session.get(path))
@@ -229,6 +286,7 @@ async def rest_get_mac_table(session: RestSession, object_type: str) -> List[dic
 async def rest_get_interfaces(session: RestSession, object_type: str) -> List[dict]:
     """GET the vendor interfaces endpoint and map to
     ``[{name, ip, mac, vlan, status, speed}]``."""
+    # Pick the vendor endpoint and its mapper by device type, then GET and map.
     path = "/rest/v1/interfaces" if object_type == "cx_switch" else "/api/interfaces"
     mapper = map_interfaces_cx if object_type == "cx_switch" else map_interfaces_gateway
     return mapper(await session.get(path))
@@ -250,12 +308,17 @@ def _cx_cert_name(domain: str) -> str:
     allowed characters, so everything outside ``[a-z0-9-]`` becomes ``-``;
     a wildcard leading label (``*.``) becomes ``wild``; an empty domain falls
     back to ``cert``. Capped at 63 chars (a typical name ceiling)."""
+    # re is imported lazily; only needed here.
     import re
+    # Lower-case and turn a wildcard "*" into "wild".
     base = (domain or "cert").strip().lower().replace("*", "wild")
+    # Replace disallowed characters, squeeze repeated dashes, trim edge dashes.
     base = re.sub(r"[^a-z0-9-]", "-", base)
     base = re.sub(r"-+", "-", base).strip("-")
+    # Nothing left: use a generic name.
     if not base:
         base = "cert"
+    # Prefix and cap the length.
     return f"lm-le-{base}"[:63]
 
 
@@ -267,20 +330,27 @@ async def _cx_v10_prefix(session: "RestSession") -> str:
     parse ``10.XX`` out of ``GET /rest/v1/system``'s ``firmware_version``
     (``RL.10.13.0001`` → ``v10_13``). Falls back to ``v10_09`` (broadly
     supported across current AOS-CX) when neither yields a version."""
+    # os/re imported lazily; only needed here.
     import os
     import re
+    # Explicit override wins.
     override = os.getenv("LM_NW_CX_REST_VER", "").strip().lstrip("/")
     if override:
         return override
+    # Firmware lookup is best-effort.
     try:
+        # Read the firmware version from the v1 system endpoint.
         sysinfo = await session.get("/rest/v1/system")
         fw = str((sysinfo or {}).get("firmware_version")
                  or (sysinfo or {}).get("os_version") or "")
+        # "RL.10.13.0001" -> minor version 13 -> "v10_13".
         m = re.search(r"10\.(\d{1,2})", fw)
         if m:
             return f"v10_{int(m.group(1)):02d}"
     except Exception:
+        # Could not read the firmware: use the default below.
         pass
+    # Widely supported default.
     return "v10_09"
 
 
@@ -304,13 +374,16 @@ async def rest_install_cert(session: "RestSession", object_type: str,
 
     Returns ``{cert_name, service, rest_prefix}``. Raises ``RestError`` with
     the step + host on any failure (the driver wraps it in an ERROR envelope)."""
+    # Only AOS-CX is supported.
     if object_type != "cx_switch":
         raise RestError(f"REST cert install not implemented for {object_type}")
+    # Reject obviously invalid PEM input before talking to the switch.
     if not fullchain or "BEGIN CERTIFICATE" not in fullchain:
         raise RestError("invalid or empty fullchain PEM")
     if not privkey or "PRIVATE KEY" not in privkey:
         raise RestError("invalid or empty privkey PEM")
 
+    # REST version path and the certificate name to install under.
     prefix = await _cx_v10_prefix(session)
     cert_name = _cx_cert_name(domain)
 
@@ -321,15 +394,19 @@ async def rest_install_cert(session: "RestSession", object_type: str,
 
     # 2. Bind it to the https-server via the system configuration.
     syscfg = await session.get(f"/rest/{prefix}/system?selector=configuration")
+    # The configuration must be a JSON object.
     if not isinstance(syscfg, dict):
         raise RestError("system configuration GET did not return a JSON object")
+    # It must contain the certificate_association map we need to edit.
     assoc = syscfg.get("certificate_association")
     if not isinstance(assoc, dict):
         raise RestError(
             "system configuration has no certificate_association object "
             "(cannot bind https-server)")
+    # Point the HTTPS server at the new cert and write the config back.
     assoc["https-server"] = cert_name
     await session.put(f"/rest/{prefix}/system", json=syscfg)
 
+    # Details for the caller's result.
     return {"cert_name": cert_name, "service": "https-server",
             "rest_prefix": prefix}
