@@ -535,7 +535,17 @@ class SnmpDriver(NwDriver):
         from transports import snmp_io
         # Any failure becomes an ERROR envelope.
         try:
-            return self._ok(await snmp_io.snmp_get_device_info(self._session()))
+            s = self._session()
+            info = await snmp_io.snmp_get_device_info(s)
+            # A management controller has no ENTITY-MIB: take the server serial
+            # from the vendor MIB instead.
+            if self.object_type == "ipmi" and not info.get("serial"):
+                try:
+                    info["serial"] = str(await snmp_io._to_thread(
+                        s.get, snmp_io.HPE_SYS_SERIAL) or "").strip()
+                except Exception:  # noqa: BLE001 — identity extras are best-effort
+                    pass
+            return self._ok(info)
         except Exception as e:
             return _err(f"snmp device info {self.address}: {e}")
 
@@ -546,6 +556,11 @@ class SnmpDriver(NwDriver):
         # Any failure becomes an ERROR envelope.
         try:
             rows = await snmp_io.snmp_get_interfaces(self._session())
+            # A controller that serves no ifTable still has its one management
+            # port, reachable at the polled address.
+            if not rows and self.object_type == "ipmi":
+                rows = [{"name": "mgmt", "ip": self.address, "mac": "", "vlan": "",
+                         "status": "up", "speed": 0}]
             return self._ok(rows)
         except Exception as e:
             return _err(f"snmp interfaces {self.address}: {e}")
