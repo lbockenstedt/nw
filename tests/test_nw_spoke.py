@@ -629,3 +629,26 @@ def test_ping_sweep_returns_only_answering_ips():
     res = _run(_spoke_with([])._ping_sweep(
         {"targets": ["10.1.1.1", "10.1.1.254", ""]}, ping=ping))
     assert res == {"status": "SUCCESS", "probed": 2, "alive": ["10.1.1.1"]}
+
+
+def test_ipmi_snmp_driver_falls_back_when_the_controller_serves_no_iftable(monkeypatch):
+    from transports import snmp_io
+
+    class _S:
+        def get(self, oid):
+            return "SN123" if oid == snmp_io.HPE_SYS_SERIAL else ""
+
+    async def info(_s):
+        return {"model": "iLO 5", "serial": "", "firmware": "", "hostname": "h",
+                "mac": "", "interfaces_count": 0}
+
+    async def no_ifaces(_s):
+        return []
+
+    monkeypatch.setattr(snmp_io, "snmp_get_device_info", info)
+    monkeypatch.setattr(snmp_io, "snmp_get_interfaces", no_ifaces)
+    d = build_driver({"id": "d", "object_type": "ipmi", "address": "10.1.1.5"})
+    monkeypatch.setattr(d, "_session", lambda: _S())
+    assert _run(d.get_device_info())["data"]["serial"] == "SN123"
+    rows = _run(d.get_interfaces())["data"]
+    assert rows[0]["ip"] == "10.1.1.5" and rows[0]["status"] == "up"
