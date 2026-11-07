@@ -537,28 +537,30 @@ class SnmpDriver(NwDriver):
         try:
             s = self._session()
             info = await snmp_io.snmp_get_device_info(s)
-            # A management controller has no ENTITY-MIB: take the server serial
-            # from the vendor MIB instead.
-            if self.object_type == "ipmi" and not info.get("serial"):
-                try:
-                    info["serial"] = str(await snmp_io._to_thread(
-                        s.get, snmp_io.HPE_SYS_SERIAL) or "").strip()
-                except Exception:  # noqa: BLE001 — identity extras are best-effort
-                    pass
-            # The controller's own model says nothing about the server's rack
-            # height, so also report the host server's model.
             if self.object_type == "ipmi":
-                for oid in snmp_io.HOST_MODEL_OIDS:
-                    try:
-                        val = str(await snmp_io._to_thread(s.get, oid) or "").strip()
-                    except Exception:  # noqa: BLE001 — best-effort
-                        continue
-                    if val:
-                        info["host_model"] = val
-                        break
+                await self._add_host_identity(s, info)
             return self._ok(info)
         except Exception as e:
             return _err(f"snmp device info {self.address}: {e}")
+
+    async def _add_host_identity(self, session, info: Dict[str, Any]) -> None:
+        """A management controller has no ENTITY-MIB, and its own model says
+        nothing about the server's rack height: fill the host server's serial and
+        model from the vendor MIBs, then from the controller's web page."""
+        from transports import snmp_io
+        from nw_scanner import bmc_web_identity
+        for key, oids in (("serial", snmp_io.BMC_SERIAL_OIDS),
+                          ("host_model", snmp_io.BMC_HOST_MODEL_OIDS)):
+            for oid in oids:
+                if info.get(key):
+                    break
+                try:
+                    info[key] = str(await snmp_io._to_thread(session.get, oid) or "").strip()
+                except Exception:  # noqa: BLE001 — identity extras are best-effort
+                    pass
+        if not (info.get("serial") and info.get("host_model") and info.get("mac")):
+            for k, v in (await bmc_web_identity(self.address)).items():
+                info[k] = info.get(k) or v
 
     async def get_interfaces(self) -> Dict[str, Any]:
         """Walk ifTable/ipAdEntTable into interface rows."""
