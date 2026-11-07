@@ -334,7 +334,7 @@ def test_unknown_command_errors():
 # ── Driver registry: object_type → default transport + driver class ─────────
 def test_driver_registry_default_transports():
     assert _DEFAULT_TRANSPORT == {"aos_switch": "ssh", "cx_switch": "rest",
-                                  "ex_switch": "ssh", "gateway": "rest"}
+                                  "ex_switch": "ssh", "gateway": "rest", "ipmi": "snmp"}
 
 
 def test_build_driver_picks_by_transport_override():

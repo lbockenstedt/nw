@@ -70,6 +70,12 @@ _VENDOR_COMMANDS: Dict[str, Dict[str, str]] = {
         "info": "GET /api/system/info",
         "if":   "GET /api/interfaces",
     },
+    "ipmi": {        # Out-of-band BMCs: iLO, iDRAC, IPMI, AMT (SNMP MIB-II)
+        "mac":  "",
+        "arp":  "",
+        "info": "SNMP sysDescr/sysName",
+        "if":   "SNMP ifTable",
+    },
 }
 
 # Per object_type default transport when the device says ``transport=auto`` or
@@ -79,6 +85,7 @@ _DEFAULT_TRANSPORT: Dict[str, str] = {
     "cx_switch":  "rest",
     "ex_switch":  "ssh",
     "gateway":    "rest",
+    "ipmi":       "snmp",
 }
 
 # Accepted transport values and device families.
