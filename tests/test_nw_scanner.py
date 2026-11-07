@@ -402,3 +402,23 @@ def test_bmc_web_identity_reads_hpe_xmldata_serial_model_and_mac(monkeypatch):
 
     monkeypatch.setattr(nw_scanner, "_http_get", none)
     assert run(nw_scanner.bmc_web_identity("10.0.0.1")) == {}
+
+
+def test_snmp_identify_retries_a_dropped_sysname(monkeypatch):
+    from transports import snmp_io
+    answers = {snmp_io.SYS_DESCR: ["Aruba CX"], snmp_io.SYS_NAME: [TimeoutError(), "tor-1"],
+               snmp_io.SYS_OBJECT_ID: [""]}
+
+    class FakeSession:
+        def __init__(self, *a, **k):
+            pass
+
+        def get(self, oid):
+            v = answers[oid].pop(0)
+            if isinstance(v, Exception):
+                raise v
+            return v
+
+    monkeypatch.setattr(snmp_io, "SnmpSession", FakeSession)
+    info = run(nw_scanner._snmp_identify("10.0.0.1", "public", 1.0))
+    assert info["hostname"] == "tor-1"
