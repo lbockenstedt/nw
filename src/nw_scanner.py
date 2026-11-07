@@ -12,7 +12,7 @@ each target and tries to IDENTIFY it as a manageable network device:
      match the description to a vendor family.
 
 Each reachable target is classified into one of the NW ``object_type`` families
-(``aos_switch`` / ``cx_switch`` / ``ex_switch`` / ``gateway``) or left
+(``aos_switch`` / ``cx_switch`` / ``ex_switch`` / ``gateway`` / ``ipmi``) or left
 ``None`` (unknown → not manageable hardware, reported but never auto-added).
 
 Pure-stdlib + asyncio by default, matching the rest of the NW module's
@@ -58,7 +58,7 @@ MAX_TARGETS = 4096
 MAX_CRAWL_DEPTH = 3
 
 # object_type families the scanner can identify (the manageable ones).
-_MANAGEABLE = ("aos_switch", "cx_switch", "ex_switch", "gateway")
+_MANAGEABLE = ("aos_switch", "cx_switch", "ex_switch", "gateway", "ipmi")
 
 
 # ── Vendor classification ────────────────────────────────────────────────────
@@ -81,6 +81,13 @@ def classify_platform(text: str) -> Optional[str]:
             or re.search(r"\(model:\s*(?:ap-)?\d{3}", t)
             or "instant access point" in t):
         return None
+    # Out-of-band management controllers (iLO, iDRAC, IPMI/BMC, AMT, ...). Checked
+    # before the HPE/Dell vendor matches below: an iLO's sysDescr says "Hewlett
+    # Packard Enterprise", which would otherwise be taken for an AOS switch.
+    if re.search(r"integrated lights[- ]out|\bi?lo\s?\d?\b|idrac|integrated dell remote"
+                 r"|\bipmi\b|\bbmc\b|baseboard management|\bamt\b|\bimm2?\b"
+                 r"|xclarity controller|lights[- ]out", t):
+        return "ipmi"
     # Aruba AOS-CX (REST-first switch) — check before generic "aruba".
     if ("aos-cx" in t or "arubaos-cx" in t
             or ("aruba" in t and re.search(r"\bcx\b", t))):
