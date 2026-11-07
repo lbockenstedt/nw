@@ -636,7 +636,8 @@ def test_ipmi_snmp_driver_falls_back_when_the_controller_serves_no_iftable(monke
 
     class _S:
         def get(self, oid):
-            return {snmp_io.BMC_SERIAL_OIDS[1]: "SN123",
+            return {snmp_io.BMC_SERIAL_OIDS[0]: "No Such Object currently exists at this OID",
+                    snmp_io.BMC_SERIAL_OIDS[1]: "SN123",
                     snmp_io.BMC_HOST_MODEL_OIDS[1]: "PowerEdge R640"}.get(oid, "")
 
     async def info(_s):
