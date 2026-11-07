@@ -48,6 +48,7 @@ logger = logging.getLogger("NwSnmp")
 # SNMPv2-MIB scalars: system description, hostname, uptime; IF-MIB interface count.
 SYS_DESCR = "1.3.6.1.2.1.1.1.0"
 SYS_NAME = "1.3.6.1.2.1.1.5.0"
+SYS_OBJECT_ID = "1.3.6.1.2.1.1.2.0"
 SYS_UPTIME = "1.3.6.1.2.1.1.3.0"
 IF_NUMBER = "1.3.6.1.2.1.2.1.0"
 # BRIDGE-MIB dot1dBaseBridgeAddress (chassis base MAC).
