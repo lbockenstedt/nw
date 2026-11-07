@@ -246,6 +246,37 @@ def _parse_http(raw: str) -> Dict[str, str]:
     return out
 
 
+async def _hpe_xmldata(host: str, timeout: float) -> Dict[str, str]:
+    """HPE iLO 2-5 serve ``/xmldata?item=all`` unauthenticated: the server's
+    serial (SBSN) and model (SPN) and, as the first NIC, the iLO's own MAC."""
+    raw = await _http_get(host, 443, True, "/xmldata?item=all", timeout)
+    if "<RIMP>" not in raw:
+        return {}
+    out: Dict[str, str] = {}
+    for key, tag in (("serial", "SBSN"), ("host_model", "SPN")):
+        m = re.search(rf"<{tag}>\s*([^<]*?)\s*</{tag}>", raw)
+        if m and m.group(1):
+            out[key] = m.group(1)
+    m = re.search(r"<MACADDR>\s*([0-9A-Fa-f:.-]+)\s*</MACADDR>", raw)
+    if m:
+        out["mac"] = m.group(1).lower().replace("-", ":")
+    return out
+
+
+# Vendor web pages that identify a management controller's host without a
+# login. Each takes (host, timeout) and returns {serial, host_model, mac} or {}.
+BMC_WEB_PROBES = (_hpe_xmldata,)
+
+
+async def bmc_web_identity(host: str, timeout: float = 5.0) -> Dict[str, str]:
+    """First BMC web probe that recognises the controller."""
+    for probe in BMC_WEB_PROBES:
+        found = await probe(host, timeout)
+        if found:
+            return found
+    return {}
+
+
 async def _profile_probe(host: str, open_ports: List[int], timeout: float) -> Dict[str, str]:
     """What an unidentified host answers with: SSH banner + the first web
     port's Server / title / auth realm (one same-host redirect followed).
