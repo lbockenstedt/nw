@@ -53,11 +53,17 @@ SYS_UPTIME = "1.3.6.1.2.1.1.3.0"
 IF_NUMBER = "1.3.6.1.2.1.2.1.0"
 # BRIDGE-MIB dot1dBaseBridgeAddress (chassis base MAC).
 BRIDGE_BASE_MAC = "1.3.6.1.2.1.17.1.1.0"
-# HPE CPQSINFO-MIB cpqSiSysSerialNum: an iLO serves the host server's serial here
-# when it has no ENTITY-MIB.
-HPE_SYS_SERIAL = "1.3.6.1.4.1.232.2.2.2.1.0"
-# Host server model: HPE cpqSiProductName, Dell DELL-RAC systemModelName.
-HOST_MODEL_OIDS = ("1.3.6.1.4.1.232.2.2.4.2.0", "1.3.6.1.4.1.674.10892.5.1.3.12.0")
+# Management controllers (iLO, iDRAC, ...) have no ENTITY-MIB but serve the host
+# server's identity from a vendor MIB. Tried in order; the first value wins.
+# Add a vendor by appending its OIDs.
+BMC_SERIAL_OIDS = (
+    "1.3.6.1.4.1.232.2.2.2.1.0",        # HPE cpqSiSysSerialNum
+    "1.3.6.1.4.1.674.10892.5.1.3.2.0",  # Dell systemServiceTag
+)
+BMC_HOST_MODEL_OIDS = (
+    "1.3.6.1.4.1.232.2.2.4.2.0",        # HPE cpqSiProductName
+    "1.3.6.1.4.1.674.10892.5.1.3.12.0", # Dell systemModelName
+)
 # ENTITY-MIB entPhysicalSerialNum / entPhysicalModelName columns.
 ENT_SERIAL_PREFIX = "1.3.6.1.2.1.47.1.1.1.1.11"
 ENT_MODEL_PREFIX = "1.3.6.1.2.1.47.1.1.1.1.13"
