@@ -45,6 +45,28 @@ def test_classify_ipmi_before_vendor_matches():
     assert classify_platform("Aruba JL256A 2930F, PL.16.10") == "aos_switch"
 
 
+def test_classify_snmp_ilo_by_oid_or_name():
+    from nw_scanner import classify_snmp
+    assert classify_snmp("Linux", "x", "1.3.6.1.4.1.232.9.4.10") == "ipmi"
+    assert classify_snmp("Hewlett Packard Enterprise", "", ".1.3.6.1.4.1.232.9.4.10") == "ipmi"
+    assert classify_snmp("generic agent", "mipbe-ssplm-n31-ilo-tnas.mip.example.com") == "ipmi"
+    assert classify_snmp("hpiLO-5") == "ipmi"
+    assert classify_snmp("Aruba JL256A 2930F", "silo-sw1") == "aos_switch"
+    assert classify_snmp("generic agent", "pilot-box") is None
+
+
+def test_scan_snmp_identifies_ilo_with_generic_descr():
+    scanner = NwScanner(
+        CREDS,
+        tcp_probe=make_probe({"10.0.0.9": {22, 443, 80}}),
+        ssh_identify=make_ssh({}),
+        snmp_identify=make_snmp({"10.0.0.9": {"text": "Some agent", "community": "public",
+                                              "hostname": "srv-ilo", "oid": ""}}),
+    )
+    dev = run(scanner.scan(["10.0.0.9"]))["identified"][0]
+    assert dev["object_type"] == "ipmi" and dev["method"] == "snmp"
+
+
 def test_classify_access_point_is_not_manageable():
     ap = ("Aruba Operating System Software. ArubaOS (MODEL: 515), Version 10.4.0.0 "
           "(c) Copyright 2023 Hewlett Packard Enterprise Development LP. "
@@ -98,7 +120,7 @@ def make_snmp(descr_map):
         if isinstance(d, dict):
             if community != d.get("community"):
                 return None
-            return {"text": d["text"], "hostname": d.get("hostname", "")}
+            return {"text": d["text"], "hostname": d.get("hostname", ""), "oid": d.get("oid", "")}
         return {"text": d, "hostname": ""}
     return _snmp
 
