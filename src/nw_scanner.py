@@ -62,6 +62,28 @@ _MANAGEABLE = ("aos_switch", "cx_switch", "ex_switch", "gateway", "ipmi")
 
 
 # ── Vendor classification ────────────────────────────────────────────────────
+# sysObjectID prefixes of out-of-band controllers: HPE iLO (enterprise 232, agents
+# 9.4 = iLO), Dell iDRAC (674.10892), Supermicro IPMI (10876), Lenovo IMM/XCC (19046).
+_IPMI_OID_PREFIXES = ("1.3.6.1.4.1.232.9.4", "1.3.6.1.4.1.674.10892", "1.3.6.1.4.1.10876",
+                      "1.3.6.1.4.1.19046")
+# A hostname that names a management controller (``host-ilo-1``, ``srv-idrac``).
+_IPMI_NAME_RE = re.compile(r"(?<![a-z0-9])(?:i?lo\d?|idrac\d?|ipmi|bmc|imm2?|xcc)(?![a-z0-9])")
+
+
+def classify_snmp(descr: str, name: str = "", oid: str = "") -> Optional[str]:
+    """Classify an SNMP responder from sysDescr, sysName and sysObjectID. A
+    controller's sysDescr is often terse or generic, so its sysObjectID and
+    (when sysDescr matches nothing) its sysName also identify it."""
+    # Controller OIDs are unambiguous and win over the vendor text.
+    if str(oid or "").lstrip(".").startswith(_IPMI_OID_PREFIXES):
+        return "ipmi"
+    ot = classify_platform(descr)
+    # An unclassified host named like a controller is one.
+    if ot is None and _IPMI_NAME_RE.search(str(name or "").lower()):
+        return "ipmi"
+    return ot
+
+
 def classify_platform(text: str) -> Optional[str]:
     """Best-effort map a version banner / sysDescr / nmap service string to one
     of the NW ``object_type`` families, or ``None`` when it doesn't look like a
@@ -84,7 +106,7 @@ def classify_platform(text: str) -> Optional[str]:
     # Out-of-band management controllers (iLO, iDRAC, IPMI/BMC, AMT, ...). Checked
     # before the HPE/Dell vendor matches below: an iLO's sysDescr says "Hewlett
     # Packard Enterprise", which would otherwise be taken for an AOS switch.
-    if re.search(r"integrated lights[- ]out|\bi?lo\s?\d?\b|idrac|integrated dell remote"
+    if re.search(r"integrated lights[- ]out|\bi?lo\s?\d?\b|\bhpilo|idrac|integrated dell remote"
                  r"|\bipmi\b|\bbmc\b|baseboard management|\bamt\b|\bimm2?\b"
                  r"|xclarity controller|lights[- ]out", t):
         return "ipmi"
@@ -335,15 +357,21 @@ async def _snmp_identify(host: str, community: str,
             snmp_io._to_thread(session.get, snmp_io.SYS_DESCR), timeout=timeout)
         if not descr:
             return None
-        # sysName is optional.
-        name = None
+        # sysName and sysObjectID are optional.
+        name = oid = None
         try:
             name = await asyncio.wait_for(
                 snmp_io._to_thread(session.get, snmp_io.SYS_NAME), timeout=timeout)
         except Exception:  # noqa: BLE001
             pass
-        # sysDescr text and the hostname.
-        return {"text": str(descr), "hostname": str(name or "").strip()}
+        try:
+            oid = await asyncio.wait_for(
+                snmp_io._to_thread(session.get, snmp_io.SYS_OBJECT_ID), timeout=timeout)
+        except Exception:  # noqa: BLE001
+            pass
+        # sysDescr text, the hostname and the sysObjectID.
+        return {"text": str(descr), "hostname": str(name or "").strip(),
+                "oid": str(oid or "").strip()}
     except Exception:  # noqa: BLE001
         # Any failure: not identified.
         return None
@@ -507,7 +535,7 @@ class NwScanner:
                 descr = info.get("text") or ""
                 banner = banner or descr
                 result["reachable"] = True
-                ot = classify_platform(descr)
+                ot = classify_snmp(descr, info.get("hostname") or "", info.get("oid") or "")
                 # Identified via SNMP: record it and finish.
                 if ot:
                     result.update(object_type=ot, method="snmp", snmp_ok=True,
