@@ -38,6 +38,13 @@ def test_classify_gateway():
     assert classify_platform("Aruba Mobility Controller") == "gateway"
 
 
+def test_classify_ipmi_before_vendor_matches():
+    assert classify_platform("Integrated Lights-Out 5 (Hewlett Packard Enterprise)") == "ipmi"
+    assert classify_platform("iDRAC9 Dell Inc.") == "ipmi"
+    assert classify_platform("Supermicro IPMI BMC") == "ipmi"
+    assert classify_platform("Aruba JL256A 2930F, PL.16.10") == "aos_switch"
+
+
 def test_classify_access_point_is_not_manageable():
     ap = ("Aruba Operating System Software. ArubaOS (MODEL: 515), Version 10.4.0.0 "
           "(c) Copyright 2023 Hewlett Packard Enterprise Development LP. "
@@ -331,18 +338,18 @@ def test_slow_identify_keeps_the_open_ports_found():
 
 def test_unidentified_host_carries_its_probe_profile():
     async def _profile(host, open_ports, timeout):
-        return {"http_title": "iLO 5", "http_server": "HPE-iLO-Server/1.30"}
+        return {"http_title": "Rack PDU", "http_server": "lighttpd"}
     scanner = NwScanner(
         CREDS,
         tcp_probe=make_probe({"10.0.0.7": {443}}),
         ssh_identify=make_ssh({}),
-        snmp_identify=make_snmp({"10.0.0.7": "Integrated Lights-Out 5 2.72"}),
+        snmp_identify=make_snmp({"10.0.0.7": "APC Web/SNMP Management Card"}),
         profile_probe=_profile,
     )
     dev = run(scanner.scan(["10.0.0.7"]))["reachable"][0]
     assert dev["object_type"] is None
-    assert dev["profile"] == {"sys_descr": "Integrated Lights-Out 5 2.72",
-                              "http_title": "iLO 5", "http_server": "HPE-iLO-Server/1.30"}
+    assert dev["profile"] == {"sys_descr": "APC Web/SNMP Management Card",
+                              "http_title": "Rack PDU", "http_server": "lighttpd"}
 
 
 def test_parse_http_reads_server_realm_title_and_location():
