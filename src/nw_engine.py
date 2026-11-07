@@ -545,6 +545,17 @@ class SnmpDriver(NwDriver):
                         s.get, snmp_io.HPE_SYS_SERIAL) or "").strip()
                 except Exception:  # noqa: BLE001 — identity extras are best-effort
                     pass
+            # The controller's own model says nothing about the server's rack
+            # height, so also report the host server's model.
+            if self.object_type == "ipmi":
+                for oid in snmp_io.HOST_MODEL_OIDS:
+                    try:
+                        val = str(await snmp_io._to_thread(s.get, oid) or "").strip()
+                    except Exception:  # noqa: BLE001 — best-effort
+                        continue
+                    if val:
+                        info["host_model"] = val
+                        break
             return self._ok(info)
         except Exception as e:
             return _err(f"snmp device info {self.address}: {e}")

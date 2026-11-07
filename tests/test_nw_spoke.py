@@ -636,7 +636,8 @@ def test_ipmi_snmp_driver_falls_back_when_the_controller_serves_no_iftable(monke
 
     class _S:
         def get(self, oid):
-            return "SN123" if oid == snmp_io.HPE_SYS_SERIAL else ""
+            return {snmp_io.HPE_SYS_SERIAL: "SN123",
+                    snmp_io.HOST_MODEL_OIDS[0]: "ProLiant DL380 Gen10"}.get(oid, "")
 
     async def info(_s):
         return {"model": "iLO 5", "serial": "", "firmware": "", "hostname": "h",
@@ -649,6 +650,7 @@ def test_ipmi_snmp_driver_falls_back_when_the_controller_serves_no_iftable(monke
     monkeypatch.setattr(snmp_io, "snmp_get_interfaces", no_ifaces)
     d = build_driver({"id": "d", "object_type": "ipmi", "address": "10.1.1.5"})
     monkeypatch.setattr(d, "_session", lambda: _S())
-    assert _run(d.get_device_info())["data"]["serial"] == "SN123"
+    data = _run(d.get_device_info())["data"]
+    assert data["serial"] == "SN123" and data["host_model"] == "ProLiant DL380 Gen10"
     rows = _run(d.get_interfaces())["data"]
     assert rows[0]["ip"] == "10.1.1.5" and rows[0]["status"] == "up"
