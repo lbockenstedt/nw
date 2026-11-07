@@ -391,16 +391,22 @@ async def _snmp_identify(host: str, community: str,
         # sysName (the hostname LM monitors the host by) gets a second try:
         # a dropped UDP reply must not leave the host nameless. sysObjectID is optional.
         name = oid = None
+        answered = False
         for _ in range(2):
             try:
                 name = await asyncio.wait_for(
                     snmp_io._to_thread(session.get, snmp_io.SYS_NAME), timeout=timeout)
+                answered = True
             except Exception as e:  # noqa: BLE001
                 logger.debug("snmp sysName %s failed: %s", host, e)
             if str(name or "").strip():
                 break
         if not str(name or "").strip():
-            logger.info("snmp %s answered sysDescr but no sysName", host)
+            if answered:
+                logger.info("snmp %s answered sysDescr but returned a blank sysName", host)
+            else:
+                logger.info("snmp %s answered sysDescr but sysName query failed after retry",
+                            host)
         try:
             oid = await asyncio.wait_for(
                 snmp_io._to_thread(session.get, snmp_io.SYS_OBJECT_ID), timeout=timeout)
