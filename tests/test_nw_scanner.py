@@ -381,3 +381,24 @@ def test_parse_http_reads_server_realm_title_and_location():
     assert nw_scanner._parse_http(raw) == {
         "http_server": "lighttpd", "http_realm": "APC Management Card",
         "location": "/login.html", "http_title": "Rack PDU"}
+
+
+def test_bmc_web_identity_reads_hpe_xmldata_serial_model_and_mac(monkeypatch):
+    import nw_scanner
+
+    page = ("HTTP/1.0 200 OK\r\n\r\n<RIMP><HSI><SBSN>2M284302G6 </SBSN>"
+            "<SPN>ProLiant DL380 Gen10</SPN></HSI><MP><ST>1</ST></MP>"
+            "<NICS><NIC><MACADDR>08-F1-EA-97-71-5E</MACADDR></NIC></NICS></RIMP>")
+
+    async def fake_get(host, port, tls, path, timeout):
+        return page if "xmldata" in path else ""
+
+    monkeypatch.setattr(nw_scanner, "_http_get", fake_get)
+    got = run(nw_scanner.bmc_web_identity("10.0.0.1"))
+    assert got == {"serial": "2M284302G6", "host_model": "ProLiant DL380 Gen10",
+                   "mac": "08:f1:ea:97:71:5e"}
+    async def none(*a):
+        return ""
+
+    monkeypatch.setattr(nw_scanner, "_http_get", none)
+    assert run(nw_scanner.bmc_web_identity("10.0.0.1")) == {}
