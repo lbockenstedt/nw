@@ -555,9 +555,12 @@ class SnmpDriver(NwDriver):
                 if info.get(key):
                     break
                 try:
-                    info[key] = str(await snmp_io._to_thread(session.get, oid) or "").strip()
+                    val = str(await snmp_io._to_thread(session.get, oid) or "").strip()
                 except Exception:  # noqa: BLE001 — identity extras are best-effort
-                    pass
+                    continue
+                # An OID the controller lacks comes back as text, not an error.
+                if val and not val.lower().startswith("no such"):
+                    info[key] = val
         if not (info.get("serial") and info.get("host_model") and info.get("mac")):
             for k, v in (await bmc_web_identity(self.address)).items():
                 info[k] = info.get(k) or v
