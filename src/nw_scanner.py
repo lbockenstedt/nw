@@ -198,8 +198,11 @@ async def _read_ssh_banner(host: str, timeout: float) -> str:
         return ""
 
 
-async def _http_get(host: str, port: int, tls: bool, path: str, timeout: float) -> str:
-    """Raw response head + first 16 KB of ``GET path`` (TLS unverified), or ''."""
+async def _http_get(host: str, port: int, tls: bool, path: str, timeout: float,
+                    legacy_tls: bool = False, limit: int = 16384) -> str:
+    """Raw response head + first ``limit`` bytes of ``GET path`` (TLS unverified),
+    or ''. ``legacy_tls`` also accepts old BMC TLS stacks (iLO 4): no secure
+    renegotiation, TLS 1.0, weak keys -- certificates are not verified anyway."""
     # ssl imported lazily; only needed here.
     import ssl
     # For HTTPS, accept any certificate (we only want the banner/title).
@@ -208,7 +211,14 @@ async def _http_get(host: str, port: int, tls: bool, path: str, timeout: float) 
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
-    # Connect, send a minimal HTTP/1.0 GET and read up to 16 KB.
+        if legacy_tls:
+            ctx.options |= getattr(ssl, "OP_LEGACY_SERVER_CONNECT", 0x4)
+            ctx.minimum_version = ssl.TLSVersion.MINIMUM_SUPPORTED
+            try:
+                ctx.set_ciphers("DEFAULT:@SECLEVEL=0")
+            except ssl.SSLError:
+                pass
+    # Connect, send a minimal HTTP/1.0 GET and read up to ``limit`` bytes.
     try:
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(host, port, ssl=ctx), timeout)
@@ -216,7 +226,17 @@ async def _http_get(host: str, port: int, tls: bool, path: str, timeout: float) 
             writer.write(f"GET {path} HTTP/1.0\r\nHost: {host}\r\n"
                          "User-Agent: lm-nw-scan\r\nConnection: close\r\n\r\n".encode())
             await writer.drain()
-            data = await asyncio.wait_for(reader.read(16384), timeout)
+            # Read until the server closes (or the limit): one read() can
+            # return just the headers.
+            data = b""
+            while len(data) < limit:
+                try:
+                    chunk = await asyncio.wait_for(reader.read(limit - len(data)), timeout)
+                except asyncio.TimeoutError:
+                    break
+                if not chunk:
+                    break
+                data += chunk
         finally:
             writer.close()
         # Decoded response text.
@@ -249,7 +269,8 @@ def _parse_http(raw: str) -> Dict[str, str]:
 async def _hpe_xmldata(host: str, timeout: float) -> Dict[str, str]:
     """HPE iLO 2-5 serve ``/xmldata?item=all`` unauthenticated: the server's
     serial (SBSN) and model (SPN) and, as the first NIC, the iLO's own MAC."""
-    raw = await _http_get(host, 443, True, "/xmldata?item=all", timeout)
+    raw = await _http_get(host, 443, True, "/xmldata?item=all", timeout,
+                          legacy_tls=True, limit=65536)
     if "<RIMP>" not in raw:
         return {}
     out: Dict[str, str] = {}
