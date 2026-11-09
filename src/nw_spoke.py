@@ -515,7 +515,8 @@ class NwSpoke(BaseSpoke):
 
         if normalized_cmd == "NW_GET_DEVICE_INFO":
             # Model/serial/firmware.
-            return await self.engine.get_device_info(device_id, tenant)
+            addr = (data or {}).get("address") if isinstance(data, dict) else None
+            return await self.engine.get_device_info(device_id, tenant, address=addr)
 
         if normalized_cmd == "NW_GET_MAC_TABLE":
             res = await self.engine.get_mac_table(device_id, tenant)
