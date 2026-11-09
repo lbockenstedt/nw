@@ -200,6 +200,58 @@ def test_snmp_get_arp_maps_interface_name():
     assert rows == [{"ip": "10.0.0.5", "mac": "aa:bb:cc:dd:ee:ff",
                      "interface": "Gi1/0/1"}]
 
+def test_snmp_driver_arp_reads_only_names_and_overlaps_walks(monkeypatch):
+    from threading import Barrier
+    from nw_engine import SnmpDriver
+
+    descr = snmp_io.IF_PREFIX + snmp_io.IF_DESCR
+    arp = snmp_io.ARP_PREFIX
+    barrier = Barrier(2)
+    calls = []
+
+    class Session:
+        def walk(self, oid):
+            calls.append(oid)
+            assert oid in (descr, arp), "ARP must not walk the full ifTable"
+            # A sequential implementation fails here instead of depending on
+            # a flaky elapsed-time threshold to prove the reads overlap.
+            barrier.wait(timeout=5)
+            if oid == descr:
+                return [(descr + ".1", "Gi1/0/1")]
+            return [(arp + "2.1.10.0.0.5", "aa:bb:cc:dd:ee:ff"),
+                    (arp + "2.9.10.0.0.6", "00:11:22:33:44:55")]
+
+    driver = SnmpDriver({"id": "d1", "object_type": "cx_switch",
+                         "address": "10.0.0.1"})
+    monkeypatch.setattr(driver, "_session", Session)
+    result = _run(driver.get_arp())
+    assert result["status"] == "SUCCESS", result
+    assert result["data"] == [
+        {"ip": "10.0.0.5", "mac": "aa:bb:cc:dd:ee:ff", "interface": "Gi1/0/1"},
+        {"ip": "10.0.0.6", "mac": "00:11:22:33:44:55", "interface": "9"},
+    ]
+    assert sorted(calls) == sorted([descr, arp])
+
+
+def test_snmp_driver_arp_walk_failures_remain_errors(monkeypatch):
+    from nw_engine import SnmpDriver
+
+    driver = SnmpDriver({"id": "d1", "object_type": "cx_switch",
+                         "address": "10.0.0.1"})
+    descr = snmp_io.IF_PREFIX + snmp_io.IF_DESCR
+    for failed_oid in (descr, snmp_io.ARP_PREFIX):
+        class Session:
+            def walk(self, oid, failure=failed_oid):
+                if oid == failure:
+                    raise snmp_io.SnmpError("walk failed")
+                return []
+
+        monkeypatch.setattr(driver, "_session", Session)
+        result = _run(driver.get_arp())
+        assert result["status"] == "ERROR", result
+        assert "walk failed" in result["message"]
+
+
 # ── SnmpSession against a fake pysnmp 7.x v1arch asyncio API — nw#103 ────────
 # pysnmp 7.x removed the synchronous hlapi this module used to import, so SNMP
 # was dead in the field while every test here still passed: the tests stubbed

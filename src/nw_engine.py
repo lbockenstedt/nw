@@ -582,16 +582,22 @@ class SnmpDriver(NwDriver):
             return _err(f"snmp interfaces {self.address}: {e}")
 
     async def get_arp(self) -> Dict[str, Any]:
-        """Walk the ARP table, naming interfaces from ifTable."""
+        """Walk ARP and ifDescr concurrently, without fetching the full ifTable."""
         # Imported lazily; pysnmp may be absent.
         from transports import snmp_io
         # Any failure becomes an ERROR envelope.
         try:
             s = self._session()
-            # Map ifIndex → name so the ARP rows carry a friendly interface.
-            iftable = snmp_io.parse_iftable(
-                await snmp_io._to_thread(s.walk, snmp_io.IF_PREFIX))
-            rows = await snmp_io.snmp_get_arp(s, ifaces=iftable)
+            # Only interface names are needed. Each walk owns its dispatcher,
+            # so these independent reads can safely overlap on worker threads.
+            descriptions, rows = await asyncio.gather(
+                snmp_io._to_thread(s.walk, snmp_io.IF_PREFIX + snmp_io.IF_DESCR),
+                snmp_io.snmp_get_arp(s),
+            )
+            names = {str(ifx): fields["name"] for ifx, fields in
+                     snmp_io.parse_iftable(descriptions).items()}
+            for row in rows:
+                row["interface"] = names.get(row["interface"], row["interface"])
             return self._ok(rows)
         except Exception as e:
             # Walk failed.
