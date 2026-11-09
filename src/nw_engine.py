@@ -1133,10 +1133,19 @@ class NwEngine:
                                f"latency={pd.get('latency_ms')}ms")
         return res
 
-    async def get_device_info(self, device_id: str, tenant: Optional[str] = None) -> Dict[str, Any]:
-        """Fetch hardware metadata and OS version for a single device."""
+    async def get_device_info(self, device_id: str, tenant: Optional[str] = None,
+                              address: Optional[str] = None) -> Dict[str, Any]:
+        """Fetch hardware metadata and OS version for a single device.
+
+        ``address`` asks the device's credentials to be tried against another IP
+        (e.g. a VLAN address a firewall saw): the reply's serial then says whether
+        that IP belongs to the same box."""
         # Unknown device: error.
-        drv = self._driver_for(device_id, tenant)
+        if address:
+            d = self._get_device(device_id, tenant)
+            drv = build_driver({**d, "address": str(address)}) if d else None
+        else:
+            drv = self._driver_for(device_id, tenant)
         if not drv:
             logger.warning("nw get_device_info: device %s not in fleet", device_id)
             return _err(f"Device {device_id} not found")
