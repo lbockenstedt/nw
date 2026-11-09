@@ -390,18 +390,40 @@ def test_bmc_web_identity_reads_hpe_xmldata_serial_model_and_mac(monkeypatch):
             "<SPN>ProLiant DL380 Gen10</SPN></HSI><MP><ST>1</ST></MP>"
             "<NICS><NIC><MACADDR>08-F1-EA-97-71-5E</MACADDR></NIC></NICS></RIMP>")
 
-    async def fake_get(host, port, tls, path, timeout):
+    async def fake_get(host, port, tls, path, timeout, **kw):
         return page if "xmldata" in path else ""
 
     monkeypatch.setattr(nw_scanner, "_http_get", fake_get)
     got = run(nw_scanner.bmc_web_identity("10.0.0.1"))
     assert got == {"serial": "2M284302G6", "host_model": "ProLiant DL380 Gen10",
                    "mac": "08:f1:ea:97:71:5e"}
-    async def none(*a):
+    async def none(*a, **kw):
         return ""
 
     monkeypatch.setattr(nw_scanner, "_http_get", none)
     assert run(nw_scanner.bmc_web_identity("10.0.0.1")) == {}
+
+
+def test_http_get_reads_a_body_sent_after_the_headers():
+    # iLO 4 sends the headers and the XML body in separate writes.
+    import asyncio
+    import nw_scanner
+
+    async def go():
+        async def serve(reader, writer):
+            await reader.readuntil(b"\r\n\r\n")
+            writer.write(b"HTTP/1.0 200 OK\r\n\r\n")
+            await writer.drain()
+            await asyncio.sleep(0.05)
+            writer.write(b"<RIMP><HSI><SBSN>CZJ1234567</SBSN></HSI></RIMP>")
+            await writer.drain()
+            writer.close()
+        server = await asyncio.start_server(serve, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        async with server:
+            return await nw_scanner._http_get("127.0.0.1", port, False, "/xmldata?item=all", 2)
+
+    assert "<SBSN>CZJ1234567</SBSN>" in run(go())
 
 
 def test_snmp_identify_retries_a_dropped_sysname(monkeypatch):
