@@ -4,29 +4,6 @@ The `nw` module is the authoritative network device management spoke for the Lab
 
 ---
 
-## Repository layout
-
-| Path | What it holds |
-| :--- | :--- |
-| `.claude/` | Fleet-owned skills, synced from lm; edit them in lm. |
-| `.github/` | CI (`workflows/ci.yml`), the thin `promote`/`backmerge` callers, promotion scripts and fleet-owned agents. |
-| `.pipeline-templates/` | Templates for the issue automation pipeline. |
-| `audit/` | Static audit scripts (imports, paths, syntax, serialization) and their reports. |
-| `docs/` | This module's docs (copies of the canonical pages in `lm/docs`). |
-| `scripts/` | Operator tools: remote log fetch, issue polling, and GitHub issue clean-up (these change GitHub state; read first). |
-| `src/` | The spoke's Python source (entry point, engine, control plane). |
-| `tests/` | pytest suite; CI runs it in the `test-unit` job. |
-| `AGENTS.md` | Orientation for people and AI agents; the fleet rules block is synced from lm. |
-| `API_SPEC.md` | The commands and routes this spoke exposes. |
-| `install_automation.sh` | Installs the issue automation. |
-| `install_nw.sh` | Installer (idempotent; safe to re-run). |
-| `nw.Dockerfile` | Container build. |
-| `README.md` | This file. |
-| `requirements.txt` | Runtime Python dependencies. |
-| `RULES.md` | nw-specific coding rules. |
-| `SECURITY.md` | Security notes and reporting. |
-| `VERSION` | Bot-owned version; promotion bumps it. Never edit by hand. |
-
 ## Architecture
 
 The spoke operates as a lightweight, high-performance orchestration layer between the Lab Manager hub and managed network devices:
