@@ -619,6 +619,15 @@ class SnmpDriver(NwDriver):
             # Walk failed.
             return _err(f"snmp mac table {self.address}: {e}")
 
+    async def get_lldp_neighbors(self) -> Dict[str, Any]:
+        """Read topology edges from the vendor-neutral LLDP-MIB."""
+        from transports import snmp_io
+        try:
+            rows = await snmp_io.snmp_get_lldp_neighbors(self._session())
+            return self._ok(rows)
+        except Exception as e:
+            return _err(f"snmp lldp {self.address}: {e}")
+
 
 class SshCliDriver(NwDriver):
     """SSH / CLI driver (asyncssh + per-vendor text parsers). One interactive
