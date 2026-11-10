@@ -15,6 +15,71 @@ def _run(coro):
     return asyncio.get_event_loop().run_until_complete(coro)
 
 
+def test_snmp_lldp_driver_reads_standard_tables(monkeypatch):
+    """SNMP devices return full edge records, including multiple peers per port."""
+    from nw_engine import SnmpDriver
+
+    remote = snmp_io.LLDP_REMOTE_PREFIX
+    local = snmp_io.LLDP_LOCAL_PORT_ID
+    pairs = []
+    for index, chassis_type, chassis, port_type, port in (
+        ("10.7.1", "4", b"\x00\x0a\x14\x1e\x28\x32", "5", b"eth0"),
+        ("10.7.2", "7", b"abcdef123456", "3", b"\x00\x01\x02\x03\x04\x05"),
+    ):
+        fields = {"4": chassis_type, "5": chassis, "6": port_type,
+                  "7": port, "9": b"PEER", "10": b"Switch"}
+        pairs.extend((remote + col + "." + index, value)
+                     for col, value in fields.items())
+    session = _FakeSnmp(walks={
+        remote.rstrip("."): pairs,
+        local.rstrip("."): [(local + "7", b"1/1/24")],
+    })
+    driver = SnmpDriver({"id": "d1", "object_type": "aos_switch",
+                         "transport": "snmp", "address": "192.0.2.1"})
+    monkeypatch.setattr(driver, "_session", lambda: session)
+    result = _run(driver.get_lldp_neighbors())
+    assert result["status"] == "SUCCESS"
+    assert result["data"] == [
+        {"local_port": "1/1/24", "remote_chassis": "00:0a:14:1e:28:32",
+         "remote_port": "eth0", "remote_name": "PEER",
+         "remote_descr": "Switch", "remote_mgmt_ip": ""},
+        {"local_port": "1/1/24", "remote_chassis": "abcdef123456",
+         "remote_port": "00:01:02:03:04:05", "remote_name": "PEER",
+         "remote_descr": "Switch", "remote_mgmt_ip": ""},
+    ]
+
+
+def test_snmp_lldp_empty_and_failed_queries_are_distinct(monkeypatch):
+    """A timeout must not become a successful zero-neighbour result."""
+    from nw_engine import SnmpDriver
+
+    driver = SnmpDriver({"id": "d1", "object_type": "aos_switch",
+                         "transport": "snmp", "address": "192.0.2.1"})
+    monkeypatch.setattr(driver, "_session", lambda: _FakeSnmp())
+    result = _run(driver.get_lldp_neighbors())
+    assert result["status"] == "SUCCESS"
+    assert result["data"] == []
+    monkeypatch.setattr(driver, "_session", lambda: _FakeSnmp(fail=True))
+    result = _run(driver.get_lldp_neighbors())
+    assert result["status"] == "ERROR"
+    assert "snmp lldp" in result["message"]
+
+
+def test_snmp_lldp_missing_names_and_malformed_rows():
+    """Use the LLDP port number when unnamed; ignore incomplete remote rows."""
+    prefix = snmp_io.LLDP_REMOTE_PREFIX
+    rows = snmp_io.parse_lldp_table([
+        (prefix + "5.0.7.1", "chassis"),
+        (prefix + "7.0.7.1", "port"),
+        (prefix + "5.0.8.1", "incomplete"),
+        (prefix + "5.bad", "malformed"),
+        ("1.2.3", "outside subtree"),
+    ], [])
+    assert len(rows) == 1
+    assert rows[0]["local_port"] == "7"
+    assert rows[0]["remote_name"] == ""
+
+
 # ── _mac_from_octets ──────────────────────────────────────────────────────────
 def test_mac_from_bytes():
     assert snmp_io._mac_from_octets(b"\xaa\xbb\xcc\xdd\xee\xff") == \
