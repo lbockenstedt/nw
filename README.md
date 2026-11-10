@@ -80,7 +80,7 @@ The spoke operates as a lightweight, high-performance orchestration layer betwee
 
 - **Multi-Vendor Device Polling:** Unified polling engine for ArubaOS-CX, HP ProCurve (AOS-S), Juniper EX, and SNMP-enabled appliances.
 - **Auto-Discovery & Fingerprinting:** Rapid scanning of CIDR blocks, automatically detecting vendor models, firmware versions, serial numbers, and management endpoints.
-- **LLDP Topology Mapping:** Automated neighbor extraction across ports to map physical and logical datacenter topology.
+- **LLDP Topology Mapping:** Automated neighbor extraction across ports to map physical and logical datacenter topology. SNMP devices use the standard LLDP-MIB remote table and local port IDs, without requiring SSH credentials. SNMP edges include chassis, port, system name and description; management IP is currently left empty. Devices must expose LLDP-MIB to the configured community.
 - **VLAN Inspection:** Query and inspect configured 802.1Q VLANs and port memberships.
 - **Port Operational Status & Metrics:** Real-time port speeds, duplex modes, administrative status, PoE power delivery, and traffic statistics.
 - **Fused ARP & MAC Tables:** Fuses layer-2 MAC address tables with layer-3 ARP bindings into deduplicated endpoint records with standardized MAC formatting (`aa:bb:cc:dd:ee:ff`).
