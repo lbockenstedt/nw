@@ -98,7 +98,7 @@ jobs:
           # Only run pytest when this repo actually has tests, so an empty
           # tests/ reports honestly instead of failing with "no tests ran".
           if [ -n "$(find tests -name 'test_*.py' -print -quit 2>/dev/null)" ]; then
-            pytest --timeout=300 --timeout-method=thread tests/
+            pytest -x --timeout=300 --timeout-method=thread tests/
           else
             echo "no test_*.py under tests/ — skipping pytest"
           fi
