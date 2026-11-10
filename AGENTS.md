@@ -27,8 +27,8 @@ operations), `src/nw_scanner.py` (discovery), `src/nw_poll_scheduler.py`, `src/h
 
 - **Highest-churn repo in the fleet.** Expect the most drift between docs and code; verify against `src/`.
 - **`CLAUDE.md` in this repo is an unedited generic template** — it prescribes `npm run build`, Vitest and camelCase for what is a **Python** repo. **Ignore it.** Prefer `RULES.md` and this file.
-- Extra automation lives here that other repos lack: `.pipeline-templates/`, `install_automation.sh`, `issue_automation.yml`, `bugfix_main.py`, `purge_github_reports.py`, `delete-closed-issues.sh`. These touch GitHub state — read before running.
-- `test_new_file.txt` is stray scratch, not source. `LM-SIM-PORT-STATUS.md` tracks the sim port-over.
+- Extra automation lives here that other repos lack: `.pipeline-templates/`, `install_automation.sh`, `issue_automation.yml`, `scripts/purge_github_reports.py`, `scripts/delete-closed-issues.sh`. These touch GitHub state — read before running.
+- `docs/LM-SIM-PORT-STATUS.md` tracks the sim port-over.
 
 <!-- fleet-rules:begin (synced from lm/.github/fleet-rules.md -- edit there) -->
 
