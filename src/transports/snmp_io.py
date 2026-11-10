@@ -83,6 +83,10 @@ ARP_IFIDX, ARP_MAC, ARP_IP = "1", "2", "3"
 FDB_ADDR_PREFIX = "1.3.6.1.2.1.17.4.3.1.1"
 FDB_PORT_PREFIX = "1.3.6.1.2.1.17.4.3.1.2"
 BRIDGE_PORT_IF_PREFIX = "1.3.6.1.2.1.17.1.4.1.2"
+# LLDP-MIB: local port IDs and remote table entries. Local port numbers are
+# NOT necessarily ifIndex values; resolve them through lldpLocPortId instead.
+LLDP_LOCAL_PORT_ID = "1.0.8802.1.1.2.1.3.7.1.3."
+LLDP_REMOTE_PREFIX = "1.0.8802.1.1.2.1.4.1.1."
 
 
 class SnmpError(Exception):
@@ -496,6 +500,60 @@ _SNMP_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=32, thread_name_p
 async def _to_thread(fn, *args):
     """Run a blocking function on an SNMP worker thread and await its result."""
     return await asyncio.get_running_loop().run_in_executor(_SNMP_POOL, fn, *args)
+
+
+def _lldp_text(value: Any) -> str:
+    """Decode LLDP octet strings into JSON-safe text."""
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).decode("utf-8", errors="replace").strip()
+    return str(value if value is not None else "").strip()
+
+
+def parse_lldp_table(remote_pairs, local_pairs) -> List[dict]:
+    """Join LLDP remote rows to local port IDs without assuming ifIndex."""
+    names = {oid[len(LLDP_LOCAL_PORT_ID):]: _lldp_text(value)
+             for oid, value in local_pairs
+             if oid.startswith(LLDP_LOCAL_PORT_ID)}
+    # The complete index is timeMark.localPortNum.remIndex. Keeping all three
+    # components prevents neighbours sharing a local port from being merged.
+    entries = {}
+    for oid, value in remote_pairs:
+        if not oid.startswith(LLDP_REMOTE_PREFIX):
+            continue
+        parts = oid[len(LLDP_REMOTE_PREFIX):].split(".")
+        if len(parts) != 4 or not all(p.isdigit() for p in parts):
+            continue
+        column, *index = parts
+        entries.setdefault(tuple(index), {})[column] = value
+
+    rows = []
+    for index, fields in entries.items():
+        chassis = _lldp_text(fields.get("5"))
+        port = _lldp_text(fields.get("7"))
+        # Only MAC-address subtypes should be normalised as MACs; locally
+        # assigned identifiers can also look like hex strings.
+        if _lldp_text(fields.get("4")) == "4":
+            chassis = _mac_from_octets(fields.get("5")) or chassis
+        if _lldp_text(fields.get("6")) == "3":
+            port = _mac_from_octets(fields.get("7")) or port
+        if not chassis or not port:
+            continue
+        rows.append({"local_port": names.get(index[1]) or index[1],
+                     "remote_chassis": chassis, "remote_port": port,
+                     "remote_name": _lldp_text(fields.get("9")),
+                     "remote_descr": _lldp_text(fields.get("10")),
+                     "remote_mgmt_ip": ""})
+    return rows
+
+
+async def snmp_get_lldp_neighbors(session: SnmpSession) -> List[dict]:
+    """Walk standard LLDP tables on SNMP workers; propagate query failures."""
+    # LLDP port numbering is independent of IF-MIB numbering.
+    remote, local = await asyncio.gather(
+        _to_thread(session.walk, LLDP_REMOTE_PREFIX.rstrip(".")),
+        _to_thread(session.walk, LLDP_LOCAL_PORT_ID.rstrip(".")),
+    )
+    return parse_lldp_table(remote, local)
 
 
 async def snmp_probe(session: SnmpSession) -> dict:
