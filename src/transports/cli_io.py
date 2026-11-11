@@ -188,9 +188,19 @@ class CliSession:
                                  password=self.password, known_hosts=None,
                                  login_timeout=10),
                 timeout=15.0)
+        except asyncio.TimeoutError as e:
+            # TimeoutError often has no text, leaving operators with a blank error.
+            raise CliError(
+                f"SSH connect to {self.host}:{self.port}: timed out during TCP "
+                "connection or authentication (15s overall limit, 10s login limit); "
+                "check reachability, SSH service and authentication response time"
+            ) from e
         except Exception as e:
-            # Any connect/auth failure becomes a CliError with the host.
-            raise CliError(f"SSH connect to {self.host}: {e}")
+            # Preserve the cause and identify even exceptions with empty messages.
+            detail = str(e).strip() or "no error details supplied"
+            raise CliError(
+                f"SSH connect to {self.host}:{self.port}: {type(e).__name__}: {detail}"
+            ) from e
         heartbeat.beat()  # progress: TCP+auth done
         # Request a REAL terminal size (80x24), not asyncssh's default 0x0 PTY.
         # openssh always negotiates a concrete window size; some AOS-S switches
