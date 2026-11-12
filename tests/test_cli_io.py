@@ -388,6 +388,35 @@ class _FakeConn:
         return None
 
 
+@pytest.mark.parametrize("failure, expected", [
+    (TimeoutError(), "timed out during TCP connection or authentication"),
+    (ConnectionRefusedError(111, "Connection refused"), "Connection refused"),
+    (PermissionError("Permission denied"), "Permission denied"),
+    (Exception(), "Exception: no error details supplied"),
+])
+def test_connect_errors_include_actionable_cause(monkeypatch, failure, expected):
+    """Connection failures retain their cause and never produce a blank suffix."""
+    import types
+
+    async def fake_connect(*args, **kwargs):
+        """Fail before opening a session, without network I/O or real timers."""
+        raise failure
+
+    monkeypatch.setitem(sys.modules, "asyncssh", types.SimpleNamespace(connect=fake_connect))
+    monkeypatch.delenv("LM_NW_SSH_DEBUG", raising=False)
+    session = cli_io.CliSession({
+        "address": "switch.example", "port": 2222, "username": "operator",
+        "password": "test-secret-not-for-logs",
+    })
+    with pytest.raises(cli_io.CliError) as caught:
+        asyncio.get_event_loop().run_until_complete(session.connect())
+    message = str(caught.value)
+    assert "SSH connect to switch.example:2222:" in message
+    assert expected in message
+    assert session.password not in message
+    assert caught.value.__cause__ is failure
+
+
 def test_connect_failure_does_not_leak_connection():
     # THE session-exhaustion bug: connect() runs inside __aenter__, so if it
     # raises after the SSH connection is established, close() would never fire
