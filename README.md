@@ -89,6 +89,20 @@ The spoke operates as a lightweight, high-performance orchestration layer betwee
 
 ---
 
+## SSH polling diagnostics
+
+SSH connection failures include the target address and port. Timeouts explicitly
+identify the TCP connection/authentication phase (15-second overall limit,
+10-second login limit), rather than returning an empty error message. Other
+failures retain their exception type and details.
+
+For permission-denied errors, verify the device's assigned credential in the hub
+and its account permissions on the device. For connection-refused errors or
+timeouts, check the management address, configured SSH port, SSH service and
+network/ACL reachability from the nw agent. A timeout alone does not prove that
+credentials were rejected. These diagnostics do not repair credentials or
+reachability, change retry behavior, or suppress failed-poll ERROR results.
+
 ## Spoke Commands Reference
 
 The spoke receives commands from the Lab Manager hub over WebSocket and executes them via `nw_spoke.py`:
