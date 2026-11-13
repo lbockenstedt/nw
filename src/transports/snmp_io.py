@@ -8,8 +8,8 @@ against — ``pysnmp.hlapi`` is now an empty namespace, so the old import raised
 ImportError from outside the ``try`` in get()/walk() and SNMP was entirely
 non-functional (nw#103). It now targets ``pysnmp.hlapi.v1arch.asyncio``:
 ``SnmpDispatcher`` (a context manager), an awaited
-``UdpTransportTarget.create()``, ``get_cmd``, and ``walk_cmd`` (an async
-generator). ``ContextData`` does not exist in v1arch and is gone.
+``UdpTransportTarget.create()``, ``get_cmd``, and ``bulk_walk_cmd`` (an async
+generator; GETBULK, see ``WALK_MAX_REPETITIONS``). ``ContextData`` does not exist in v1arch and is gone.
 
 ``SnmpSession.get``/``.walk`` deliberately remain BLOCKING despite the async
 library underneath: every caller reaches them via ``asyncio.to_thread`` (see
@@ -93,6 +93,13 @@ class SnmpError(Exception):
     """Raised on configuration errors, timeouts, or SNMP error responses."""
 
 
+# OIDs fetched per GETBULK round trip during a walk. A GETNEXT walk costs one
+# round trip per OID, so a core switch's FDB (thousands of MACs) ran past the
+# hub's 180s ceiling (lm#1846, nw#227); 25 per request cuts that ~25x and keeps
+# each reply well under a UDP datagram.
+WALK_MAX_REPETITIONS = 25
+
+
 # ── SnmpSession: blocking pysnmp get/walk (run via to_thread) ────────────────
 class SnmpSession:
     """SNMPv2c community session. Raises SnmpError if no community is configured
@@ -122,9 +129,9 @@ class SnmpSession:
         """Import and return the pysnmp v1arch asyncio API pieces (lazy import)."""
         from pysnmp.hlapi.v1arch.asyncio import (SnmpDispatcher, CommunityData,
                                                  UdpTransportTarget, ObjectType,
-                                                 ObjectIdentity, get_cmd, walk_cmd)
+                                                 ObjectIdentity, get_cmd, bulk_walk_cmd)
         return (SnmpDispatcher, CommunityData, UdpTransportTarget, ObjectType,
-                ObjectIdentity, get_cmd, walk_cmd)
+                ObjectIdentity, get_cmd, bulk_walk_cmd)
 
     async def _target(self, UdpTransportTarget):
         """Create the UDP transport target for this device, wrapping errors in SnmpError."""
@@ -143,7 +150,7 @@ class SnmpSession:
         """Async GET of one OID; returns its value, or None when nothing came back."""
         # Unpack the lazily imported API.
         (SnmpDispatcher, CommunityData, UdpTransportTarget, ObjectType,
-         ObjectIdentity, get_cmd, walk_cmd) = self._hlapi()
+         ObjectIdentity, get_cmd, bulk_walk_cmd) = self._hlapi()
         # Dispatcher owns the UDP socket for the duration of the request.
         with SnmpDispatcher() as dispatcher:
             target = await self._target(UdpTransportTarget)
@@ -167,33 +174,52 @@ class SnmpSession:
         """Async walk of an OID subtree; returns (oid, value) pairs."""
         # Unpack the lazily imported API.
         (SnmpDispatcher, CommunityData, UdpTransportTarget, ObjectType,
-         ObjectIdentity, get_cmd, walk_cmd) = self._hlapi()
+         ObjectIdentity, get_cmd, bulk_walk_cmd) = self._hlapi()
         # Dispatcher owns the UDP socket for the duration of the walk.
         with SnmpDispatcher() as dispatcher:
             target = await self._target(UdpTransportTarget)
             out: List[Tuple[str, Any]] = []
             # Walk only inside the subtree (lexicographicMode=False stops at its end).
-            async for err, es, ei, var in walk_cmd(
-                    dispatcher, CommunityData(self.community, mpModel=1),
-                    target, ObjectType(ObjectIdentity(oid)),
-                    lexicographicMode=False):
-                # Any error ends the walk.
-                if err:
-                    # "no SNMP response" → timeout; stop what we have.
-                    if "no" in str(err).lower() and "response" in str(err).lower():
-                        if not out:
-                            # Timed out before any data: report it as a failure.
-                            raise SnmpError(f"walk {oid} on {self.host}: {err}")
+            walk = bulk_walk_cmd(
+                dispatcher, CommunityData(self.community, mpModel=1),
+                target, 0, WALK_MAX_REPETITIONS, ObjectType(ObjectIdentity(oid)),
+                lexicographicMode=False)
+            # pysnmp before 7.1.32 never resolves a GETNEXT/GETBULK that times
+            # out, so a single dropped reply hung the walk (and its worker
+            # thread) forever. Bound each step by the request's own timeout.
+            stall = self.timeout * (self.retries + 1) + 1
+            try:
+                while True:
+                    try:
+                        err, es, ei, var = await asyncio.wait_for(walk.__anext__(), stall)
+                    except StopAsyncIteration:
                         break
-                    # Other errors: keep what was collected.
-                    break
-                # SNMP error status: stop the walk.
-                if es:
-                    break
-                # Record each returned OID with its value.
-                for vb in (var or []):
-                    full = _oid_str(vb[0])
-                    out.append((full, _value_of(vb)))
+                    except asyncio.TimeoutError:
+                        err, es, var = "No SNMP response received (walk stalled)", 0, None
+                    # Any error ends the walk.
+                    if err:
+                        # "no SNMP response" → timeout; stop what we have.
+                        if "no" in str(err).lower() and "response" in str(err).lower():
+                            if not out:
+                                # Timed out before any data: report it as a failure.
+                                raise SnmpError(f"walk {oid} on {self.host}: {err}")
+                            break
+                        # Other errors: keep what was collected.
+                        break
+                    # SNMP error status: stop the walk.
+                    if es:
+                        break
+                    # Record each returned OID with its value.
+                    for vb in (var or []):
+                        full = _oid_str(vb[0])
+                        out.append((full, _value_of(vb)))
+            finally:
+                # Close the generator so a stalled request is not left pending.
+                try:
+                    await walk.aclose()
+                except Exception:  # noqa: BLE001
+                    # A generator cancelled mid-request may refuse to close; nothing to keep.
+                    pass
         # All pairs collected.
         return out
 
