@@ -317,13 +317,42 @@ def test_snmp_driver_arp_walk_failures_remain_errors(monkeypatch):
         assert "walk failed" in result["message"]
 
 
+def test_snmp_driver_mac_table_reads_only_interface_names(monkeypatch):
+    """The MAC table names ports from ifDescr alone; walking every ifTable
+    column made big switches time out."""
+    from nw_engine import SnmpDriver
+
+    descr = snmp_io.IF_PREFIX + snmp_io.IF_DESCR
+    calls = []
+
+    class Session:
+        def walk(self, oid):
+            calls.append(oid)
+            assert oid != snmp_io.IF_PREFIX, "MAC table must not walk the full ifTable"
+            if oid == descr:
+                return [(descr + ".7", "1/1/7")]
+            if oid == snmp_io.FDB_ADDR_PREFIX:
+                return [(oid + ".170.187.204.221.238.255", b"\xaa\xbb\xcc\xdd\xee\xff")]
+            if oid == snmp_io.FDB_PORT_PREFIX:
+                return [(oid + ".170.187.204.221.238.255", 3)]
+            return [(snmp_io.BRIDGE_PORT_IF_PREFIX + ".3", 7)]
+
+    driver = SnmpDriver({"id": "d1", "object_type": "aos_switch",
+                         "address": "10.0.0.1"})
+    monkeypatch.setattr(driver, "_session", Session)
+    result = _run(driver.get_mac_table())
+    assert result["status"] == "SUCCESS", result
+    assert result["data"] == [{"mac": "aa:bb:cc:dd:ee:ff", "vlan": "", "interface": "1/1/7"}]
+    assert calls[0] == descr
+
+
 # ── SnmpSession against a fake pysnmp 7.x v1arch asyncio API — nw#103 ────────
 # pysnmp 7.x removed the synchronous hlapi this module used to import, so SNMP
 # was dead in the field while every test here still passed: the tests stubbed
 # SnmpSession itself and never exercised the pysnmp plumbing. These drive the
 # REAL SnmpSession.get/walk against a fake that enforces the 7.x contract —
 # SnmpDispatcher is a sync context manager, UdpTransportTarget.create() must be
-# awaited, walk_cmd is an async generator — so a regression to the 6.x shapes,
+# awaited, bulk_walk_cmd is an async generator — so a regression to the 6.x shapes,
 # or using the dispatcher after its `with` block closed it, fails loudly.
 class _FakeOid:
     def __init__(self, dotted):
@@ -388,13 +417,18 @@ def _install_fake(monkeypatch, *, get_result=None, walk_rows=None, get_raises=No
             raise get_raises
         return get_result
 
-    async def _walk_cmd(dispatcher, auth, target, varbind, **kw):
+    async def _walk_cmd(dispatcher, auth, target, non_repeaters, max_repetitions, varbind, **kw):
         assert dispatcher.closed is False, "dispatcher used after close"
+        # GETBULK, many OIDs per round trip: a GETNEXT walk timed out on big FDBs.
+        assert non_repeaters == 0 and max_repetitions > 1, "walk must use GETBULK"
         assert isinstance(target, _FakeTarget), "transport target must be awaited"
         # Without this the walk runs past the requested subtree to end-of-MIB.
         assert kw.get("lexicographicMode") is False, "walk must be subtree-bounded"
         seen["walk_kw"] = kw
         for row in (walk_rows or []):
+            if row == "HANG":
+                # pysnmp < 7.1.32 never resolves a timed-out GETBULK.
+                await asyncio.Event().wait()
             yield row
 
     def _hlapi(self):
@@ -478,6 +512,22 @@ def test_walk_timeout_after_some_rows_keeps_what_it_has(monkeypatch):
     _install_fake(monkeypatch, walk_rows=rows)
     got = snmp_io.SnmpSession(_DEV).walk(snmp_io.ARP_PREFIX)
     assert got == [("1.3.6.1.2.1.4.22.1.3.1.1", "10.0.0.5")]
+
+
+def test_walk_stalled_request_ends_the_walk(monkeypatch):
+    """A request the library never resolves ends the walk after the request
+    timeout instead of hanging it (and its worker thread) forever."""
+    rows = [(None, 0, 0, [(_FakeOid("1.3.6.1.2.1.17.4.3.1.1.1"), _FakeVal("x"))]), "HANG"]
+    _install_fake(monkeypatch, walk_rows=rows)
+    session = snmp_io.SnmpSession(_DEV, timeout=0.01, retries=0)
+    assert session.walk(snmp_io.FDB_ADDR_PREFIX) == [("1.3.6.1.2.1.17.4.3.1.1.1", "x")]
+    _install_fake(monkeypatch, walk_rows=["HANG"])
+    try:
+        session.walk(snmp_io.FDB_ADDR_PREFIX)
+    except snmp_io.SnmpError as e:
+        assert "stalled" in str(e)
+    else:
+        raise AssertionError("expected SnmpError")
 
 
 def test_walk_stops_on_error_status(monkeypatch):

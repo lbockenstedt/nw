@@ -611,8 +611,9 @@ class SnmpDriver(NwDriver):
         try:
             # Map ifIndex to name so MAC rows carry a friendly interface.
             s = self._session()
+            # Only the names are used, so walk ifDescr rather than the whole ifTable.
             iftable = snmp_io.parse_iftable(
-                await snmp_io._to_thread(s.walk, snmp_io.IF_PREFIX))
+                await snmp_io._to_thread(s.walk, snmp_io.IF_PREFIX + snmp_io.IF_DESCR))
             rows = await snmp_io.snmp_get_mac_table(s, ifaces=iftable)
             return self._ok(rows)
         except Exception as e:
