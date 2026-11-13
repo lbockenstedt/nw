@@ -64,6 +64,15 @@ bound to this spoke via `UPDATE_CONFIG`. Each device dict:
   interfaces, arp, mac_table}, "errors":[...], "message":"..."}`. MACs are
   canonicalized on the way out. The hub's POLL NOW button sends this and pushes
   the device + interfaces to NetBox via `NETBOX_SYNC_NW_DEVICE`.
+  For a reachable `ipmi` controller polled over SNMP, `data` also carries
+  `hw_health`: `{"overall": "ok"|"degraded"|"failed"|"other", "source": "snmp",
+  "polled_at": <epoch>, "components": {"power"|"memory"|"fans"|"temperatures"|
+  "cpus"|"storage": [{name, location?, condition, detail?}]}}`, read from the
+  HPE health MIBs (OID map: `src/transports/hw_health_oids.json`). A group the
+  controller doesn't implement is left out ("not reported"); a controller
+  without the HPE health MIBs (not an iLO) gets no `hw_health` key. When any
+  walk fails, `hw_health` is `{"error": "...", "polled_at": <epoch>}` and the
+  poll is `PARTIAL`. Older hubs ignore the extra key.
 
 > Every datum method returns an `ERROR` envelope (`{"status":"ERROR","data":[],
 > "message":...}`) on transport failure (timeout, no community, auth refused,

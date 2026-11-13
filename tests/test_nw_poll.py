@@ -320,3 +320,48 @@ def test_poll_schedule_survives_restart(tmp_path, monkeypatch):
     assert NwSpoke("nw-1", {"devices": []})._load_poll_due() == {"dev-1": 1234.5}
     (tmp_path / "due.json").write_text("not json")
     assert sp._load_poll_due() == {}
+
+
+# ── hw_health: ipmi controllers only, failures sent as {"error"} ─────────────
+class _FakeBmc(_FakeDriver):
+    """A controller driver that also reads hardware health."""
+
+    object_type = "ipmi"
+
+    def __init__(self, health, **kw):
+        super().__init__(**kw)
+        self._health, self.health_calls = health, 0
+
+    async def get_hw_health(self):
+        self.health_calls += 1
+        return self._health
+
+
+def test_poll_ipmi_carries_hw_health():
+    drv = _FakeBmc(_ok({"overall": "ok", "components": {}}))
+    res = _run(_engine_with_fake(drv).poll("d1"))
+    assert res["data"]["hw_health"] == {"overall": "ok", "components": {}}
+    assert res["status"] == "SUCCESS"
+
+
+def test_poll_hw_health_failure_is_error_entry():
+    drv = _FakeBmc(_err("snmp hw health: timeout"))
+    res = _run(_engine_with_fake(drv).poll("d1"))
+    assert res["data"]["hw_health"]["error"] == "snmp hw health: timeout"
+    assert res["status"] == "PARTIAL"
+
+
+def test_poll_hw_health_skipped_when_unreachable_or_not_ipmi():
+    drv = _FakeBmc(_ok({"overall": "ok"}), probe=_err("no SNMP response"))
+    res = _run(_engine_with_fake(drv).poll("d1"))
+    assert "hw_health" not in res["data"] and drv.health_calls == 0
+    drv = _FakeBmc(_ok({"overall": "ok"}))
+    drv.object_type = "aos_switch"
+    res = _run(_engine_with_fake(drv).poll("d1"))
+    assert "hw_health" not in res["data"] and drv.health_calls == 0
+
+
+def test_poll_sends_no_hw_health_for_a_non_hpe_controller():
+    drv = _FakeBmc(_ok(None))
+    res = _run(_engine_with_fake(drv).poll("d1"))
+    assert "hw_health" not in res["data"] and res["status"] == "SUCCESS"

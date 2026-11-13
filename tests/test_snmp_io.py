@@ -530,6 +530,21 @@ def test_walk_stalled_request_ends_the_walk(monkeypatch):
         raise AssertionError("expected SnmpError")
 
 
+def test_walk_complete_raises_when_cut_short_or_on_error_status(monkeypatch):
+    """walk_complete (iLO hardware health) never returns a partial table: a
+    timeout after some rows, or an error status, is a failed read."""
+    for rows in ([(None, 0, 0, [(_FakeOid("1.3.6.1.2.1.4.22.1.3.1.1"), _FakeVal("x"))]),
+                  ("No SNMP response received", 0, 0, [])],
+                 [(None, 5, 0, [(_FakeOid("1.2.3"), _FakeVal("x"))])]):
+        _install_fake(monkeypatch, walk_rows=rows)
+        try:
+            snmp_io.SnmpSession(_DEV).walk_complete(snmp_io.ARP_PREFIX)
+        except snmp_io.SnmpError:
+            pass
+        else:
+            raise AssertionError("expected SnmpError")
+
+
 def test_walk_stops_on_error_status(monkeypatch):
     rows = [(None, 5, 0, [(_FakeOid("1.2.3"), _FakeVal("x"))])]
     _install_fake(monkeypatch, walk_rows=rows)
