@@ -119,7 +119,7 @@ The spoke receives commands from the Lab Manager hub over WebSocket and executes
 | `NW_GET_INTERFACES` | `device_id`, `tenant` *(optional)* | Retrieves port states, duplex, operational speed, descriptions, and error counters. |
 | `NW_GET_ENDPOINTS` | `device_id`, `tenant` *(optional)* | Returns fused ARP + MAC table of unique active IP/MAC endpoints seen on the device. |
 | `NW_GET_VLANS` | `device_id`, `tenant` *(optional)* | Lists 802.1Q VLAN IDs and names configured on the switch. |
-| `NW_POLL` | `device_id`, `tenant` *(optional)* | Comprehensive multi-metric poll (probe, info, interfaces, ARP, and MAC table) in one pass. |
+| `NW_POLL` | `device_id`, `tenant` *(optional)* | Comprehensive multi-metric poll (probe, info, interfaces, ARP, and MAC table) in one pass; iLO controllers also return `hw_health` (power, memory, fans, temperatures, CPUs, storage over SNMP). |
 | `NW_RUN_CONFIG` | `device_id`, `commands` | Stub handler returning not-implemented envelope (config push planned for phase 3). |
 | `NW_PING_SWEEP` | `targets` | Pings each IP once (≤2048) and returns the `alive` ones; used by the hub's gateway sweep. |
 | `NW_SCAN` / `NW_DISCOVER` | `targets`, `credentials`, `options` | Probes candidate IP addresses, fingerprinting manageable devices without modifying fleet. |

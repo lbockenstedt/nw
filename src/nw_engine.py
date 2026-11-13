@@ -565,6 +565,15 @@ class SnmpDriver(NwDriver):
             for k, v in (await bmc_web_identity(self.address)).items():
                 info[k] = info.get(k) or v
 
+    async def get_hw_health(self) -> Dict[str, Any]:
+        """Server hardware health (power, memory, fans, temperatures, CPUs,
+        storage) from the controller's HPE health MIBs; see transports/hw_health."""
+        from transports import hw_health
+        try:
+            return self._ok(await hw_health.snmp_get_hw_health(self._session()))
+        except Exception as e:
+            return _err(f"snmp hw health {self.address}: {e}")
+
     async def get_interfaces(self) -> Dict[str, Any]:
         """Walk ifTable/ipAdEntTable into interface rows."""
         # Imported lazily; pysnmp may be absent.
@@ -1579,6 +1588,22 @@ class NwEngine:
             is_gw = getattr(drv, "object_type", "") == "gateway"
             native_vlans = await _safe(drv.get_vlans(), "vlans") if is_gw else []
 
+            # Server hardware health, on a reachable controller whose transport
+            # can read it (SNMP). A failure is sent as {"error"} so the hub can
+            # show it next to the last good reading.
+            hw_health = None
+            if (reachable and getattr(drv, "object_type", "") == "ipmi"
+                    and hasattr(drv, "get_hw_health")):
+                hr = await drv.get_hw_health()
+                self._log_datum("hw_health", drv, hr)
+                if hr.get("status") == "SUCCESS":
+                    # None: not an HPE controller, so nothing is sent.
+                    hw_health = hr.get("data")
+                else:
+                    msg = hr.get("message", "failed")
+                    errors.append(f"hw_health: {msg}")
+                    hw_health = {"error": msg, "polled_at": time.time()}
+
         # SUCCESS only when reachable AND no sub-datum errored; else PARTIAL — a
         # reachable device whose info/interfaces/arp/mac probes all failed must not
         # report SUCCESS (the errors[] carry the detail).
@@ -1612,18 +1637,21 @@ class NwEngine:
                          getattr(drv, "address", ""), len(errors),
                          "; ".join(errors))
         # Full poll envelope.
+        data = {
+            "reachable": reachable,
+            "latency_ms": latency_ms,
+            "device_info": device_info,
+            "interfaces": interfaces,
+            "arp": arp,
+            "mac_table": mac_table,
+            "endpoints": endpoints,
+            "vlans": vlans,
+        }
+        if hw_health is not None:
+            data["hw_health"] = hw_health
         return {
             "status": status,
-            "data": {
-                "reachable": reachable,
-                "latency_ms": latency_ms,
-                "device_info": device_info,
-                "interfaces": interfaces,
-                "arp": arp,
-                "mac_table": mac_table,
-                "endpoints": endpoints,
-                "vlans": vlans,
-            },
+            "data": data,
             "errors": errors,
             "message": (f"reachable={reachable}, "
                         f"{n_if} interface(s), "
