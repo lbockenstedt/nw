@@ -91,7 +91,10 @@ Drivers are real (not stubbed):
 - **SnmpDriver** — SNMPv2c via pysnmp 7.x (v1arch asyncio), standard MIBs only (IF-MIB,
   IP-MIB, BRIDGE-MIB) so the same OIDs work across all four families. Requires
   `snmp_community` on the device. Blocking pysnmp calls run via
-  `asyncio.to_thread`.
+  `asyncio.to_thread`. Table walks use GETBULK (25 OIDs per request), and each
+  request is bounded by the session timeout, so a dropped reply ends the walk
+  with the rows collected so far instead of hanging it. The MAC table names
+  ports from ifDescr only.
 - **SshCliDriver** — asyncssh interactive PTY, per-vendor text parsers
   (`transports/cli_io.py`); `enable_secret` enters enable mode on AOS-S.
 - **RestDriver** — httpx async, AOS-CX RESTv1 (basic auth) + gateway REST
