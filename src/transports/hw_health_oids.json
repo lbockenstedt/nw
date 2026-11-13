@@ -1,0 +1,94 @@
+{
+  "_comment": "HPE iLO hardware health over SNMP. Every OID and enum below was checked against the HPE MIB text (CPQHLTH-MIB, CPQSTDEQ-MIB, CPQIDA-MIB). Columns are the column number under the table entry OID; rows are keyed by the index after the column. Values in skip_if/ detail maps are the raw SNMP integers as text. A table the iLO doesn't implement walks empty and is left out (not reported).",
+  "condition": {"1": "other", "2": "ok", "3": "degraded", "4": "failed"},
+  "overall": {
+    "_mib": "CPQHLTH-MIB cpqHeMibCondition",
+    "oid": "1.3.6.1.4.1.232.6.1.3"
+  },
+  "groups": {
+    "power": [
+      {
+        "_mib": "CPQHLTH-MIB cpqHeFltTolPwrSupplyCondition (all supplies, incl. lost redundancy)",
+        "scalar": "1.3.6.1.4.1.232.6.2.9.1",
+        "name": "Power supplies (redundancy)"
+      },
+      {
+        "_mib": "CPQHLTH-MIB cpqHeFltTolPowerSupplyEntry",
+        "entry": "1.3.6.1.4.1.232.6.2.9.3.1",
+        "columns": {"bay": 2, "present": 3, "condition": 4, "status": 5, "redundant": 9, "location": 15},
+        "skip_if": {"present": ["2"]},
+        "name": "Power supply {bay}",
+        "detail": {
+          "status": {"2": "general failure", "3": "self-test failure", "4": "fan failure", "5": "temperature failure",
+                     "6": "interlock open", "7": "EPROM failed", "8": "vref failed", "9": "DAC failed",
+                     "10": "RAM test failed", "11": "voltage channel failed", "12": "ORing diode failed",
+                     "13": "brown-out", "14": "gave up on startup", "15": "NVRAM invalid",
+                     "16": "calibration table invalid", "17": "no power input"},
+          "redundant": {"2": "not redundant"}
+        }
+      }
+    ],
+    "memory": [
+      {
+        "_mib": "CPQHLTH-MIB cpqHeResMem2ModuleEntry; condition 4 is degradedModuleIndexUnknown",
+        "entry": "1.3.6.1.4.1.232.6.2.14.13.1",
+        "columns": {"module": 5, "location": 13, "status": 19, "condition": 20},
+        "condition_map": {"1": "other", "2": "ok", "3": "degraded", "4": "degraded"},
+        "skip_if": {"status": ["2"]},
+        "name": "DIMM {module}",
+        "detail": {
+          "status": {"7": "missing", "8": "does not match", "9": "not supported", "10": "bad config",
+                     "11": "degraded", "13": "partial"}
+        }
+      }
+    ],
+    "fans": [
+      {
+        "_mib": "CPQHLTH-MIB cpqHeFltTolFanEntry",
+        "entry": "1.3.6.1.4.1.232.6.2.6.7.1",
+        "columns": {"index": 2, "present": 4, "condition": 9, "location": 11},
+        "skip_if": {"present": ["2"]},
+        "name": "Fan {index}"
+      }
+    ],
+    "temperatures": [
+      {
+        "_mib": "CPQHLTH-MIB cpqHeTemperatureEntry; condition other(1) is an unread or absent sensor",
+        "entry": "1.3.6.1.4.1.232.6.2.6.8.1",
+        "columns": {"index": 2, "celsius": 4, "threshold": 5, "condition": 6, "location": 8},
+        "skip_if": {"condition": ["1"]},
+        "name": "Sensor {index}",
+        "reading": {"value": "celsius", "threshold": "threshold"}
+      }
+    ],
+    "cpus": [
+      {
+        "_mib": "CPQSTDEQ-MIB cpqSeCpuEntry; status unknown(1) ok(2) degraded(3) failed(4) disabled(5)",
+        "entry": "1.3.6.1.4.1.232.1.2.2.1.1",
+        "columns": {"unit": 1, "status": 6, "socket": 9},
+        "condition_column": "status",
+        "condition_map": {"1": "other", "2": "ok", "3": "degraded", "4": "failed", "5": "other"},
+        "name": "CPU {socket}",
+        "detail": {"status": {"5": "disabled"}}
+      }
+    ],
+    "storage": [
+      {
+        "_mib": "CPQIDA-MIB cpqDaCntlrEntry",
+        "entry": "1.3.6.1.4.1.232.3.2.2.1.1",
+        "columns": {"index": 1, "slot": 5, "condition": 6, "location": 20},
+        "name": "Controller slot {slot}"
+      },
+      {
+        "_mib": "CPQIDA-MIB cpqDaPhyDrvEntry",
+        "entry": "1.3.6.1.4.1.232.3.2.5.1.1",
+        "columns": {"bay": 5, "status": 6, "condition": 37, "location": 64},
+        "name": "Drive bay {bay}",
+        "detail": {
+          "status": {"3": "failed", "4": "predictive failure", "5": "erasing", "8": "SSD wear-out",
+                     "9": "not authenticated"}
+        }
+      }
+    ]
+  }
+}

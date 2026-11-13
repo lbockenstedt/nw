@@ -170,8 +170,11 @@ class SnmpSession:
             # Value of the single var-bind.
             return _value_of(var[0])
 
-    async def _awalk(self, oid: str) -> List[Tuple[str, Any]]:
-        """Async walk of an OID subtree; returns (oid, value) pairs."""
+    async def _awalk(self, oid: str, complete: bool = False) -> List[Tuple[str, Any]]:
+        """Async walk of an OID subtree; returns (oid, value) pairs. By default a
+        walk that breaks part-way keeps what it has; with ``complete`` any
+        transport error or SNMP error status raises ``SnmpError`` instead, so a
+        cut-short read never passes for a short (or absent) table."""
         # Unpack the lazily imported API.
         (SnmpDispatcher, CommunityData, UdpTransportTarget, ObjectType,
          ObjectIdentity, get_cmd, bulk_walk_cmd) = self._hlapi()
@@ -197,6 +200,8 @@ class SnmpSession:
                     except asyncio.TimeoutError:
                         err, es, var = "No SNMP response received (walk stalled)", 0, None
                     # Any error ends the walk.
+                    if err and complete:
+                        raise SnmpError(f"walk {oid} on {self.host}: {err}")
                     if err:
                         # "no SNMP response" → timeout; stop what we have.
                         if "no" in str(err).lower() and "response" in str(err).lower():
@@ -207,6 +212,8 @@ class SnmpSession:
                         # Other errors: keep what was collected.
                         break
                     # SNMP error status: stop the walk.
+                    if es and complete:
+                        raise SnmpError(f"walk {oid} on {self.host}: {es} at {ei}")
                     if es:
                         break
                     # Record each returned OID with its value.
@@ -262,6 +269,11 @@ class SnmpSession:
     def walk(self, oid: str) -> List[Tuple[str, Any]]:
         """Blocking walk of an OID subtree (call via asyncio.to_thread)."""
         return self._run(self._awalk(oid))
+
+    def walk_complete(self, oid: str) -> List[Tuple[str, Any]]:
+        """Blocking walk that raises ``SnmpError`` unless the whole subtree was
+        read (call via asyncio.to_thread); for data where a missing row matters."""
+        return self._run(self._awalk(oid, complete=True))
 
 
 def _oid_str(name):
