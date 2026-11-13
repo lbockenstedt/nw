@@ -11,4 +11,6 @@ asyncssh
 # pins existed only because lextudio 6.3.0 wanted pyasn1<0.6.1 while
 # pyasn1-modules>=0.4.2 wanted >=0.6.1 — mutually exclusive, and the agent's
 # per-role pip runs thrashed between them.
-pysnmp>=7.1.0
+# 7.1.32: older 7.x never resolves a GETNEXT/GETBULK that times out, so one
+# dropped reply hung an SNMP walk forever (nw#227).
+pysnmp>=7.1.32
