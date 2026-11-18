@@ -543,9 +543,26 @@ class NwScanner:
         # Reachable if any port answered or the host was pinged.
         result["open_ports"] = open_ports
         result["reachable"] = bool(open_ports) or self.pinged
+        # SNMP is asked beside the SSH logins, not after them: with several login
+        # credentials, slow or rejected logins used up the whole per-host time
+        # budget before SNMP was ever tried, so devices were never SNMP-verified.
+        # Only hosts that answered the TCP probe or a ping are asked: UDP gives no
+        # cheap liveness signal, and timing out on every dead address of a large
+        # sweep would take far longer than the sweep itself.
+        snmp = None
+        if self.try_snmp and (open_ports or self.pinged):
+            snmp = asyncio.ensure_future(self._snmp_phase(host, result))
+        try:
+            return await self._identify(host, result, open_ports, snmp)
+        finally:
+            # A timeout or error while identifying must not leave the SNMP query running.
+            if snmp is not None and not snmp.done():
+                snmp.cancel()
 
-        # Text used for classification.
-        banner = ""
+    async def _identify(self, host: str, result: Dict[str, Any], open_ports: List[int],
+                        snmp: Optional[asyncio.Future]) -> Dict[str, Any]:
+        """Identify ``host`` from SSH, the SNMP answer in ``snmp`` (the running
+        ``_snmp_phase`` task, or None), nmap and a service profile, filling ``result``."""
         # SSH identify — try each credential until one logs in + classifies.
         if 22 in open_ports:
             # First credential that logs in decides.
@@ -568,48 +585,35 @@ class NwScanner:
                                   credential_id=cred.get("id"),
                                   hostname=info.get("hostname") or result["hostname"],
                                   os=_os_from_banner(banner))
-                    await self._probe_snmp(host, result)
+                    # Wait for the SNMP answer so the monitoring sync knows which credential to use.
+                    if snmp is not None:
+                        await snmp
                     return result
                 # Logged in but couldn't classify — keep the banner + hostname.
                 result["hostname"] = info.get("hostname") or result["hostname"]
                 break
 
-        # SNMP identify — try each candidate community. Only on hosts that answered
-        # the TCP probe: UDP gives no cheap liveness signal, and timing out on every
-        # dead address of a large sweep would take far longer than the sweep itself.
-        if self.try_snmp and result["object_type"] is None and (open_ports or self.pinged):
-            # First community that answers decides.
-            for cred in self.credentials:
-                community = cred.get("snmp_community") or cred.get("community")
-                # Credential without a community: skip.
-                if not community:
-                    continue
-                # Query sysDescr/sysName.
-                info = await self._snmp_identify(host, community, self.target_timeout)
-                # No answer: try the next community.
-                if not info:
-                    continue
-                # Classify the description.
-                descr = info.get("text") or ""
-                banner = banner or descr
-                result["reachable"] = True
-                ot = classify_snmp(descr, info.get("hostname") or "", info.get("oid") or "")
-                # Identified via SNMP: record it and finish.
-                if ot:
-                    result.update(object_type=ot, method="snmp", snmp_ok=True,
-                                  snmp_credential_id=cred.get("id"),
-                                  credential=cred.get("name") or cred.get("id"),
-                                  credential_id=cred.get("id"),
-                                  hostname=info.get("hostname") or result["hostname"],
-                                  os=_os_from_banner(descr))
-                    return result
-                # Answered SNMP but isn't a platform we auto-add: still monitorable.
-                result["profile"] = {"sys_descr": " ".join(descr.split())[:300]}
-                result.update(snmp_ok=True, snmp_credential_id=cred.get("id"),
+        # SNMP identify — the first community that answered decides (the query ran
+        # beside the SSH logins above).
+        hit = await snmp if snmp is not None else None
+        if hit:
+            cred, info = hit
+            # Classify the description.
+            descr = info.get("text") or ""
+            result["reachable"] = True
+            ot = classify_snmp(descr, info.get("hostname") or "", info.get("oid") or "")
+            # Identified via SNMP: record it and finish.
+            if ot:
+                result.update(object_type=ot, method="snmp",
+                              credential=cred.get("name") or cred.get("id"),
+                              credential_id=cred.get("id"),
                               hostname=info.get("hostname") or result["hostname"],
-                              os=result["os"] or _os_from_banner(descr))
-                break
-
+                              os=_os_from_banner(descr))
+                return result
+            # Answered SNMP but isn't a platform we auto-add: still monitorable.
+            result["profile"] = {"sys_descr": " ".join(descr.split())[:300]}
+            result.update(hostname=info.get("hostname") or result["hostname"],
+                          os=result["os"] or _os_from_banner(descr))
         # Optional nmap augmentation for the still-unknown-but-reachable ones.
         if self.use_nmap and result["object_type"] is None and open_ports:
             # Run nmap and classify its service text.
@@ -634,25 +638,36 @@ class NwScanner:
         # Result for this target.
         return result
 
-    async def _probe_snmp(self, host: str, result: Dict[str, Any]) -> None:
-        """Record which community (if any) answers, independently of SSH, so the
-        monitoring sync knows which credential to replicate. ``snmp_ok`` stays
-        None when no community was offered (nothing was tested)."""
-        # SNMP disabled: nothing to test.
-        if not self.try_snmp:
-            return
+    async def _snmp_phase(self, host: str, result: Dict[str, Any]
+                          ) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
+        """Ask each candidate community in turn until one answers and return
+        ``(credential, info)`` for it, else None. Runs beside the SSH logins and
+        records its outcome in ``result`` the moment it is known, so it survives
+        the per-host timeout: ``snmp_ok`` is True with the winning
+        ``snmp_credential_id`` the moment a community answers, False only once
+        every community was tried and none answered, and stays None when nothing
+        was offered or the phase was cut off before it finished (unknown, not a
+        failure). The hostname is kept too (monitoring needs it), unless SSH
+        already read one."""
+        tested = False
         # Try each community until one answers.
         for cred in self.credentials:
             community = cred.get("snmp_community") or cred.get("community")
             # Credential without a community: skip.
             if not community:
                 continue
-            # At least one community was tested.
+            tested = True
+            # Query sysDescr/sysName; no answer means try the next community.
+            info = await self._snmp_identify(host, community, self.target_timeout)
+            if not info:
+                continue
+            result.update(snmp_ok=True, snmp_credential_id=cred.get("id"),
+                          hostname=result["hostname"] or info.get("hostname") or "")
+            return cred, info
+        # Reached only when every community was tried without an answer.
+        if tested:
             result["snmp_ok"] = False
-            # Record the first community that answers.
-            if await self._snmp_identify(host, community, self.target_timeout):
-                result.update(snmp_ok=True, snmp_credential_id=cred.get("id"))
-                return
+        return None
 
     async def scan(self, targets: List[str], *, crawl: bool = False,
                    max_targets: int = MAX_TARGETS,
