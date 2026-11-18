@@ -55,6 +55,14 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 # Volatile banner lines/tokens that change every login — excluded from the
 # fingerprint so a normal login isn't mistaken for a banner change.
 _PREV_LOGIN_RE = re.compile(r"(?im)^.*previous.*login.*$")
+# Session notices are not MOTD text. Only consume recognizable continuation
+# lines, never arbitrary following lines that could contain a legal notice.
+_SESSION_LOGIN_RE = re.compile(
+    r"(?im)^[ \t]*(?:last[ \t]+(?:(?:successful|failed|unsuccessful)[ \t]+)?"
+    r"login[ \t]*:|login[ \t]*:[ \t]*\d+[ \t]+(?:successful|failed|unsuccessful)\b)[^\n]*"
+    r"(?:\n[ \t]*(?:from[ \t]+\S+|(?:has[ \t]+)?logged[ \t]+in[ \t]+\d+[ \t]+times"
+    r"|\d+[ \t]+times)[ \t]*$)*"
+)
 # Dates, clock times and IPv4 addresses are also volatile and removed.
 _DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 _TIME_RE = re.compile(r"\d{1,2}:\d{2}:\d{2}")
@@ -62,12 +70,13 @@ _IP_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
 
 
 def _norm_banner(banner: str) -> str:
-    """Normalize a login banner for fingerprinting: drop ANSI, the volatile
-    "previous login" line, and any dates/times/IPs, then collapse whitespace.
+    """Normalize a login banner for fingerprinting: drop ANSI, volatile login
+    notices and dates/times/IPs, then collapse whitespace.
     What remains is the *stable* legal/copyright/T&C text — the thing we want to
     notice a change in."""
-    # Remove terminal escape codes, then the volatile parts, one at a time.
-    s = _ANSI_RE.sub("", banner or "")
+    # Normalize terminal line endings before matching line-based session notices.
+    s = _ANSI_RE.sub("", banner or "").replace("\r\n", "\n").replace("\r", "\n")
+    s = _SESSION_LOGIN_RE.sub("", s)
     s = _PREV_LOGIN_RE.sub("", s)
     s = _DATE_RE.sub("", s)
     s = _TIME_RE.sub("", s)
