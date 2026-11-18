@@ -337,6 +337,51 @@ def test_ssh_identified_device_also_reports_snmp_result():
     assert by["10.0.0.2"]["snmp_ok"] is False
 
 
+def test_slow_ssh_logins_do_not_starve_snmp():
+    # Several login credentials that each hang used to eat the whole per-host
+    # budget before SNMP was tried, leaving snmp_ok unset. SNMP now runs beside
+    # them, so its answer is already in the result when the cap fires.
+    creds = [{"id": f"ssh{i}", "name": f"login{i}", "username": "u", "password": "p"}
+             for i in range(3)] + [{"id": "snmp1", "name": "comm", "snmp_community": "public"}]
+
+    async def _slow_login(host, port, cred, timeout):
+        await asyncio.sleep(1.0)
+
+    scanner = NwScanner(
+        creds, tcp_probe=make_probe({"10.0.0.5": {22}}), ssh_identify=_slow_login,
+        snmp_identify=make_snmp({"10.0.0.5": {"community": "public", "text": "Aruba JL256A 2930F",
+                                              "hostname": "SW-5"}}))
+    res = NwScanner._empty_result("10.0.0.5")
+    with pytest.raises(asyncio.TimeoutError):
+        run(asyncio.wait_for(scanner._fingerprint("10.0.0.5", res), timeout=0.3))
+    assert res["snmp_ok"] is True and res["snmp_credential_id"] == "snmp1"
+    assert res["hostname"] == "SW-5"
+
+
+def test_snmp_cut_off_by_the_host_cap_stays_unknown_not_failed():
+    # A query still in flight when the per-host cap fires proves nothing about
+    # the device, so snmp_ok must stay None rather than read as "no answer".
+    async def _hang(host, community, timeout):
+        await asyncio.sleep(10)
+    scanner = NwScanner([{"id": "snmp1", "name": "comm", "snmp_community": "public"}],
+                        tcp_probe=make_probe({"10.0.0.7": {22}}),
+                        ssh_identify=make_ssh({}), snmp_identify=_hang)
+    res = NwScanner._empty_result("10.0.0.7")
+    with pytest.raises(asyncio.TimeoutError):
+        run(asyncio.wait_for(scanner._fingerprint("10.0.0.7", res), timeout=0.2))
+    assert res["snmp_ok"] is None and res["snmp_credential_id"] is None
+
+
+def test_ssh_identified_host_gets_its_snmp_hostname_when_ssh_has_none():
+    scanner = NwScanner(
+        CREDS, tcp_probe=make_probe({"10.0.0.4": {22}}),
+        ssh_identify=make_ssh({"10.0.0.4": "ArubaOS-CX FL.10.09 6300M"}),
+        snmp_identify=make_snmp({"10.0.0.4": {"community": "public", "text": "ArubaOS-CX",
+                                              "hostname": "CX-4"}}))
+    dev = run(scanner.scan(["10.0.0.4"]))["identified"][0]
+    assert dev["method"] == "ssh" and dev["snmp_ok"] is True and dev["hostname"] == "CX-4"
+
+
 def test_pinged_host_without_open_ports_still_gets_snmp():
     kw = dict(tcp_probe=make_probe({}), ssh_identify=make_ssh({}),
               snmp_identify=make_snmp({"10.0.0.9": "Aruba JL256A 2930F Switch"}))
