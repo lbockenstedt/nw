@@ -2,6 +2,8 @@
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from transports import device_profile  # noqa: E402
@@ -28,6 +30,71 @@ def test_fingerprint_stable_across_logins_only_datetime_changes():
     b2 = _BANNER.replace("2026-08-24 01:40:03", "2026-08-25 09:15:22") \
                 .replace("172.16.1.9", "172.16.1.44")
     assert _fingerprint(b1) == _fingerprint(b2)
+
+
+@pytest.mark.parametrize("notice", [
+    'Last login: from User "{user}" has logged in {count} times',
+    '\tLAST SUCCESSFUL LOGIN: {user} from {host}',
+    'Last failed login: {user}, attempt {count}',
+    'Last unsuccessful login: {user}, attempt {count}',
+    'Login: {count} successful, 2 failed',
+    'Last login: from User "{user}" has logged in\n  {count} times',
+    'Last login: from User "{user}"\n  has logged in {count} times\n  from {host}',
+    'Last successful login:\n  from {host}',
+])
+@pytest.mark.parametrize("newline", ["\n", "\r\n", "\r"])
+def test_session_notices_do_not_change_banner_fingerprint(notice, newline):
+    """Session users, counters and wrapped source hosts are not static banners."""
+    first = notice.format(user="admin", count=12, host="client-a.example")
+    second = notice.format(user="operator", count=137, host="client-b.example")
+    legal = "AUTHORIZED USE ONLY. All activity monitored."
+    for session in (first, second):
+        banner = (session + "\n" + legal).replace("\n", newline)
+        assert _norm_banner(banner) == legal
+        assert _fingerprint(banner) == _fingerprint(legal)
+        assert _fingerprint(session.replace("\n", newline)) == ""
+
+
+def test_session_filter_preserves_legal_text_and_ansi_handling():
+    """Only session headers are ignored; legal mentions and numbers still count."""
+    legal = "We retain your last login: details for 30 days."
+    banner = '\x1b[32m  Last login: admin count 12\x1b[0m\n' + legal
+    assert _norm_banner(banner) == legal
+    assert _fingerprint(banner) != _fingerprint(banner.replace("30 days", "60 days"))
+
+
+def test_record_session_changes_are_quiet_but_motd_changes_warn(tmp_path, caplog):
+    """Exercise persistence and warning detection, not just the hash helper."""
+    s = _store(tmp_path)
+    legal = "AUTHORIZED USE ONLY\n"
+    first = 'Last login: from User "admin" has logged in 12 times\n'
+    second = 'Last login: from User "operator" has logged in\n  137 times\n'
+    s.record(address="192.0.2.1", banner=first + legal)
+    s = _store(tmp_path)
+    with caplog.at_level("WARNING"):
+        s.record(address="192.0.2.1", banner=second + legal)
+        assert "login banner CHANGED" not in caplog.text
+        s.record(address="192.0.2.1", banner=second + legal + "All activity monitored.\n")
+    assert caplog.text.count("login banner CHANGED") == 1
+    assert s.get("192.0.2.1")["banner_excerpt"] == (
+        "AUTHORIZED USE ONLY All activity monitored.")
+
+
+def test_legacy_banner_fingerprint_settles_after_one_observation(tmp_path, caplog):
+    """An old persisted hash is replaced once, without recurring warnings."""
+    path = tmp_path / "profiles.json"
+    path.write_text(
+        '{"192.0.2.1": {"banner_fingerprint": "legacy-session-hash"}}',
+        encoding="utf-8",
+    )
+    with caplog.at_level("WARNING"):
+        for count in (12, 137, 138):
+            s = _store(tmp_path)
+            s.record(address="192.0.2.1", banner=(
+                f'Last login: from User "admin" has logged in {count} times\n'
+                "AUTHORIZED USE ONLY\n"))
+    assert caplog.text.count("login banner CHANGED") == 1
+    assert s.get("192.0.2.1")["banner_fingerprint"] == _fingerprint("AUTHORIZED USE ONLY")
 
 
 def test_fingerprint_changes_when_tc_banner_added():
