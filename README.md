@@ -103,6 +103,24 @@ network/ACL reachability from the nw agent. A timeout alone does not prove that
 credentials were rejected. These diagnostics do not repair credentials or
 reachability, change retry behavior, or suppress failed-poll ERROR results.
 
+Device-profile banner comparisons ignore dynamic `Last login:` notices (including
+successful, failed and unsuccessful variants) and `Login: N successful/failed`
+counters. Recognizable wrapped session lines (`from <host>`, `has logged in N times`,
+or `N times`) are ignored too; other following lines remain part of the banner so
+legal/MOTD changes still warn. Existing saved fingerprints may produce one change
+warning when first replaced by the normalized static banner. If nothing static
+remains, the existing empty-observation behavior keeps the old baseline without
+warning. The truncated alert does not establish the device's exact wrapping;
+if warnings persist, inspect the existing DEBUG-level `login banner/first output`
+trace for the actual format rather than ignoring arbitrary continuation text.
+
+`NW_PING_SWEEP: 0/2048 answered` is separate from banner profiling: none of the
+2048 supplied targets returned a successful ICMP result within the sweep's
+one-second per-target timeout. This alone cannot establish whether the subnet is
+empty or ICMP is blocked. Verify the configured targets/CIDRs and reachability to
+a known-live target from the nw agent, including its routing, ping capability and
+ICMP ACLs. The banner fix does not change sweep behavior.
+
 ## Spoke Commands Reference
 
 The spoke receives commands from the Lab Manager hub over WebSocket and executes them via `nw_spoke.py`:
