@@ -40,6 +40,7 @@ def test_fingerprint_stable_across_logins_only_datetime_changes():
     'Login: {count} successful, 2 failed',
     'Last login: from User "{user}" has logged in\n  {count} times',
     'Last login: from User "{user}"\n  has logged in {count} times\n  from {host}',
+    'Last login: from {host}\nUser "{user}" has logged in {count} times in the past 30 days',
     'Last successful login:\n  from {host}',
 ])
 @pytest.mark.parametrize("newline", ["\n", "\r\n", "\r"])
@@ -178,3 +179,31 @@ def test_unwritable_path_is_nonfatal(tmp_path):
     s = ProfileStore(path="/proc/nonexistent-dir/profiles.json")
     s.record(address="10.0.0.9", prompt="SW#", banner=_BANNER)
     assert s.get("10.0.0.9")["prompt"] == "SW#"
+
+
+def test_multiline_user_login_count_continuation_filtered(tmp_path, caplog):
+    """Aruba AOS-CX multi-line login count must not alter the banner fingerprint."""
+    # 1. Initialize temporary profile store.
+    s = _store(tmp_path)
+    legal = "AUTHORIZED USE ONLY\n"
+    first = (
+        'Last login: Mon Nov 18 10:20:30 from 192.168.1.50\n'
+        'User "admin" has logged in 42 times in the past 30 days.\n'
+    )
+    second = (
+        'Last login: Mon Nov 18 10:21:05 from 192.168.1.50\n'
+        'User "admin" has logged in 43 times in the past 30 days.\n'
+    )
+
+    # 2. Both banners must normalize to the exact same static content.
+    assert _norm_banner(first + legal) == "AUTHORIZED USE ONLY"
+    assert _norm_banner(second + legal) == "AUTHORIZED USE ONLY"
+
+    # 3. Fingerprint (SHA-256 of normalized banner) must be identical.
+    assert _fingerprint(first + legal) == _fingerprint(second + legal)
+
+    # 4. Sequential recording with incrementing count must NOT emit CHANGED warning.
+    s.record(address="192.0.2.1", banner=first + legal)
+    with caplog.at_level("WARNING"):
+        s.record(address="192.0.2.1", banner=second + legal)
+        assert "login banner CHANGED" not in caplog.text
