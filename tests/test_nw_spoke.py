@@ -655,3 +655,38 @@ def test_ipmi_snmp_driver_falls_back_when_the_controller_serves_no_iftable(monke
     assert data["serial"] == "SN123" and data["host_model"] == "PowerEdge R640"
     rows = _run(d.get_interfaces())["data"]
     assert rows[0]["ip"] == "10.1.1.5" and rows[0]["status"] == "up"
+
+
+def test_device_info_ttl_cache_reduces_driver_calls(monkeypatch):
+    """nw#293 / nw#294: verify get_device_info caches SUCCESS and ERROR responses."""
+    from nw_engine import NwEngine
+
+    calls = {"count": 0}
+
+    class _MockDriver:
+        async def get_device_info(self):
+            calls["count"] += 1
+            return {"status": "SUCCESS", "data": {"model": "AOS-S", "serial": "CN123"}}
+
+    eng = NwEngine([{"id": "sw-1", "object_type": "aos_switch", "address": "10.0.0.1"}])
+    monkeypatch.setattr(eng, "_driver_for", lambda dev_id, tenant=None: _MockDriver())
+
+    # Call 1: misses cache, queries driver
+    res1 = _run(eng.get_device_info("sw-1"))
+    assert res1["status"] == "SUCCESS"
+    assert calls["count"] == 1
+
+    # Call 2: hits cache, driver call count remains 1
+    res2 = _run(eng.get_device_info("sw-1"))
+    assert res2["status"] == "SUCCESS"
+    assert res2["data"]["serial"] == "CN123"
+    assert calls["count"] == 1
+
+    # set_devices invalidates cache
+    eng.set_devices([{"id": "sw-1", "object_type": "aos_switch", "address": "10.0.0.1"}])
+
+    # Call 3: queries driver again after cache invalidation
+    res3 = _run(eng.get_device_info("sw-1"))
+    assert res3["status"] == "SUCCESS"
+    assert calls["count"] == 2
+
