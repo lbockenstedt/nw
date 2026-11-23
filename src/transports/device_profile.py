@@ -60,8 +60,8 @@ _PREV_LOGIN_RE = re.compile(r"(?im)^.*previous.*login.*$")
 _SESSION_LOGIN_RE = re.compile(
     r"(?im)^[ \t]*(?:last[ \t]+(?:(?:successful|failed|unsuccessful)[ \t]+)?"
     r"login[ \t]*:|login[ \t]*:[ \t]*\d+[ \t]+(?:successful|failed|unsuccessful)\b)[^\n]*"
-    r"(?:\n[ \t]*(?:from[ \t]+\S+|(?:has[ \t]+)?logged[ \t]+in[ \t]+\d+[ \t]+times"
-    r"|\d+[ \t]+times)[ \t]*$)*"
+    r"(?:\n[ \t]*(?:from[ \t]+\S+|(?:User[ \t]+(?:\S+|\"[^\"]*\")[ \t]+)?(?:has[ \t]+)?logged[ \t]+in\b"
+    r"|\d+[ \t]+times)[^\n]*)*"
 )
 # Dates, clock times and IPv4 addresses are also volatile and removed.
 _DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
