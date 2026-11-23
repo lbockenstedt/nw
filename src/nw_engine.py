@@ -36,7 +36,7 @@ import time
 # Context-manager helper for driver sessions.
 from contextlib import asynccontextmanager
 # Type hints.
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # heartbeat signals progress to the fleet idle-guard.
 import heartbeat
@@ -945,6 +945,9 @@ class NwEngine:
         # box confirmed DOWN by a cheap ping isn't hammered with a full
         # transport poll (each sub-call would just time out).
         self.reachability: Dict[str, Dict[str, Any]] = {}
+        # In-memory TTL cache for NW_GET_DEVICE_INFO (nw#293 / nw#294).
+        # Key: (device_id, tenant, address) -> (monotonic_ts, envelope).
+        self._device_info_cache: Dict[Tuple[str, str, str], Tuple[float, Dict[str, Any]]] = {}
 
     def set_devices(self, devices: List[Dict[str, Any]],
                     shared_tenant_id: str = "") -> None:
@@ -952,6 +955,7 @@ class NwEngine:
         # Replace the fleet and the shared tenant id.
         self.devices = list(devices or [])
         self.shared_tenant_id = shared_tenant_id or ""
+        self._device_info_cache.clear()
         # Count devices per family for the log line.
         types = {}
         for d in self.devices:
@@ -1165,6 +1169,16 @@ class NwEngine:
         ``address`` asks the device's credentials to be tried against another IP
         (e.g. a VLAN address a firewall saw): the reply's serial then says whether
         that IP belongs to the same box."""
+        # Serve from TTL cache when fresh to avoid call-rate storms (nw#294) and
+        # repeated SSH timeout cascades on offline devices (nw#293).
+        key = (str(device_id), str(tenant or ""), str(address or ""))
+        cached = self._device_info_cache.get(key)
+        if cached is not None:
+            ts, cached_res = cached
+            ttl = 30.0 if cached_res.get("status") == "ERROR" else 120.0
+            if time.monotonic() - ts < ttl:
+                return cached_res
+
         # Unknown device: error.
         if address:
             d = self._get_device(device_id, tenant)
@@ -1173,10 +1187,13 @@ class NwEngine:
             drv = self._driver_for(device_id, tenant)
         if not drv:
             logger.warning("nw get_device_info: device %s not in fleet", device_id)
-            return _err(f"Device {device_id} not found")
+            res = _err(f"Device {device_id} not found")
+            self._device_info_cache[key] = (time.monotonic(), res)
+            return res
         # Fetch and log.
         res = await drv.get_device_info()
         self._log_datum("device_info", drv, res)
+        self._device_info_cache[key] = (time.monotonic(), res)
         return res
 
     async def get_mac_table(self, device_id: str, tenant: Optional[str] = None) -> Dict[str, Any]:
