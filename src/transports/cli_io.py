@@ -188,7 +188,7 @@ class CliSession:
                                  password=self.password, known_hosts=None,
                                  login_timeout=10),
                 timeout=15.0)
-        except asyncio.TimeoutError as e:
+        except (asyncio.TimeoutError, TimeoutError) as e:
             # TimeoutError often has no text, leaving operators with a blank error.
             raise CliError(
                 f"SSH connect to {self.host}:{self.port}: timed out during TCP "
