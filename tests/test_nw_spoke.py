@@ -690,3 +690,221 @@ def test_device_info_ttl_cache_reduces_driver_calls(monkeypatch):
     assert res3["status"] == "SUCCESS"
     assert calls["count"] == 2
 
+
+def test_device_info_icmp_reachability_gate(monkeypatch):
+    """nw#293 / nw#297: verify get_device_info short-circuits when device is ICMP offline."""
+    import time
+    from nw_engine import NwEngine
+
+    calls = {"count": 0}
+
+    class _MockDriver:
+        async def get_device_info(self):
+            calls["count"] += 1
+            return {"status": "SUCCESS", "data": {"model": "AOS-S", "serial": "CN123"}}
+
+    eng = NwEngine([{"id": "sw-down", "object_type": "aos_switch", "address": "10.0.0.99"}])
+    monkeypatch.setattr(eng, "_driver_for", lambda dev_id, tenant=None: _MockDriver())
+
+    # Mark device as confirmed unreachable via ICMP
+    eng.reachability["sw-down"] = {
+        "reachable": False,
+        "latency_ms": None,
+        "checked_at": time.monotonic(),
+    }
+    assert eng.recently_unreachable("sw-down") is True
+
+    # Calling get_device_info should short-circuit with ERROR without invoking driver
+    res = _run(eng.get_device_info("sw-down"))
+    assert res["status"] == "ERROR"
+    assert "offline (ICMP confirmed)" in res["message"]
+    assert calls["count"] == 0
+
+    # Device recovery: when reachability flips to True, next call reaches driver immediately
+    eng.reachability["sw-down"]["reachable"] = True
+    assert eng.recently_unreachable("sw-down") is False
+    res_recovered = _run(eng.get_device_info("sw-down"))
+    assert res_recovered["status"] == "SUCCESS"
+    assert calls["count"] == 1
+
+
+def test_device_info_tenant_isolation_before_gate(monkeypatch):
+    """Defect A fix: cross-tenant lookup must return 'not found', never 'offline'."""
+    import time
+    from nw_engine import NwEngine
+
+    # sw-tenant-a belongs to tenant 't-a'
+    eng = NwEngine([{"id": "sw-a", "object_type": "aos_switch", "address": "10.0.0.1", "tenant_id": "t-a"}])
+    # Mark it down in reachability
+    eng.reachability["sw-a"] = {
+        "reachable": False,
+        "latency_ms": None,
+        "checked_at": time.monotonic(),
+    }
+
+    # Query from tenant 't-b' must return 'not found', NOT leak offline status
+    res = _run(eng.get_device_info("sw-a", tenant="t-b"))
+    assert res["status"] == "ERROR"
+    assert "not found" in res["message"]
+    assert "offline" not in res["message"]
+
+
+def test_device_info_address_bypass_gate(monkeypatch):
+    """Stub probes passing address= must bypass the device-level ICMP gate."""
+    import time
+    from nw_engine import NwEngine
+
+    calls = {"count": 0}
+
+    class _MockDriver:
+        async def get_device_info(self):
+            calls["count"] += 1
+            return {"status": "SUCCESS", "data": {"model": "AOS-S", "serial": "CN-STUB"}}
+
+    import nw_engine
+    monkeypatch.setattr(nw_engine, "build_driver", lambda d: _MockDriver())
+
+    eng = NwEngine([{"id": "sw-down", "object_type": "aos_switch", "address": "10.0.0.99"}])
+    eng.reachability["sw-down"] = {
+        "reachable": False,
+        "latency_ms": None,
+        "checked_at": time.monotonic(),
+    }
+    assert eng.recently_unreachable("sw-down") is True
+
+    # Passing address= targets an alternate IP/stub and must reach driver
+    res = _run(eng.get_device_info("sw-down", address="10.0.0.100"))
+    assert res["status"] == "SUCCESS"
+    assert calls["count"] == 1
+
+
+def test_device_info_concurrency_coalescing(monkeypatch):
+    """Defect B fix: concurrent in-flight requests coalesce into a single driver call."""
+    import asyncio
+    from nw_engine import NwEngine
+
+    calls = {"count": 0}
+
+    class _SlowDriver:
+        async def get_device_info(self):
+            calls["count"] += 1
+            await asyncio.sleep(0.05)
+            return {"status": "SUCCESS", "data": {"model": "AOS-S", "serial": "CN-COALESCE"}}
+
+    eng = NwEngine([{"id": "sw-slow", "object_type": "aos_switch", "address": "10.0.0.5"}])
+    monkeypatch.setattr(eng, "_driver_for", lambda dev_id, tenant=None: _SlowDriver())
+
+    async def _concurrent_calls():
+        # Launch 5 concurrent calls
+        tasks = [eng.get_device_info("sw-slow") for _ in range(5)]
+        results = await asyncio.gather(*tasks)
+        return results
+
+    results = _run(_concurrent_calls())
+    assert len(results) == 5
+    for r in results:
+        assert r["status"] == "SUCCESS"
+        assert r["data"]["serial"] == "CN-COALESCE"
+    # Exactly 1 driver call occurred despite 5 concurrent callers
+    assert calls["count"] == 1
+
+
+def test_device_info_leader_cancellation(monkeypatch):
+    """H1 fix: cancelling the leader resolves the future with an error so waiting callers never hang."""
+    import asyncio
+    from nw_engine import NwEngine
+
+    started = asyncio.Event()
+
+    class _HangingDriver:
+        async def get_device_info(self):
+            started.set()
+            await asyncio.sleep(10.0)
+            return {"status": "SUCCESS", "data": {"model": "AOS-S"}}
+
+    eng = NwEngine([{"id": "sw-lead", "object_type": "aos_switch", "address": "10.0.0.6"}])
+    monkeypatch.setattr(eng, "_driver_for", lambda dev_id, tenant=None: _HangingDriver())
+
+    async def _test():
+        leader_task = asyncio.create_task(eng.get_device_info("sw-lead"))
+        await started.wait()
+
+        # Launch 2 waiting callers
+        waiter1 = asyncio.create_task(eng.get_device_info("sw-lead"))
+        waiter2 = asyncio.create_task(eng.get_device_info("sw-lead"))
+        await asyncio.sleep(0.01)
+
+        # Cancel leader
+        leader_task.cancel()
+        try:
+            await leader_task
+        except asyncio.CancelledError:
+            pass
+
+        # Waiters must not hang and must receive an ERROR envelope
+        res1 = await asyncio.wait_for(waiter1, timeout=1.0)
+        res2 = await asyncio.wait_for(waiter2, timeout=1.0)
+        assert res1["status"] == "ERROR"
+        assert res2["status"] == "ERROR"
+        assert "aborted" in res1["message"]
+        assert "aborted" in res2["message"]
+
+    _run(_test())
+
+
+def test_device_info_waiting_caller_cancellation(monkeypatch):
+    """H1 fix: cancelling a waiting caller does not cancel the shared flight for leader or others."""
+    import asyncio
+    from nw_engine import NwEngine
+
+    started = asyncio.Event()
+
+    class _SlowDriver:
+        async def get_device_info(self):
+            started.set()
+            await asyncio.sleep(0.05)
+            return {"status": "SUCCESS", "data": {"model": "AOS-S", "serial": "CN-SHIELD"}}
+
+    eng = NwEngine([{"id": "sw-shield", "object_type": "aos_switch", "address": "10.0.0.7"}])
+    monkeypatch.setattr(eng, "_driver_for", lambda dev_id, tenant=None: _SlowDriver())
+
+    async def _test():
+        leader = asyncio.create_task(eng.get_device_info("sw-shield"))
+        await started.wait()
+
+        waiter1 = asyncio.create_task(eng.get_device_info("sw-shield"))
+        waiter2 = asyncio.create_task(eng.get_device_info("sw-shield"))
+        await asyncio.sleep(0.01)
+
+        # Cancel waiter 1
+        waiter1.cancel()
+        try:
+            await waiter1
+        except asyncio.CancelledError:
+            pass
+
+        # Leader and waiter2 must still complete with SUCCESS
+        res_lead = await leader
+        res_wait2 = await waiter2
+        assert res_lead["status"] == "SUCCESS"
+        assert res_lead["data"]["serial"] == "CN-SHIELD"
+        assert res_wait2["status"] == "SUCCESS"
+        assert res_wait2["data"]["serial"] == "CN-SHIELD"
+
+    _run(_test())
+
+
+def test_device_info_cache_hard_bound():
+    """H2 fix: cache enforces a hard limit of 500 entries across all write paths."""
+    from nw_engine import NwEngine
+
+    eng = NwEngine([])
+    # Query 600 unknown devices (writes to cache on 'not found' path)
+    for i in range(600):
+        _run(eng.get_device_info(f"dev-{i}"))
+
+    assert len(eng._device_info_cache) <= 500
+
+
+
+

@@ -33,6 +33,8 @@ import shutil
 import sys
 # time for latency measurement and probe caching.
 import time
+# copy for deep-copying cached envelopes to prevent caller mutation leaks.
+import copy
 # Context-manager helper for driver sessions.
 from contextlib import asynccontextmanager
 # Type hints.
@@ -948,6 +950,15 @@ class NwEngine:
         # In-memory TTL cache for NW_GET_DEVICE_INFO (nw#293 / nw#294).
         # Key: (device_id, tenant, address) -> (monotonic_ts, envelope).
         self._device_info_cache: Dict[Tuple[str, str, str], Tuple[float, Dict[str, Any]]] = {}
+        # In-flight deduplication future map: key -> asyncio.Future
+        self._device_info_inflight: Dict[Tuple[str, str, str], asyncio.Future] = {}
+
+    def _cache_set_device_info(self, key: Tuple[str, str, str], res: Dict[str, Any]) -> None:
+        """Store device_info in TTL cache, enforcing a hard 500-entry cap across all write paths."""
+        if len(self._device_info_cache) >= 500:
+            oldest_key = min(self._device_info_cache, key=lambda k: self._device_info_cache[k][0])
+            self._device_info_cache.pop(oldest_key, None)
+        self._device_info_cache[key] = (time.monotonic(), copy.deepcopy(res))
 
     def set_devices(self, devices: List[Dict[str, Any]],
                     shared_tenant_id: str = "") -> None:
@@ -956,6 +967,7 @@ class NwEngine:
         self.devices = list(devices or [])
         self.shared_tenant_id = shared_tenant_id or ""
         self._device_info_cache.clear()
+        self._device_info_inflight.clear()
         # Count devices per family for the log line.
         types = {}
         for d in self.devices:
@@ -1170,16 +1182,29 @@ class NwEngine:
         (e.g. a VLAN address a firewall saw): the reply's serial then says whether
         that IP belongs to the same box."""
         # Serve from TTL cache when fresh to avoid call-rate storms (nw#294) and
-        # repeated SSH timeout cascades on offline devices (nw#293).
+        # repeated SSH timeout cascades on offline devices (nw#293 / nw#297).
         key = (str(device_id), str(tenant or ""), str(address or ""))
         cached = self._device_info_cache.get(key)
         if cached is not None:
             ts, cached_res = cached
-            ttl = 30.0 if cached_res.get("status") == "ERROR" else 120.0
-            if time.monotonic() - ts < ttl:
-                return cached_res
+            # nw#294: fleet-rules 4.8 — 300s (5 min) TTL for healthy devices.
+            # nw#297: 60s for transient errors, extended to 120s if confirmed offline.
+            is_down = self.recently_unreachable(device_id) if not address else False
+            err_ttl = 120.0 if is_down else 60.0
+            ttl = err_ttl if cached_res.get("status") == "ERROR" else 300.0
+            age_s = time.monotonic() - ts
+            if age_s < ttl:
+                out = copy.deepcopy(cached_res)
+                out["cached"] = True
+                out["age_s"] = round(age_s, 1)
+                return out
 
-        # Unknown device: error.
+        # In-flight coalescing: concurrent callers await existing flight shielded from caller cancellation (H1).
+        if key in self._device_info_inflight:
+            res = await asyncio.shield(self._device_info_inflight[key])
+            return copy.deepcopy(res)
+
+        # 1. Resolve driver and enforce tenant boundary FIRST (Defect A fix).
         if address:
             d = self._get_device(device_id, tenant)
             drv = build_driver({**d, "address": str(address)}) if d else None
@@ -1188,13 +1213,36 @@ class NwEngine:
         if not drv:
             logger.warning("nw get_device_info: device %s not in fleet", device_id)
             res = _err(f"Device {device_id} not found")
-            self._device_info_cache[key] = (time.monotonic(), res)
+            self._cache_set_device_info(key, res)
             return res
-        # Fetch and log.
-        res = await drv.get_device_info()
-        self._log_datum("device_info", drv, res)
-        self._device_info_cache[key] = (time.monotonic(), res)
-        return res
+
+        # 2. ICMP reachability gate: only checked AFTER tenant verification (Defect A & D fix).
+        # Short-circuit without caching the error so recovery is immediate when ping succeeds.
+        if not address and self.recently_unreachable(device_id):
+            logger.info("nw get_device_info %s -> skipped: ICMP-confirmed offline", device_id)
+            return _err(f"Device {device_id} is offline (ICMP confirmed)")
+
+        # 3. Single-flight execution with 20.0s time limit and cancellation-safe future (Defects B, C, H1, H2 fix).
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        self._device_info_inflight[key] = fut
+        try:
+            try:
+                res = await asyncio.wait_for(drv.get_device_info(), timeout=20.0)
+            except asyncio.TimeoutError:
+                res = _err(f"get_device_info timed out after 20.0s on {device_id}")
+            except Exception as e:
+                res = _err(f"get_device_info failed on {device_id}: {e}")
+            self._log_datum("device_info", drv, res)
+            self._cache_set_device_info(key, res)
+            if not fut.done():
+                fut.set_result(res)
+            return copy.deepcopy(res)
+        finally:
+            if not fut.done():
+                fut.set_result(_err(f"get_device_info aborted on {device_id}"))
+            if self._device_info_inflight.get(key) is fut:
+                self._device_info_inflight.pop(key, None)
 
     async def get_mac_table(self, device_id: str, tenant: Optional[str] = None) -> Dict[str, Any]:
         """Fetch forwarding MAC table entries for a single device."""
