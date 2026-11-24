@@ -186,7 +186,8 @@ def summarize_vlans(endpoints: Any, interfaces: Any = None) -> List[Dict[str, An
 
     # Count endpoints, MACs and IPs per VLAN.
     for e in (endpoints or []):
-        vlan = str(e.get("vlan") or "").strip()
+        vlan_val = e.get("vlan")
+        vlan = str(vlan_val).strip() if vlan_val is not None else ""
         # No VLAN: not counted.
         if not vlan:
             continue
@@ -223,7 +224,8 @@ def enrich_vlans(native_rows: Any, endpoints: Any,
     # Annotate each native VLAN row.
     out = []
     for r in (native_rows or []):
-        vid = str(r.get("vlan") or "").strip()
+        vid_val = r.get("vlan")
+        vid = str(vid_val).strip() if vid_val is not None else ""
         # Skip rows without a VLAN id.
         if not vid:
             continue
@@ -259,7 +261,11 @@ async def icmp_ping(host: str, timeout: float = 2.0, count: int = 1) -> Dict[str
     so no CAP_NET_RAW / root is needed on the spoke.
     """
     # No host: result unknown.
-    if not host:
+    if not host or not isinstance(host, str):
+        return {"reachable": None, "latency_ms": None}
+    host = host.strip()
+    # Reject flag injection, whitespace, control characters, or non-hostname strings.
+    if not host or host.startswith("-") or any(c.isspace() or ord(c) < 32 for c in host):
         return {"reachable": None, "latency_ms": None}
     # No ping binary: result unknown.
     ping_bin = shutil.which("ping")
@@ -269,10 +275,11 @@ async def icmp_ping(host: str, timeout: float = 2.0, count: int = 1) -> Dict[str
     to = int(max(1, round(timeout)))
     # -W is a per-reply wait in SECONDS on Linux/iputils but MILLISECONDS on
     # BSD/macOS; macOS uses -t for an overall deadline instead.
+    # Note: "--" separates command options from positional target to prevent option injection.
     if sys.platform == "darwin":
-        args = [ping_bin, "-c", str(count), "-t", str(to), host]
+        args = [ping_bin, "-c", str(count), "-t", str(to), "--", host]
     else:
-        args = [ping_bin, "-c", str(count), "-W", str(to), host]
+        args = [ping_bin, "-c", str(count), "-W", str(to), "--", host]
     # Run ping, capped a little past its own timeout.
     proc = None
     try:
@@ -289,8 +296,9 @@ async def icmp_ping(host: str, timeout: float = 2.0, count: int = 1) -> Dict[str
             except ProcessLookupError:
                 pass
         return {"reachable": False, "latency_ms": None}
-    except Exception:  # noqa: BLE001 - spawn failure -> unknown, fail open
+    except Exception as e:  # noqa: BLE001 - spawn failure -> unknown, fail open
         # Could not start ping: result unknown.
+        logger.debug("icmp_ping spawn failed for %s: %s", host, e)
         return {"reachable": None, "latency_ms": None}
     # Exit code 0 means the host answered.
     reachable = proc.returncode == 0
@@ -362,9 +370,9 @@ class _SharedTransportSession:
         if s is not None:
             try:
                 await s.close()
-            except Exception:
-                # Close errors are ignored.
-                pass
+            except Exception as e:
+                # Close errors are logged for observability but ignored.
+                logger.debug("Failed to close transport session cleanly: %s", e)
 
 
 class NwDriver:
