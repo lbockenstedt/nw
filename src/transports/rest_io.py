@@ -347,9 +347,9 @@ async def _cx_v10_prefix(session: "RestSession") -> str:
         m = re.search(r"10\.(\d{1,2})", fw)
         if m:
             return f"v10_{int(m.group(1)):02d}"
-    except Exception:
-        # Could not read the firmware: use the default below.
-        pass
+    except Exception as e:
+        # Could not read the firmware: log debug trace and use the default below.
+        logger.debug("cx_v10_prefix: firmware lookup failed, falling back to default: %s", e)
     # Widely supported default.
     return "v10_09"
 
