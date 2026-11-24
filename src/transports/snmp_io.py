@@ -635,9 +635,10 @@ async def snmp_get_device_info(session: SnmpSession) -> dict:
     mac = ""
     try:
         mac = _mac_from_octets(await _to_thread(session.get, BRIDGE_BASE_MAC))
-    except Exception:  # noqa: BLE001 — identity extras are best-effort
-        # Not served: leave the MAC empty.
-        pass
+    except Exception as e:  # noqa: BLE001 — identity extras are best-effort
+        # Not served: leave the MAC empty and log debug trace.
+        logger.debug("snmp_get_device_info: BRIDGE-MIB base MAC fetch failed on %s: %s",
+                     getattr(session, "host", "unknown"), e)
     # Firmware: the "revision X.Y.Z" token in sysDescr, else the whole description.
     m = re.search(r"\brevision\s+([A-Z]{0,3}\.?\d+(?:\.\w+)+)", descr, re.IGNORECASE)
     # Device info for the driver.
