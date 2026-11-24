@@ -1251,6 +1251,9 @@ class NwEngine:
         if not drv:
             logger.warning("nw get_mac_table: device %s not in fleet", device_id)
             return _err(f"Device {device_id} not found")
+        if self.recently_unreachable(device_id):
+            logger.info("nw get_mac_table %s -> skipped: ICMP-confirmed offline", device_id)
+            return _err(f"Device {device_id} is offline (ICMP confirmed)")
         # Augment the MAC table with the client/ARP table so each MAC carries its
         # IP: gateway = `show user-table` ⋈ `show datapath bridge table`;
         # AOS-S = `show arp` (IP+MAC) ⋈ `show mac-address` (MAC+VLAN+port).
@@ -1286,6 +1289,9 @@ class NwEngine:
         if not drv:
             logger.warning("nw get_lldp_neighbors: device %s not in fleet", device_id)
             return _err(f"Device {device_id} not found")
+        if self.recently_unreachable(device_id):
+            logger.info("nw get_lldp_neighbors %s -> skipped: ICMP-confirmed offline", device_id)
+            return _err(f"Device {device_id} is offline (ICMP confirmed)")
         # Fetch and log.
         res = await drv.get_lldp_neighbors()
         self._log_datum("lldp", drv, res)
@@ -1298,6 +1304,9 @@ class NwEngine:
         if not drv:
             logger.warning("nw get_arp: device %s not in fleet", device_id)
             return _err(f"Device {device_id} not found")
+        if self.recently_unreachable(device_id):
+            logger.info("nw get_arp %s -> skipped: ICMP-confirmed offline", device_id)
+            return _err(f"Device {device_id} is offline (ICMP confirmed)")
         # Fetch and log.
         res = await drv.get_arp()
         self._log_datum("arp", drv, res)
@@ -1310,6 +1319,9 @@ class NwEngine:
         if not drv:
             logger.warning("nw get_interfaces: device %s not in fleet", device_id)
             return _err(f"Device {device_id} not found")
+        if self.recently_unreachable(device_id):
+            logger.info("nw get_interfaces %s -> skipped: ICMP-confirmed offline", device_id)
+            return _err(f"Device {device_id} is offline (ICMP confirmed)")
         # Fetch and log.
         res = await drv.get_interfaces()
         self._log_datum("interfaces", drv, res)
@@ -1324,6 +1336,9 @@ class NwEngine:
         if not drv:
             logger.warning("nw get_endpoints: device %s not in fleet", device_id)
             return _err(f"Device {device_id} not found")
+        if self.recently_unreachable(device_id):
+            logger.info("nw get_endpoints %s -> skipped: ICMP-confirmed offline", device_id)
+            return _err(f"Device {device_id} is offline (ICMP confirmed)")
         # Gather the three datums.
         arp, mac, ifs = await self._gather_endpoint_datums(drv)
         self._log_datum("endpoints", drv, arp)
@@ -1345,6 +1360,9 @@ class NwEngine:
         if not drv:
             logger.warning("nw get_vlans: device %s not in fleet", device_id)
             return _err(f"Device {device_id} not found")
+        if self.recently_unreachable(device_id):
+            logger.info("nw get_vlans %s -> skipped: ICMP-confirmed offline", device_id)
+            return _err(f"Device {device_id} is offline (ICMP confirmed)")
         # Native VLANs plus endpoint datums, over one session.
         async with self._session_scope(drv):
             native = await drv.get_vlans()
@@ -1423,6 +1441,9 @@ class NwEngine:
         if not drv:
             logger.warning("nw run_config: device %s not in fleet", device_id)
             return _err(f"Device {device_id} not found")
+        if self.recently_unreachable(device_id):
+            logger.info("nw run_config %s -> skipped: ICMP-confirmed offline", device_id)
+            return _err(f"Device {device_id} is offline (ICMP confirmed)")
         # Delegate to the driver.
         return await drv.run_config(commands or [])
 
@@ -1450,6 +1471,9 @@ class NwEngine:
         if not drv:
             logger.warning("nw install_cert: device %s not in fleet", device_id)
             return _err(f"Device {device_id} not found")
+        if self.recently_unreachable(device_id):
+            logger.info("nw install_cert %s -> skipped: ICMP-confirmed offline", device_id)
+            return _err(f"Device {device_id} is offline (ICMP confirmed)")
         # Dispatch by device family.
         ot = (drv.object_type or "").strip().lower()
         if ot == "cx_switch":

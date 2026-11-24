@@ -975,6 +975,108 @@ def test_control_plane_lifecycle_teardown(monkeypatch):
     _run(_test())
 
 
+def test_mac_table_icmp_reachability_gate(monkeypatch):
+    """nw#235: verify get_mac_table short-circuits in 0.0s when device is ICMP offline."""
+    import time
+    from nw_engine import NwEngine
+
+    calls = {"count": 0}
+
+    class _MockDriver:
+        object_type = "generic_switch"
+        async def get_mac_table(self):
+            calls["count"] += 1
+            return {"status": "SUCCESS", "data": [{"mac": "aa:bb:cc:dd:ee:ff", "port": "1"}]}
+
+    eng = NwEngine([{"id": "sw-down", "object_type": "generic_switch", "address": "10.0.0.99"}])
+    monkeypatch.setattr(eng, "_driver_for", lambda dev_id, tenant=None: _MockDriver() if dev_id == "sw-down" else None)
+
+    # Mark device as confirmed unreachable via ICMP
+    eng.reachability["sw-down"] = {
+        "reachable": False,
+        "latency_ms": None,
+        "checked_at": time.monotonic(),
+    }
+    assert eng.recently_unreachable("sw-down") is True
+
+    # get_mac_table must short-circuit without invoking driver
+    res = _run(eng.get_mac_table("sw-down"))
+    assert res["status"] == "ERROR"
+    assert "offline (ICMP confirmed)" in res["message"]
+    assert calls["count"] == 0
+
+    # Device recovery: when reachability flips to True, call reaches driver immediately
+    eng.reachability["sw-down"]["reachable"] = True
+    assert eng.recently_unreachable("sw-down") is False
+    res_recovered = _run(eng.get_mac_table("sw-down"))
+    assert res_recovered["status"] == "SUCCESS"
+    assert calls["count"] == 1
+
+
+def test_datum_queries_icmp_reachability_gate(monkeypatch):
+    """nw#235: verify all individual datum queries short-circuit when device is offline."""
+    import time
+    from nw_engine import NwEngine
+
+    calls = []
+
+    class _MockDriver:
+        object_type = "generic_switch"
+        async def get_arp(self):
+            calls.append("arp")
+            return {"status": "SUCCESS", "data": []}
+        async def get_interfaces(self):
+            calls.append("interfaces")
+            return {"status": "SUCCESS", "data": []}
+        async def get_lldp_neighbors(self):
+            calls.append("lldp")
+            return {"status": "SUCCESS", "data": []}
+        async def get_endpoints(self):
+            calls.append("endpoints")
+            return {"status": "SUCCESS", "data": []}
+        async def get_vlans(self):
+            calls.append("vlans")
+            return {"status": "SUCCESS", "data": []}
+
+    eng = NwEngine([{"id": "sw-down", "object_type": "generic_switch", "address": "10.0.0.99"}])
+    monkeypatch.setattr(eng, "_driver_for", lambda dev_id, tenant=None: _MockDriver() if dev_id == "sw-down" else None)
+
+    eng.reachability["sw-down"] = {
+        "reachable": False,
+        "latency_ms": None,
+        "checked_at": time.monotonic(),
+    }
+
+    for method_name in ("get_arp", "get_interfaces", "get_lldp_neighbors", "get_endpoints", "get_vlans"):
+        method = getattr(eng, method_name)
+        res = _run(method("sw-down"))
+        assert res["status"] == "ERROR", f"{method_name} should have failed"
+        assert "offline (ICMP confirmed)" in res["message"], f"{method_name} message unexpected: {res}"
+
+    assert len(calls) == 0, "No driver calls should have been made for offline device"
+
+
+def test_mac_table_tenant_isolation_before_gate(monkeypatch):
+    """nw#235 tenant isolation: cross-tenant lookup must return 'not found', never 'offline'."""
+    import time
+    from nw_engine import NwEngine
+
+    # sw-a belongs to tenant 't-a'
+    eng = NwEngine([{"id": "sw-a", "object_type": "generic_switch", "address": "10.0.0.1", "tenant_id": "t-a"}])
+    eng.reachability["sw-a"] = {
+        "reachable": False,
+        "latency_ms": None,
+        "checked_at": time.monotonic(),
+    }
+
+    # Query with wrong tenant 't-b' must return 'not found', NOT leak offline status
+    res = _run(eng.get_mac_table("sw-a", tenant="t-b"))
+    assert res["status"] == "ERROR"
+    assert "not found" in res["message"]
+    assert "offline" not in res["message"]
+
+
+
 
 
 
