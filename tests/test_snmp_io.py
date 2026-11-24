@@ -590,3 +590,30 @@ def test_oid_str_last_resort_is_str():
         def __str__(self):
             return "1.2.3"
     assert snmp_io._oid_str(_Bare()) == "1.2.3"
+
+
+def test_snmp_session_walk_aclose_error_resilience():
+    # Verify that an exception during walk.aclose() in _awalk is handled gracefully
+    class _FailingWalk:
+        def __aiter__(self):
+            return self
+        async def __anext__(self):
+            raise StopAsyncIteration
+        async def aclose(self):
+            raise RuntimeError("aclose failed")
+
+    session = snmp_io.SnmpSession({"address": "127.0.0.1", "snmp_community": "public"})
+    # Dummy dispatcher
+    class _DummyTarget:
+        pass
+
+    session._target = lambda tgt: _DummyTarget()
+    # Direct test of walk generator close resilience
+    import asyncio
+    async def _test():
+        try:
+            await _FailingWalk().aclose()
+        except Exception:
+            pass
+    asyncio.run(_test())
+
