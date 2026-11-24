@@ -257,6 +257,15 @@ def test_scan_lldp_crawl_enqueues_neighbors():
     assert res["scanned"] == 2
 
 
+def test_nmap_augment_target_expansion_rejected():
+    from nw_scanner import _nmap_augment
+    # Range / CIDR / glob expansions must be rejected
+    assert run(_nmap_augment("10.0.0.0/24", 5.0)) == ""
+    assert run(_nmap_augment("10.0.0.*", 5.0)) == ""
+    assert run(_nmap_augment("10.0.0.[1-10]", 5.0)) == ""
+    assert run(_nmap_augment("10.0.0.1; rm -rf /", 5.0)) == ""
+
+
 # ── discovery_only: the result must say whether credentials were in play ─────
 # Scan credentials are optional. Without them nothing can SSH/SNMP-identify, so
 # every classification comes from nmap service detection and carries no

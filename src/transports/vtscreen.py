@@ -111,8 +111,14 @@ class TerminalScreen:
                     j += 1
                 self._write(s[i:j])
                 i = j
-        # Keep anything not yet processed (an incomplete escape) for the next feed.
-        self._pending = s[i:]
+        # Keep anything not yet processed (an incomplete escape) for the next feed,
+        # capped to 8KB to prevent unbounded memory growth and quadratic CPU exhaustion
+        # on malformed or unclosed escape sequences.
+        rem = s[i:]
+        if len(rem) > 8192:
+            self._pending = ""
+        else:
+            self._pending = rem
 
     # ── query replies ────────────────────────────────────────────────────────
     def pending_replies(self) -> str:

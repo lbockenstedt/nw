@@ -527,6 +527,60 @@ def test_parse_lldp_neighbors():
     assert ips == ["10.0.0.2", "10.0.0.3"]
 
 
+def test_sanitize_err_msg_comprehensive():
+    from nw_engine import _sanitize_err_msg
+    # Bearer header
+    assert _sanitize_err_msg("Authorization: Bearer mysecrettoken123") == "Authorization: Bearer ***"
+    # JSON payload
+    assert '"password":***' in _sanitize_err_msg('{"password": "mypassword123"}')
+    # Key-value params
+    assert _sanitize_err_msg("api_key=key_val&community=public_comm") == "api_key=***&community=***"
+
+
+def test_spoke_mask_recursive_and_case_insensitive():
+    from nw_spoke import NwSpoke
+    sample = {
+        "device": {
+            "id": "sw1",
+            "Password": "pass_val",
+            "apiToken": "tok_val",
+            "community": "comm_val",
+            "meta": {
+                "priv_password": "priv_val"
+            }
+        },
+        "credentials": [
+            {"username": "admin", "password": "p", "community": "c"}
+        ]
+    }
+    masked = NwSpoke._mask(sample)
+    assert masked["device"]["Password"] == "********"
+    assert masked["device"]["apiToken"] == "********"
+    assert masked["device"]["community"] == "********"
+    assert masked["device"]["meta"]["priv_password"] == "********"
+    assert masked["credentials"][0]["password"] == "********"
+    assert masked["credentials"][0]["community"] == "********"
+
+
+def test_get_device_info_address_override_validation():
+    from nw_engine import NwEngine
+    eng = NwEngine([{"id": "d1", "object_type": "gateway", "address": "10.0.0.1"}])
+    # Loopback target must be rejected
+    res = _run(eng.get_device_info("d1", address="127.0.0.1"))
+    assert res["status"] == "ERROR"
+    assert "Invalid target address" in res["message"]
+
+    # Multicast target must be rejected
+    res_m = _run(eng.get_device_info("d1", address="224.0.0.5"))
+    assert res_m["status"] == "ERROR"
+    assert "Invalid target address" in res_m["message"]
+
+    # Non-IP string must be rejected
+    res_s = _run(eng.get_device_info("d1", address="not-an-ip"))
+    assert res_s["status"] == "ERROR"
+    assert "Invalid target address" in res_s["message"]
+
+
 # ── NW_GET_LLDP_NEIGHBORS: structured topology edges ────────────────────────
 # The chassis id is canonicalised so an LLDP edge and a MAC-table row describe
 # the SAME node when the hub stitches them together. It must be canonicalised
