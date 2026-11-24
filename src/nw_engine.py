@@ -1137,6 +1137,9 @@ class NwEngine:
             "latency_ms": res.get("latency_ms"),
             "checked_at": time.monotonic(),
         }
+        addr = d.get("address")
+        if addr:
+            self.reachability[addr] = self.reachability[device_id]
         # Debug log and result.
         logger.debug("nw ping %s (%s) -> reachable=%s latency=%sms",
                      device_id, d.get("address", ""), res.get("reachable"),
@@ -1218,9 +1221,11 @@ class NwEngine:
 
         # 2. ICMP reachability gate: only checked AFTER tenant verification (Defect A & D fix).
         # Short-circuit without caching the error so recovery is immediate when ping succeeds.
-        if not address and self.recently_unreachable(device_id):
-            logger.info("nw get_device_info %s -> skipped: ICMP-confirmed offline", device_id)
-            return _err(f"Device {device_id} is offline (ICMP confirmed)")
+        unreachable = self.recently_unreachable(address) if address else self.recently_unreachable(device_id)
+        if unreachable:
+            target = address or device_id
+            logger.info("nw get_device_info %s -> skipped: ICMP-confirmed offline", target)
+            return _err(f"Device {target} is offline (ICMP confirmed)")
 
         # 3. Single-flight execution with 20.0s time limit and cancellation-safe future (Defects B, C, H1, H2 fix).
         loop = asyncio.get_running_loop()
@@ -1231,8 +1236,12 @@ class NwEngine:
                 res = await asyncio.wait_for(drv.get_device_info(), timeout=20.0)
             except asyncio.TimeoutError:
                 res = _err(f"get_device_info timed out after 20.0s on {device_id}")
+                if address:
+                    self.reachability[address] = {"reachable": False, "latency_ms": None, "checked_at": time.monotonic()}
             except Exception as e:
                 res = _err(f"get_device_info failed on {device_id}: {e}")
+                if address and ("Connect call failed" in str(e) or "timed out" in str(e)):
+                    self.reachability[address] = {"reachable": False, "latency_ms": None, "checked_at": time.monotonic()}
             self._log_datum("device_info", drv, res)
             self._cache_set_device_info(key, res)
             if not fut.done():
