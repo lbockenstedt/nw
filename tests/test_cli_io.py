@@ -702,3 +702,54 @@ def test_gateway_mac_falls_back_to_vlan1_svi():
     info = asyncio.get_event_loop().run_until_complete(
         cli_io.cli_get_device_info(s, "gateway"))
     assert info["mac"] == "00:0b:86:bc:49:87"
+
+
+def test_channel_closed_handles_attribute_errors():
+    class _BrokenProc:
+        @property
+        def exit_status(self):
+            raise AttributeError("broken exit_status")
+
+        @property
+        def exit_signal(self):
+            raise AttributeError("broken exit_signal")
+
+        @property
+        def channel(self):
+            raise RuntimeError("channel attribute error")
+
+    s = cli_io.CliSession({"address": "10.0.0.1", "username": "admin"})
+    s._proc = _BrokenProc()
+    # Must not raise and assume open (False)
+    assert s._channel_closed() is False
+
+
+def test_close_handles_component_exceptions():
+    class _FailingStdin:
+        def write(self, data):
+            raise BrokenPipeError("pipe broken")
+
+    class _FailingProc:
+        def __init__(self):
+            self.stdin = _FailingStdin()
+            self.exit_status = None
+            self.exit_signal = None
+            self.channel = None
+
+        def close(self):
+            raise RuntimeError("proc close failed")
+
+    class _FailingConn:
+        def close(self):
+            raise RuntimeError("conn close failed")
+
+        async def wait_closed(self):
+            raise RuntimeError("conn wait_closed failed")
+
+    s = cli_io.CliSession({"address": "10.0.0.1", "username": "admin"})
+    s._proc = _FailingProc()
+    s._conn = _FailingConn()
+
+    # close() must handle all component failures gracefully
+    asyncio.get_event_loop().run_until_complete(s.close())
+
