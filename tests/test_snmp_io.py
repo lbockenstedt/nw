@@ -228,6 +228,22 @@ def test_snmp_get_device_info_chassis_identity():
     assert info["mac"] == "38:21:c7:fc:8e:e0"
 
 
+def test_snmp_get_device_info_bridge_mac_failure_resilience():
+    class _FailingMacSnmp(_FakeSnmp):
+        def get(self, oid):
+            if oid == snmp_io.BRIDGE_BASE_MAC:
+                raise snmp_io.SnmpError("OID not supported")
+            return super().get(oid)
+
+    s = _FailingMacSnmp(gets={snmp_io.SYS_DESCR: "Switch 2930F",
+                              snmp_io.SYS_NAME: "edge-sw",
+                              snmp_io.IF_NUMBER: 24})
+    info = _run(snmp_io.snmp_get_device_info(s))
+    assert info["mac"] == ""
+    assert info["hostname"] == "edge-sw"
+
+
+
 def test_snmp_get_interfaces():
     P = snmp_io.IF_PREFIX
     IP = snmp_io.IP_PREFIX
