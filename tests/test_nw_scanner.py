@@ -489,3 +489,50 @@ def test_snmp_identify_retries_a_dropped_sysname(monkeypatch):
     monkeypatch.setattr(snmp_io, "SnmpSession", FakeSession)
     info = run(nw_scanner._snmp_identify("10.0.0.1", "public", 1.0))
     assert info["hostname"] == "tor-1"
+
+
+def test_nmap_augment_rejects_malicious_inputs():
+    """Verify _nmap_augment rejects leading dashes, spaces, control characters, and non-strings."""
+    from nw_scanner import _nmap_augment
+
+    invalid_hosts = [
+        "-iL /etc/passwd",
+        "-oN /tmp/output",
+        "-sS",
+        "--script vuln",
+        "10.0.0.1; rm -rf /",
+        "10.0.0.1 192.168.1.1",
+        "host\nwith\nnewline",
+        "",
+        "   ",
+        None,
+        99999,
+    ]
+    for bad in invalid_hosts:
+        res = run(_nmap_augment(bad, 5.0))
+        assert res == "", f"Expected '' for invalid host: {bad!r}"
+
+
+def test_nmap_augment_uses_argument_separator(monkeypatch):
+    """Verify _nmap_augment places '--' before the host parameter to prevent option injection."""
+    from nw_scanner import _nmap_augment
+
+    invoked_args = []
+
+    class FakeProc:
+        async def communicate(self):
+            return b"PORT   STATE SERVICE VERSION\n22/tcp open  ssh     OpenSSH 8.2\n", b""
+
+    async def fake_exec(*args, **kwargs):
+        invoked_args.extend(args)
+        return FakeProc()
+
+    monkeypatch.setattr(nw_scanner.shutil, "which", lambda _b: "/usr/bin/nmap")
+    monkeypatch.setattr(nw_scanner.asyncio, "create_subprocess_exec", fake_exec)
+
+    res = run(_nmap_augment("192.168.1.100", 5.0))
+    assert "OpenSSH" in res
+    assert "--" in invoked_args
+    dash_idx = invoked_args.index("--")
+    assert invoked_args[dash_idx + 1] == "192.168.1.100"
+
