@@ -193,3 +193,80 @@ def test_poll_proceeds_when_reachability_unknown():
     res = _run(eng.poll("d1"))
     assert res["status"] == "SUCCESS"
     assert res["data"]["reachable"] is True
+
+
+def test_icmp_ping_rejects_malicious_inputs():
+    """Verify icmp_ping immediately rejects flag injections and bad inputs."""
+    invalid_hosts = [
+        "-c 1 127.0.0.1",
+        "-t 1 10.0.0.1",
+        "--help",
+        "-f",
+        "10.0.0.1; whoami",
+        "10.0.0.1 192.168.1.1",
+        "host\nwith\nnewlines",
+        "",
+        "   ",
+        None,
+        12345,
+    ]
+    for bad_host in invalid_hosts:
+        res = _run(icmp_ping(bad_host))
+        assert res["reachable"] is None, f"Expected None for invalid host: {bad_host!r}"
+        assert res["latency_ms"] is None
+
+
+def test_icmp_ping_argument_separator():
+    """Verify that '--' is placed before the target host in ping invocation."""
+    orig_which = nw_engine.shutil.which
+    orig_exec = nw_engine.asyncio.create_subprocess_exec
+    invoked_args = []
+
+    async def _mock_exec(*args, **kwargs):
+        invoked_args.extend(args)
+        return _FakeProc(0, b"time=1.5 ms\n")
+
+    try:
+        nw_engine.shutil.which = lambda _n: "/sbin/ping"
+        nw_engine.asyncio.create_subprocess_exec = _mock_exec
+        res = _run(icmp_ping("192.168.1.50"))
+        assert res["reachable"] is True
+        assert res["latency_ms"] == 1.5
+        assert "--" in invoked_args
+        dash_idx = invoked_args.index("--")
+        assert invoked_args[dash_idx + 1] == "192.168.1.50"
+    finally:
+        nw_engine.shutil.which = orig_which
+        nw_engine.asyncio.create_subprocess_exec = orig_exec
+
+
+def test_summarize_and_enrich_vlans_handles_vlan_zero():
+    """Verify summarize_vlans and enrich_vlans correctly handle numeric 0 VLAN."""
+    from nw_engine import summarize_vlans, enrich_vlans
+    endpoints = [{"mac": "aa:bb:cc:dd:ee:01", "ip": "10.0.0.1", "vlan": 0}]
+    summary = summarize_vlans(endpoints)
+    assert len(summary) == 1
+    assert summary[0]["vlan"] == "0"
+    assert summary[0]["endpoints"] == 1
+
+    native = [{"vlan": 0, "name": "DefaultVLAN0", "ports": "1/1"}]
+    enriched = enrich_vlans(native, endpoints)
+    assert len(enriched) == 1
+    assert enriched[0]["vlan"] == "0"
+    assert enriched[0]["endpoints"] == 1
+
+
+def test_shared_transport_session_close_handles_exception():
+    """Verify _SharedTransportSession.close() gracefully logs and absorbs close errors."""
+    from nw_engine import _SharedTransportSession
+
+    class _FailingSession:
+        async def close(self):
+            raise RuntimeError("Underlying socket abruptly severed")
+
+    shared = _SharedTransportSession(lambda: None)
+    shared.session = _FailingSession()
+    # close() must not raise
+    _run(shared.close())
+    assert shared.session is None
+
