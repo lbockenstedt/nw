@@ -753,3 +753,26 @@ def test_close_handles_component_exceptions():
     # close() must handle all component failures gracefully
     asyncio.get_event_loop().run_until_complete(s.close())
 
+
+def test_cli_get_lldp_neighbors_handles_failure():
+    class _FailingSession:
+        host = "10.0.0.1"
+        async def run(self, cmd):
+            raise cli_io.CliError("command failed")
+
+    res = asyncio.get_event_loop().run_until_complete(
+        cli_io.cli_get_lldp_neighbors(_FailingSession(), "aos_switch"))
+    assert res == []
+
+
+def test_cli_install_cert_gateway_handles_build_error():
+    class _DummySession:
+        host = "10.0.0.1"
+
+    # Invalid cert/key triggers build error envelope
+    res = asyncio.get_event_loop().run_until_complete(
+        cli_io.cli_install_cert_gateway(_DummySession(), "not-a-cert", "not-a-key", "", "test.local"))
+    assert res["status"] == "ERROR"
+    assert "PKCS#12 build failed" in res["message"]
+
+
