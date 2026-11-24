@@ -1113,7 +1113,8 @@ async def cli_get_lldp_neighbors(session: CliSession, object_type: str) -> List[
     # Run it; any failure means no neighbors.
     try:
         text = await session.run(cmd)
-    except Exception:
+    except Exception as e:
+        logger.debug("cli %s: LLDP neighbor query failed: %s", getattr(session, "host", "unknown"), e)
         return []
     # Extract the management IPs.
     return parse_lldp_neighbors(text)
@@ -1774,7 +1775,8 @@ async def cli_get_device_info(session: CliSession, object_type: str) -> dict:
             # A failing alternate is just skipped.
             try:
                 alt_text = await session.run(alt)
-            except Exception:  # noqa: BLE001
+            except Exception as e:  # noqa: BLE001
+                logger.debug("cli_get_device_info: alternate command %r failed: %s", alt, e)
                 continue
             # Accepted: use its output.
             if not _cli_rejected(alt_text):
@@ -1919,6 +1921,7 @@ async def cli_install_cert_gateway(session: CliSession, fullchain: str, privkey:
     try:
         pfx = _build_pkcs12(fullchain, privkey, name, passphrase)
     except Exception as e:  # noqa: BLE001
+        logger.debug("gateway: PKCS#12 build failed: %s", e, exc_info=True)
         return _err(f"gateway: PKCS#12 build failed: {e}")
 
     # Output of each step, for diagnosis.
@@ -1942,9 +1945,11 @@ async def cli_install_cert_gateway(session: CliSession, fullchain: str, privkey:
         save = await session.run("write memory")
         log.append("save: " + " ".join(save.split())[:120])
     except CliError as e:
+        logger.debug("gateway cert install CliError: %s", e, exc_info=True)
         # Return the log with the error so the failure point is visible.
         return _err(f"gateway cert install: {e}", {"log": log})
     except Exception as e:  # noqa: BLE001
+        logger.debug("gateway cert install unexpected error: %s", e, exc_info=True)
         # Unexpected error: same envelope.
         return _err(f"gateway cert install: {e}", {"log": log})
 
