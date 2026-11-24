@@ -182,10 +182,13 @@ class CliSession:
                 # Unsupported asyncssh version: ignore.
                 pass
         # TCP connect plus authentication, capped at 15 seconds overall.
+        known_hosts_path = os.environ.get("LM_NW_KNOWN_HOSTS") or getattr(self, "known_hosts", None)
+        if not known_hosts_path:
+            logger.debug("SSH connecting to %s without pinned known_hosts (LM_NW_KNOWN_HOSTS not set)", self.host)
         try:
             self._conn = await asyncio.wait_for(
                 asyncssh.connect(self.host, port=self.port, username=self.username,
-                                 password=self.password, known_hosts=None,
+                                 password=self.password, known_hosts=known_hosts_path,
                                  login_timeout=10),
                 timeout=15.0)
         except (asyncio.TimeoutError, TimeoutError) as e:

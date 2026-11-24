@@ -35,6 +35,8 @@ import sys
 import time
 # copy for deep-copying cached envelopes to prevent caller mutation leaks.
 import copy
+# ipaddress for destination target validation.
+import ipaddress
 # Context-manager helper for driver sessions.
 from contextlib import asynccontextmanager
 # Type hints.
@@ -94,8 +96,12 @@ _DEFAULT_TRANSPORT: Dict[str, str] = {
 _VALID_TRANSPORTS = ("ssh", "rest", "snmp", "auto")
 _VALID_OBJECT_TYPES = tuple(_VENDOR_COMMANDS.keys())
 
-# Credential field names — never logged.
-_SENSITIVE = ("password", "enable_secret", "api_token", "snmp_community")
+# Credential field names — never logged. Mirrors spoke-level _SENSITIVE set.
+_SENSITIVE = (
+    "password", "enable_secret", "api_token", "snmp_community", "community",
+    "secret", "hub_secret", "privkey", "private_key", "token",
+    "api_key", "auth", "authorization", "bearer",
+)
 
 
 def _norm_mac(m: str) -> str:
@@ -240,13 +246,18 @@ def enrich_vlans(native_rows: Any, endpoints: Any,
 
 
 def _sanitize_err_msg(msg: Any) -> str:
-    """Mask credentials (token, password, secret, bearer) in error strings."""
-    return re.sub(
-        r"(token|password|secret|bearer)[=:]\s*([^\s&,]+)",
-        r"\1=***",
-        str(msg or ""),
+    """Mask credentials (token, password, secret, bearer, api_key, community) in error strings."""
+    s = str(msg or "")
+    # Mask HTTP Bearer token headers: Authorization: Bearer <token>
+    s = re.sub(r"(bearer)\s+([^\s&,]+)", r"\1 ***", s, flags=re.IGNORECASE)
+    # Mask key-value credentials in URL params, JSON, or exception strings without adding extra spaces
+    s = re.sub(
+        r"""((?:token|password|secret|bearer|community|api_key|privkey|private_key)["']?\s*[:=])\s*(?:["'][^"']*["']|[^\s&,]+)""",
+        r"\1***",
+        s,
         flags=re.IGNORECASE,
     )
+    return s
 
 
 def _err(message: str, data: Any = None) -> Dict[str, Any]:
@@ -1233,8 +1244,19 @@ class NwEngine:
 
         # 1. Resolve driver and enforce tenant boundary FIRST (Defect A fix).
         if address:
+            addr_str = str(address).strip()
+            # Validate address override to prevent credential relaying to loopback, multicast, or malformed targets
+            try:
+                ip_obj = ipaddress.ip_address(addr_str)
+                if ip_obj.is_loopback or ip_obj.is_multicast or ip_obj.is_unspecified:
+                    logger.warning("nw get_device_info %s: rejected invalid destination override %s", device_id, address)
+                    return _err(f"Invalid target address {address}")
+            except ValueError:
+                # Disallow CIDRs, ranges, or non-IP strings
+                logger.warning("nw get_device_info %s: rejected non-IP address override %s", device_id, address)
+                return _err(f"Invalid target address {address}")
             d = self._get_device(device_id, tenant)
-            drv = build_driver({**d, "address": str(address)}) if d else None
+            drv = build_driver({**d, "address": addr_str}) if d else None
         else:
             drv = self._driver_for(device_id, tenant)
         if not drv:
