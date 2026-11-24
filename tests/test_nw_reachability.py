@@ -270,3 +270,20 @@ def test_shared_transport_session_close_handles_exception():
     _run(shared.close())
     assert shared.session is None
 
+
+def test_err_envelope_sanitizes_credentials():
+    """Verify _err masks embedded tokens, passwords, and secrets in error strings."""
+    from nw_engine import _err, _sanitize_err_msg
+
+    raw = "Failed to connect: token=secret12345&user=admin and password: supersecretpass"
+    sanitized = _sanitize_err_msg(raw)
+    assert "token=***" in sanitized
+    assert "secret12345" not in sanitized
+    assert "password=***" in sanitized or "password:***" in sanitized or "password=***" in sanitized
+    assert "supersecretpass" not in sanitized
+
+    envelope = _err("HTTP 401: Bearer=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.xyz")
+    assert "Bearer=***" in envelope["message"]
+    assert "eyJhbGciOi" not in envelope["message"]
+
+
