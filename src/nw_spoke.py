@@ -120,6 +120,14 @@ class NwSpoke(BaseSpoke):
         ]
         logger.info("nw background loops started (poll + reachability sweep)")
 
+    def stop_background_loops(self) -> None:
+        """Cancel and clean up autonomous background tasks."""
+        for task in self._bg_tasks:
+            if not task.done():
+                task.cancel()
+        self._bg_tasks.clear()
+        logger.info("nw background loops stopped")
+
     _NW_POLL_FIRST_MAX = 600   # first poll after a (re)start: 5–15 min, not 3–9h
 
     @staticmethod
