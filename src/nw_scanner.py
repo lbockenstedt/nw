@@ -455,21 +455,32 @@ async def _nmap_augment(host: str, timeout: float) -> str:
     host = host.strip()
     if not host or host.startswith("-") or any(c.isspace() or ord(c) < 32 for c in host):
         return ""
+    # Reject range/CIDR target expansion to ensure single-host scans only.
+    if any(ch in host for ch in ("/", "*", "[", "]", "?", ";", "$")):
+        return ""
     # nmap not installed: skip.
     if not shutil.which("nmap"):
         return ""
-    # Any failure or timeout: no extra text.
+    # Minimum 1 second timeout to prevent nmap from treating 0s as unlimited.
+    to_s = max(1, int(round(timeout)))
+    proc = None
+    # Any failure or timeout: kill process and return empty text.
     try:
         # Service/version scan of this host only, without a ping check.
         # Note: "--" separates command options from positional target to prevent option injection.
         proc = await asyncio.create_subprocess_exec(
-            "nmap", "-sV", "-Pn", "-T4", "--host-timeout", f"{int(timeout)}s",
+            "nmap", "-sV", "-Pn", "-T4", "--host-timeout", f"{to_s}s",
             "--", host, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
         # Wait a little past nmap's own host timeout.
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout + 5)
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=to_s + 5)
         return (out or b"").decode("utf-8", "replace")
     except Exception:  # noqa: BLE001
-        # Failed or timed out.
+        # Kill orphaned nmap process on timeout or error
+        if proc is not None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
         return ""
 
 

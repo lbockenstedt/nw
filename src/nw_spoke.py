@@ -40,9 +40,9 @@ logger = logging.getLogger("NwSpoke")
 # opnsense spoke's masking precedent: leaking both ends of a credential exposes
 # a meaningful fraction of a typical secret, so the whole value is replaced.
 _SENSITIVE = {
-    "password", "enable_secret", "api_token", "snmp_community",
+    "password", "enable_secret", "api_token", "snmp_community", "community",
     "secret", "hub_secret", "privkey", "private_key", "token",
-    "api_key", "auth", "authorization",
+    "api_key", "auth", "authorization", "bearer",
 }
 
 
@@ -409,25 +409,21 @@ class NwSpoke(BaseSpoke):
     # ── Logging helper: mask sensitive fields in any command data ───────────
     @staticmethod
     def _mask(data: Any) -> Any:
-        """Recursively redact sensitive credential keys from dictionary data."""
-        # Non-dicts pass through.
-        if not isinstance(data, dict):
-            return data
-        # Copy each key, masking sensitive ones.
-        out = {}
-        for k, v in data.items():
-            # Credential fields are fully masked.
-            if k in _SENSITIVE:
-                out[k] = "********"
-            elif k == "credentials" and isinstance(v, list):
-                # NW_SCAN carries a list of credential dicts — mask each nested
-                # secret so a scan never leaks candidate passwords/communities.
-                out[k] = [NwSpoke._mask(c) if isinstance(c, dict) else c for c in v]
-            else:
-                # Other values are copied as is.
-                out[k] = v
-        # Masked copy.
-        return out
+        """Recursively redact sensitive credential keys from dicts and lists."""
+        if isinstance(data, dict):
+            out = {}
+            for k, v in data.items():
+                k_lower = str(k).lower()
+                # Exact sensitive key or suffix match (_password, _secret, _token, _key)
+                if (k_lower in _SENSITIVE or
+                        any(k_lower.endswith(sfx) for sfx in ("_secret", "_password", "_token", "_key", "password", "secret", "token", "community"))):
+                    out[k] = "********"
+                else:
+                    out[k] = NwSpoke._mask(v)
+            return out
+        elif isinstance(data, list):
+            return [NwSpoke._mask(item) for item in data]
+        return data
 
     async def handle_command(self, command_type: str, data: Dict[str, Any]) -> Dict[str, Any]:
         """Dispatch a hub NW_* command to the engine.
