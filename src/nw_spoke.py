@@ -39,8 +39,11 @@ logger = logging.getLogger("NwSpoke")
 # Credential field names — FULL mask in logs (never partial). Mirrors the
 # opnsense spoke's masking precedent: leaking both ends of a credential exposes
 # a meaningful fraction of a typical secret, so the whole value is replaced.
-_SENSITIVE = {"password", "enable_secret", "api_token", "snmp_community",
-              "secret", "hub_secret"}
+_SENSITIVE = {
+    "password", "enable_secret", "api_token", "snmp_community",
+    "secret", "hub_secret", "privkey", "private_key", "token",
+    "api_key", "auth", "authorization",
+}
 
 
 
@@ -808,8 +811,8 @@ class NwSpoke(BaseSpoke):
             profiles = device_profile.store().all()
             if profiles:
                 status["device_profiles"] = profiles
-        except Exception:  # noqa: BLE001 — status must not fail on profiling
-            pass
+        except Exception as e:  # noqa: BLE001 — status must not fail on profiling
+            logger.debug("nw get_status: device_profiles retrieval failed: %s", e)
         # Status report.
         return status
 
