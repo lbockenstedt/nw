@@ -1076,6 +1076,46 @@ def test_mac_table_tenant_isolation_before_gate(monkeypatch):
     assert "offline" not in res["message"]
 
 
+def test_device_info_address_reachability_gate(monkeypatch):
+    """nw#267 / nw#300: custom address reachability gating and failure recording."""
+    import time
+    from nw_engine import NwEngine
+
+    calls = {"count": 0}
+
+    class _FailingDriver:
+        async def get_device_info(self):
+            calls["count"] += 1
+            raise RuntimeError("SSH connect to 10.0.0.100:22: Connect call failed ('10.0.0.100', 22)")
+
+    import nw_engine
+    monkeypatch.setattr(nw_engine, "build_driver", lambda d: _FailingDriver())
+
+    eng = NwEngine([{"id": "sw-1", "object_type": "aos_switch", "address": "10.0.0.50"}])
+
+    # 1. When address is marked unreachable in reachability cache, short-circuit immediately
+    eng.reachability["10.0.0.100"] = {
+        "reachable": False,
+        "latency_ms": None,
+        "checked_at": time.monotonic(),
+    }
+    res_gated = _run(eng.get_device_info("sw-1", address="10.0.0.100"))
+    assert res_gated["status"] == "ERROR"
+    assert "offline (ICMP confirmed)" in res_gated["message"]
+    assert calls["count"] == 0
+
+    # 2. When address recovers, call proceeds to driver
+    eng.reachability.pop("10.0.0.100")
+    res1 = _run(eng.get_device_info("sw-1", address="10.0.0.100"))
+    assert res1["status"] == "ERROR"
+    assert calls["count"] == 1
+    # Error records 10.0.0.100 as unreachable
+    assert "10.0.0.100" in eng.reachability
+    assert eng.reachability["10.0.0.100"]["reachable"] is False
+
+
+
+
 
 
 
