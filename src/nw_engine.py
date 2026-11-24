@@ -239,10 +239,21 @@ def enrich_vlans(native_rows: Any, endpoints: Any,
     return out
 
 
+def _sanitize_err_msg(msg: Any) -> str:
+    """Mask credentials (token, password, secret, bearer) in error strings."""
+    return re.sub(
+        r"(token|password|secret|bearer)[=:]\s*([^\s&,]+)",
+        r"\1=***",
+        str(msg or ""),
+        flags=re.IGNORECASE,
+    )
+
+
 def _err(message: str, data: Any = None) -> Dict[str, Any]:
     """Construct an error response envelope with message and optional data payload."""
+    clean_msg = _sanitize_err_msg(message)
     return {"status": "ERROR", "data": data if data is not None else [],
-            "message": message}
+            "message": clean_msg}
 
 
 async def icmp_ping(host: str, timeout: float = 2.0, count: int = 1) -> Dict[str, Any]:
@@ -813,9 +824,11 @@ class RestDriver(NwDriver):
                 return self._ok(rows)
         except rest_io.RestError as e:
             # HTTP/transport failure.
+            logger.debug("rest %s error: %s", self.address, _sanitize_err_msg(e))
             return _err(f"rest {self.address}: {e}")
         except Exception as e:
             # Any other failure.
+            logger.debug("rest %s unexpected failure: %s", self.address, _sanitize_err_msg(e))
             return _err(f"rest {self.address}: {e}")
 
     async def probe(self) -> Dict[str, Any]:
@@ -837,6 +850,7 @@ class RestDriver(NwDriver):
                              "latency_ms": int((time.monotonic() - t0) * 1000)})
         except Exception as e:
             # Request failed: unreachable.
+            logger.debug("rest probe %s failed: %s", self.address, _sanitize_err_msg(e))
             return _err(f"rest probe {self.address}: {e}",
                         {"reachable": False, "latency_ms": 0})
 
@@ -887,9 +901,11 @@ class RestDriver(NwDriver):
             return self._ok(data, message=msg)
         except rest_io.RestError as e:
             # HTTP/transport failure.
+            logger.debug("rest install_cert %s error: %s", self.address, _sanitize_err_msg(e))
             return _err(f"rest install_cert {self.address}: {e}")
         except Exception as e:
             # Any other failure.
+            logger.debug("rest install_cert %s unexpected failure: %s", self.address, _sanitize_err_msg(e))
             return _err(f"rest install_cert {self.address}: {e}")
 
 
