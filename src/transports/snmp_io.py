@@ -224,9 +224,9 @@ class SnmpSession:
                 # Close the generator so a stalled request is not left pending.
                 try:
                     await walk.aclose()
-                except Exception:  # noqa: BLE001
+                except Exception as e:  # noqa: BLE001
                     # A generator cancelled mid-request may refuse to close; nothing to keep.
-                    pass
+                    logger.debug("snmp walk.aclose failed on %s: %s", self.host, e)
         # All pairs collected.
         return out
 
