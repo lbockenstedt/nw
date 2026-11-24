@@ -148,17 +148,17 @@ class CliSession:
         try:
             if proc.exit_status is not None or proc.exit_signal is not None:
                 return True
-        except Exception:
+        except Exception as e:
             # Attribute missing: cannot tell.
-            pass
+            logger.debug("cli %s: exit_status check attribute error: %s", self.host, e)
         # A channel that is closing is also closed for our purposes.
         try:
             chan = proc.channel
             if chan is not None and chan.is_closing():
                 return True
-        except Exception:
+        except Exception as e:
             # Attribute missing: cannot tell.
-            pass
+            logger.debug("cli %s: channel.is_closing check attribute error: %s", self.host, e)
         # No sign of closure: assume open.
         return False
 
@@ -346,24 +346,24 @@ class CliSession:
         try:
             if self._proc is not None and not self._channel_closed():
                 self._proc.stdin.write("exit\n")
-        except Exception:
+        except Exception as e:
             # Channel already gone: nothing to do.
-            pass
+            logger.debug("cli %s: exit command write failed: %s", self.host, e)
         # Close the interactive process.
         try:
             if self._proc:
                 self._proc.close()
-        except Exception:
+        except Exception as e:
             # Already closed: ignore.
-            pass
+            logger.debug("cli %s: proc.close failed: %s", self.host, e)
         # Close the SSH connection and wait until it is down.
         try:
             if self._conn:
                 self._conn.close()
                 await self._conn.wait_closed()
-        except Exception:
+        except Exception as e:
             # Already closed: ignore.
-            pass
+            logger.debug("cli %s: conn.close failed: %s", self.host, e)
 
     def _flush_term_replies(self) -> bool:
         """Write any host-bound replies the shadow emulator queued in answer to
@@ -621,9 +621,9 @@ class CliSession:
             # Always delete the local temp file.
             try:
                 os.unlink(tmp)
-            except OSError:
+            except OSError as e:
                 # Already gone: ignore.
-                pass
+                logger.debug("cli %s: scp tempfile unlink error: %s", self.host, e)
 
 
 # ── Pure parsers (testable) ──────────────────────────────────────────────────
