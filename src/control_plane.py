@@ -32,6 +32,8 @@ import logging
 import argparse
 # asyncio runs the control plane's event loop.
 import asyncio
+# re for URL masking.
+import re
 # time and the typing hints below are kept for helpers/type annotations.
 import time
 from typing import Dict, Any
@@ -94,17 +96,16 @@ class NwControlPlane(BaseControlPlane):
     def __init__(self, spoke_id: str, secret: str, hub_secret: str = None,
                  hub_url: str = None, config: Dict[str, Any] = None):
         """Store the spoke's config and set up the Hub connection as module type "nw"."""
-        # Initialize attributes before calling super().__init__ so background
-        # workers started by the base class see them.
-        self.config = config or {}
         super().__init__(spoke_id, secret, hub_secret, hub_url)
+        self.config = config or {}
         # Advertise "nw" so the Hub routes NW_* commands and fleet config to this spoke.
         self.module_type = "nw"
 
     async def run_hub_mode(self):
         """Native LM Spoke behavior (standalone lm-nw service)."""
-        # Announce which Hub this spoke is connecting to.
-        logger.info(f"Starting Network Devices Module in HUB MODE -> {self.hub_url}")
+        # Announce which Hub this spoke is connecting to, masking embedded credentials if present.
+        masked_url = re.sub(r"://([^:@]+):([^@]+)@", r"://\1:***@", self.hub_url) if self.hub_url else ""
+        logger.info(f"Starting Network Devices Module in HUB MODE -> {masked_url}")
 
         # Build the nw module and register it so the Hub can route "nw" commands to it.
         nw_spoke = NwSpoke(self.spoke_id, self.config)
@@ -118,8 +119,14 @@ class NwControlPlane(BaseControlPlane):
         nw_spoke.control_plane = self
         nw_spoke.start_background_loops()
 
-        # Delegate to BaseControlPlane's main loop
-        await self.run()
+        try:
+            # Delegate to BaseControlPlane's main loop
+            await self.run()
+        finally:
+            # Lifecycle cleanup: stop background loops and unregister module on teardown
+            nw_spoke.stop_background_loops()
+            if hasattr(self, "modules") and isinstance(self.modules, dict):
+                self.modules.pop("nw", None)
 
 
 # Script entry point: parse the command line and run the control plane.

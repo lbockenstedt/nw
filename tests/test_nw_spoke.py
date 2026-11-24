@@ -35,9 +35,33 @@ class _BaseSpoke:
 
 
 _core_base.BaseSpoke = _BaseSpoke
+
+_core_messaging = types.ModuleType("core.src.messaging")
+_core_messaging_cp = types.ModuleType("core.src.messaging.control_plane")
+
+
+class _BaseControlPlane:
+    def __init__(self, spoke_id, secret=None, hub_secret=None, hub_url=None, onboarding_psk=None, tenant_id_hint=None):
+        self.spoke_id = spoke_id
+        self.secret = secret
+        self.hub_url = hub_url
+        self.module_type = None
+        self.modules = {}
+
+    def register_module(self, name, mod):
+        self.modules[name] = mod
+
+    async def run(self):
+        pass
+
+
+_core_messaging_cp.BaseControlPlane = _BaseControlPlane
+
 sys.modules["core"] = _core
 sys.modules["core.src"] = _core_src
 sys.modules["core.src.base_spoke"] = _core_base
+sys.modules["core.src.messaging"] = _core_messaging
+sys.modules["core.src.messaging.control_plane"] = _core_messaging_cp
 
 from nw_spoke import NwSpoke, _SENSITIVE  # noqa: E402
 from nw_engine import (build_driver, NwEngine, SshCliDriver,  # noqa: E402
@@ -904,6 +928,52 @@ def test_device_info_cache_hard_bound():
         _run(eng.get_device_info(f"dev-{i}"))
 
     assert len(eng._device_info_cache) <= 500
+
+
+def test_nwspoke_stop_background_loops():
+    """Verify stop_background_loops cancels all running background tasks and empties the list."""
+    async def _test():
+        spoke = NwSpoke("nw-spoke-bg", {})
+        spoke.start_background_loops()
+        assert len(spoke._bg_tasks) == 2
+        tasks = list(spoke._bg_tasks)
+        spoke.stop_background_loops()
+        assert len(spoke._bg_tasks) == 0
+        await asyncio.sleep(0)
+        assert all(t.cancelled() or t.done() for t in tasks)
+
+    _run(_test())
+
+
+def test_control_plane_lifecycle_teardown(monkeypatch):
+    """Verify NwControlPlane initializes module_type properly and run_hub_mode cleans up in finally."""
+    from control_plane import NwControlPlane
+
+    cp = NwControlPlane(
+        "spoke-test",
+        "secret-123",
+        hub_url="wss://user:pass@hub.local:443",
+        config={"key": "val"},
+    )
+    # Finding 2 & 6 contract check
+    assert cp.module_type == "nw"
+    assert cp.config == {"key": "val"}
+
+    # Track whether log masking occurred
+    logged_messages = []
+    import control_plane
+    monkeypatch.setattr(control_plane.logger, "info", lambda msg: logged_messages.append(msg))
+
+    async def _test():
+        await cp.run_hub_mode()
+        # Verify unregistration and log masking
+        assert "nw" not in cp.modules
+        masked_logs = [m for m in logged_messages if "wss://user:***@hub.local:443" in m]
+        assert len(masked_logs) == 1
+        assert not any("pass@" in m for m in logged_messages)
+
+    _run(_test())
+
 
 
 
