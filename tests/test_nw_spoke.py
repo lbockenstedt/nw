@@ -107,12 +107,22 @@ def test_update_config_stores_devices():
 
 # ── Sensitive-data masking ──────────────────────────────────────────────────
 def test_mask_redacts_sensitive_fields():
-    masked = NwSpoke._mask({"device_id": "d1", "password": "hunter2",
-                            "api_token": "tok", "name": "core-sw"})
+    masked = NwSpoke._mask({
+        "device_id": "d1", "password": "hunter2",
+        "api_token": "tok", "name": "core-sw",
+        "privkey": "mock_private_key_data",
+        "token": "secret_jwt_token",
+        "api_key": "api_key_12345",
+    })
     assert masked["password"] == "********"
     assert masked["api_token"] == "********"
+    assert masked["privkey"] == "********"
+    assert masked["token"] == "********"
+    assert masked["api_key"] == "********"
     assert masked["name"] == "core-sw"  # non-sensitive passes through
     assert "password" in _SENSITIVE
+    assert "privkey" in _SENSITIVE
+    assert "token" in _SENSITIVE
 
 
 # ── NW_LIST_DEVICES returns envelope + no credentials ───────────────────────
