@@ -101,3 +101,16 @@ def test_backspace_and_tab():
     s2 = TerminalScreen()
     s2.feed("a\tb")
     assert s2.cx == 9  # tab to next 8-col stop, then 'b'
+
+
+def test_unterminated_osc_pending_cap():
+    s = TerminalScreen()
+    # Feed an unclosed OSC escape sequence longer than 8KB
+    unclosed_large_osc = "\x1b]0;" + ("A" * 9000)
+    s.feed(unclosed_large_osc)
+    # The oversized incomplete sequence must be dropped to prevent unbounded growth
+    assert len(s._pending) <= 8192
+    assert s._pending == ""
+    # Normal feed afterwards works without hanging
+    s.feed("Hello World")
+    assert "Hello World" in s.text()

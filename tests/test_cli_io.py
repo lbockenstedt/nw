@@ -539,6 +539,25 @@ def test_read_renudge_stops_once_output_arrives():
     assert calls["n"] == 0
 
 
+def test_connect_passes_known_hosts_from_env(monkeypatch):
+    proc = _FakeProc(["switch# "])
+    conn = _FakeConn(proc)
+    captured = {}
+
+    async def _fake_connect(*a, **k):
+        captured.update(k)
+        return conn
+
+    monkeypatch.setenv("LM_NW_KNOWN_HOSTS", "/etc/ssh/pinned_hosts")
+    import types
+    stub = types.ModuleType("asyncssh")
+    stub.connect = _fake_connect
+    monkeypatch.setitem(sys.modules, "asyncssh", stub)
+    s = cli_io.CliSession({"address": "10.0.0.1", "username": "admin"})
+    asyncio.get_event_loop().run_until_complete(s.connect())
+    assert captured.get("known_hosts") == "/etc/ssh/pinned_hosts"
+
+
 
 # ── AOS-CX `show mac-address-table` ──────────────────────────────────────────
 def test_parse_mac_aos_cx_reads_port_not_type():
