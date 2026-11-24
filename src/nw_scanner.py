@@ -449,15 +449,22 @@ def _hostname_from_banner(text: str) -> str:
 async def _nmap_augment(host: str, timeout: float) -> str:
     """Optional: run ``nmap -sV`` and return its service text for classification.
     Silently returns '' if nmap isn't installed or the run fails/times out."""
+    # Reject flag injection, whitespace, control characters, or non-hostname strings.
+    if not host or not isinstance(host, str):
+        return ""
+    host = host.strip()
+    if not host or host.startswith("-") or any(c.isspace() or ord(c) < 32 for c in host):
+        return ""
     # nmap not installed: skip.
     if not shutil.which("nmap"):
         return ""
     # Any failure or timeout: no extra text.
     try:
         # Service/version scan of this host only, without a ping check.
+        # Note: "--" separates command options from positional target to prevent option injection.
         proc = await asyncio.create_subprocess_exec(
             "nmap", "-sV", "-Pn", "-T4", "--host-timeout", f"{int(timeout)}s",
-            host, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+            "--", host, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
         # Wait a little past nmap's own host timeout.
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout + 5)
         return (out or b"").decode("utf-8", "replace")
